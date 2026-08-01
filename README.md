@@ -6,6 +6,63 @@ Multi-agent AI trading system (Analyst, Dealer, Floor Broker) trading on Alpaca,
 
 Trades are paper-only — see the [Alpaca paper trading dashboard](https://app.alpaca.markets/paper/dashboard/overview) for live account state, positions, and order history.
 
+## What this is
+
+Three independently-deployed Kubernetes workloads that together run a daily equities
+trading loop against Alpaca's **paper** trading account:
+
+- **Analyst** — a `CronJob` that runs once a day before market open, screens for candidate
+  symbols, and decides a tradeable watchlist for the day.
+- **Dealer** — a long-running `Deployment` that polls every 10 minutes while the market is
+  open, pulls technical indicators for each watchlist symbol, and asks an LLM whether to
+  BUY, HOLD, or SELL.
+- **Floor Broker** — a `Deployment` + `Service` that is the only component that actually
+  places orders. It never calls an LLM — it takes a BUY/SELL decision and executes it as a
+  bracket order (stocks) or notional market order (crypto) on Alpaca.
+
+Analyst and Dealer never talk to each other directly — Analyst writes its daily watchlist to
+a shared `portfolio` ConfigMap, and Dealer reads it fresh on every poll. Dealer talks to
+Floor Broker over plain in-cluster HTTP. There is no database, message queue, or shared
+filesystem anywhere in the system. See [docs/architecture.md](docs/architecture.md) for the
+full breakdown (per-agent internals, data flow, config reference, risk controls) and
+[docs/platform-services.md](docs/platform-services.md) for which platform services below are
+actually wired up vs. unused scaffolding.
+
+This is a re-platforming of an earlier single-process script (`gpt-trader.py`) onto three
+independently-scaled k8s workloads.
+
+## How it decides trades
+
+Both Analyst and Dealer make their decisions the same way: gather data, hand it to an LLM as
+context, and parse the response into a strict structured-output schema (via LangChain's
+`.with_structured_output()` — no hand-rolled JSON parsing). Both are implemented as small
+[LangGraph](https://langchain-ai.github.io/langgraph/) state machines:
+
+- **Analyst** (4 nodes): discover screener candidates → fetch news/RSS research → LLM picks
+  up to 10 symbols with a budget and rationale each → write the `portfolio` ConfigMap.
+- **Dealer** (3 nodes, per symbol per poll): fetch technical indicators → LLM decides
+  BUY/HOLD/SELL → if not HOLD, dispatch to Floor Broker over HTTP.
+
+Both LLM calls go through `langchain_openai.ChatOpenAI` against a single OpenAI-compatible
+`base_url` shared by the whole system (`config.yaml`'s `llm.base_url`) — this is intended to
+point at a vLLM endpoint serving a locally-hosted model on the DGX, so no external LLM API
+key is required for trading decisions themselves.
+
+Floor Broker has no decision logic of its own — by the time it receives a request, the
+BUY/SELL call has already been made; it only handles order placement, safety checks
+(no duplicate positions), and Alpaca's order-conflict retry cases.
+
+## External APIs used
+
+| API | Used by | Purpose |
+|---|---|---|
+| [Alpaca Trading API](https://docs.alpaca.markets/) | Floor Broker | The only component that places/cancels orders — bracket orders for stocks, notional market orders for crypto. Paper account only, hardcoded (not a config toggle). |
+| [Alpaca Market Data / Screener / News API](https://docs.alpaca.markets/) | Analyst, Dealer | Screener `most-actives`/`movers` endpoints and News API for Analyst's daily candidate research; live bid/ask quotes for Floor Broker's order sizing. |
+| [TAAPI.io](https://taapi.io/) | Dealer | Technical indicators (RSI, MACD, VWAP, Bollinger Bands, SMA, EMA) per watchlist symbol — a third-party service, unrelated to any Miramar platform component. |
+| Yahoo Finance RSS | Analyst | Supplementary headline research alongside Alpaca's News API. |
+| [LangSmith](https://www.langchain.com/langsmith) | Analyst, Dealer | Tracing for both LangGraph agent runs (optional, `config.yaml`'s `langsmith.enabled`). This is the tracing layer actually in use — not MLflow, despite MLflow appearing in the platform endpoint table below. |
+| OpenAI-compatible LLM endpoint (vLLM, planned) | Analyst, Dealer | Both agents' BUY/HOLD/SELL and symbol-selection decisions. Currently a placeholder in `config.yaml` pending a deployed vLLM serving endpoint. |
+
 ## Platform endpoints
 
 All services require the SSH tunnel from your laptop:
