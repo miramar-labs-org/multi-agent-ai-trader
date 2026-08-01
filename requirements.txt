@@ -1,0 +1,16 @@
+ipykernel
+ipywidgets
+requests
+pyyaml
+python-dotenv
+openai
+anthropic
+alpaca-py
+beautifulsoup4
+pytz
+fastapi
+uvicorn
+kubernetes
+pandas
+numpy
+tqdm
