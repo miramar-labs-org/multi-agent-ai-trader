@@ -4,6 +4,8 @@
 
 Multi-agent AI trading system (Analyst, Dealer, Floor Broker) trading on Alpaca, powered by a locally-hosted LLM on the DGX via k3s
 
+Trades are paper-only — see the [Alpaca paper trading dashboard](https://app.alpaca.markets/paper/dashboard/overview) for live account state, positions, and order history.
+
 ## Platform endpoints
 
 All services require the SSH tunnel from your laptop:
