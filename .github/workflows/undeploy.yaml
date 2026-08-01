@@ -1,0 +1,45 @@
+name: Undeploy
+
+# Removes the full multi-agent-ai-trader namespace from K3s on the DGX —
+# Deployments (Dealer, Floor Broker), the Analyst CronJob, the Floor Broker
+# Service, the portfolio ConfigMap, and all Secrets (ghcr-pull, mlabs-api-keys).
+#
+# This is a full teardown: the portfolio ConfigMap and mlabs-api-keys secret
+# are deliberately removed along with everything else. A subsequent deploy
+# will re-seed an empty portfolio and require mlabs-api-keys to be re-created
+# manually (see k8s/secrets.example.yaml).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PROJECT_NAME: "multi-agent-ai-trader"
+
+jobs:
+  undeploy-dgx:
+    runs-on: [self-hosted, dgx]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Delete namespace
+        run: |
+          kubectl delete namespace "$PROJECT_NAME" --ignore-not-found
+          echo "Namespace and all resources removed."
+
+      - name: Summary
+        run: |
+          {
+            echo "## Undeploy: $PROJECT_NAME (DGX K3s)"
+            echo "Namespace \`$PROJECT_NAME\` deleted, along with all its resources:"
+            echo "- Deployments (dealer, floor-broker)"
+            echo "- CronJob (analyst)"
+            echo "- Service (floor-broker)"
+            echo "- ConfigMap (portfolio)"
+            echo "- Secrets (ghcr-pull, mlabs-api-keys)"
+            echo ""
+            echo "A subsequent deploy will need \`mlabs-api-keys\` re-created manually"
+            echo "(see k8s/secrets.example.yaml) and the portfolio ConfigMap will re-seed empty."
+          } >> "$GITHUB_STEP_SUMMARY"

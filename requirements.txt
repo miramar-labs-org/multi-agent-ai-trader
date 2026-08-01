@@ -2,6 +2,7 @@ ipykernel
 ipywidgets
 requests
 pyyaml
+omegaconf
 python-dotenv
 openai
 anthropic
@@ -14,3 +15,7 @@ kubernetes
 pandas
 numpy
 tqdm
+langchain
+langchain-openai
+langgraph
+langsmith

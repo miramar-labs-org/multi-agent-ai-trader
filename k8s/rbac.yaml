@@ -1,0 +1,33 @@
+# Shared by both the Analyst CronJob (writes the portfolio ConfigMap) and the
+# Dealer Deployment (reads it) — one ServiceAccount/Role/RoleBinding rather than
+# two near-duplicate RBAC objects, since both workloads only ever touch the same
+# ConfigMap in this same namespace. Floor Broker does not use this ServiceAccount.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: multi-agent-ai-trader-configmap-reader
+  namespace: multi-agent-ai-trader
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: multi-agent-ai-trader-configmap-reader
+  namespace: multi-agent-ai-trader
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "patch", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: multi-agent-ai-trader-configmap-reader
+  namespace: multi-agent-ai-trader
+subjects:
+  - kind: ServiceAccount
+    name: multi-agent-ai-trader-configmap-reader
+    namespace: multi-agent-ai-trader
+roleRef:
+  kind: Role
+  name: multi-agent-ai-trader-configmap-reader
+  apiGroup: rbac.authorization.k8s.io

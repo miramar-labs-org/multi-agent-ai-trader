@@ -1,0 +1,67 @@
+name: Build and Push
+
+# Builds the 3 microservice images (Analyst, Dealer, Floor Broker) and pushes
+# them to GHCR. CPU-only, DGX self-hosted runner — no GPU node/registry logic.
+#
+# Run this after any change to src/, requirements.txt, or the Dockerfiles.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  PROJECT_NAME: "multi-agent-ai-trader"
+
+jobs:
+  build-push-ghcr:
+    runs-on: [self-hosted, dgx]
+    strategy:
+      matrix:
+        include:
+          - name: analyst
+            dockerfile: Dockerfile.analyst
+          - name: dealer
+            dockerfile: Dockerfile.dealer
+          - name: floor-broker
+            dockerfile: Dockerfile.floor-broker
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.MIRAMAR_ORG_GHCR_PAT }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Set image URI
+        id: image
+        run: |
+          IMAGE_URI="ghcr.io/miramar-labs-org/${PROJECT_NAME}-${{ matrix.name }}"
+          COMMIT_SHA="${{ github.sha }}"
+          echo "uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+          echo "tag=${COMMIT_SHA::8}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        run: |
+          IMAGE_URI="${{ steps.image.outputs.uri }}"
+          TAG="${{ steps.image.outputs.tag }}"
+          docker build \
+            -f "${{ matrix.dockerfile }}" \
+            -t "${IMAGE_URI}:latest" \
+            -t "${IMAGE_URI}:${TAG}" \
+            .
+          docker push "${IMAGE_URI}:latest"
+          docker push "${IMAGE_URI}:${TAG}"
+          echo "Pushed ${IMAGE_URI}:${TAG}"
+
+      - name: Summary
+        run: |
+          {
+            echo "## Build and Push Complete: ${{ matrix.name }}"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Project | \`$PROJECT_NAME\` |"
+            echo "| Service | \`${{ matrix.name }}\` |"
+            echo "| Registry | GHCR |"
+            echo "| Image | \`${{ steps.image.outputs.uri }}:${{ steps.image.outputs.tag }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

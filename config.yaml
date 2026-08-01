@@ -1,0 +1,49 @@
+description: "3-agent trading floor (Analyst / Dealer / Floor Broker) — Analyst picks the tradeable universe, Dealer decides BUY/HOLD/SELL, Floor Broker executes on Alpaca."
+
+llm:
+  base_url: "http://vllm.TBD-serving-namespace.svc.cluster.local:8000/v1"  # set once the sibling serving repo is deployed
+  model: "TBD-served-model-alias"                                          # Qwen2.5-32B-Instruct-FP8, served alias TBD
+  temperature: 0.1
+
+langsmith:
+  enabled: true
+  project: "multi-agent-ai-trader"   # requires LANGCHAIN_API_KEY in the mlabs-api-keys secret
+
+floor_broker:
+  base_url: "http://floor-broker.multi-agent-ai-trader.svc.cluster.local:8000"
+
+trading:
+  slP: 0.98
+  tpP: 1.05
+  pollsecs: 600
+  buffer: 15
+  market_override: false
+
+analyst:
+  schedule: "0 6 * * *"       # daily 06:00 UTC, before US market open
+  max_universe_size: 10
+  default_budget: 5000
+  screener_top_n: 20          # candidates pulled from Alpaca Screener before research/filtering
+  news_days: 2
+  yahoo_rss_url: "https://feeds.finance.yahoo.com/rss/2.0/headline"
+
+# Indicator catalog — unchanged shape from gpt-trader's config.json, TAAPI query params per indicator.
+indicators:
+  - name: rsi
+    properties: { interval: 1h, backtrack: 0, period: 14 }
+  - name: stochrsi
+    properties: { interval: 1h, backtrack: 0, kPeriod: 5, dPeriod: 3, rsiPeriod: 14, stochasticPeriod: 14 }
+  - name: vwap
+    properties: { interval: 1h, backtrack: 0, anchorPeriod: week }
+  - name: vosc
+    properties: { interval: 1h, backtrack: 0, short_period: 5, long_period: 10 }
+  - name: volume
+    properties: { interval: 1h, backtrack: 0 }
+  - name: bbands
+    properties: { interval: 1h, backtrack: 0, period: 20, stddev: 2 }
+  - name: macd
+    properties: { interval: 1h, backtrack: 0, optInFastPeriod: 12, optInSlowPeriod: 26, optInSignalPeriod: 9 }
+  - name: ema
+    properties: { interval: 1h, backtrack: 0, period: 30 }
+  - name: sma
+    properties: { interval: 1h, backtrack: 0, period: 30 }

@@ -1,0 +1,31 @@
+import os
+
+from src.analyst.graph import build_graph
+from src.common.config import load_config
+from src.common.logging import get_logger
+
+log = get_logger("ANALYST")
+
+
+def main():
+    cfg = load_config()
+
+    if cfg.langsmith.enabled:
+        os.environ["LANGCHAIN_TRACING_V2"] = "true"
+        os.environ["LANGCHAIN_PROJECT"] = cfg.langsmith.project
+
+    try:
+        graph = build_graph()
+        result = graph.invoke(
+            {"raw_candidates": [], "research_text": "", "selection": None},
+            config={"tags": ["analyst"]},
+        )
+        selection = result.get("selection") or {}
+        log(f"wrote portfolio with {len(selection.get('symbols', []))} symbols")
+    except Exception as exc:
+        log(f"💥 Analyst run failed: {exc}")
+        raise
+
+
+if __name__ == "__main__":
+    main()

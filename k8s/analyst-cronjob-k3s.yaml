@@ -1,0 +1,33 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: analyst
+  namespace: multi-agent-ai-trader
+spec:
+  schedule: "0 6 * * *"  # daily 06:00 UTC, before US market open — matches config.yaml's analyst.schedule
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 1  # a failed research run should surface, not silently retry-storm
+      template:
+        metadata:
+          labels:
+            app: analyst
+        spec:
+          serviceAccountName: multi-agent-ai-trader-configmap-reader
+          imagePullSecrets:
+            - name: ghcr-pull
+          restartPolicy: Never
+          containers:
+            - name: analyst
+              image: GHCR_IMAGE_ANALYST_PLACEHOLDER
+              envFrom:
+                - secretRef:
+                    name: mlabs-api-keys
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: "256Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "512Mi"

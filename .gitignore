@@ -1,3 +1,6 @@
 
 # Per-project JupyterLab kernel venv
 .venv/
+
+__pycache__/
+*.pyc

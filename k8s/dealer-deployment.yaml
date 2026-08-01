@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dealer
+  namespace: multi-agent-ai-trader
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate  # avoids two Dealer pods racing to read/act on the same portfolio during a rolling update
+  selector:
+    matchLabels:
+      app: dealer
+  template:
+    metadata:
+      labels:
+        app: dealer
+    spec:
+      serviceAccountName: multi-agent-ai-trader-configmap-reader
+      containers:
+        - name: dealer
+          image: IMAGE_DEALER_PLACEHOLDER
+          envFrom:
+            - secretRef:
+                name: mlabs-api-keys
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

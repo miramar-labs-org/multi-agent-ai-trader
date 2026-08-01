@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: floor-broker
+  namespace: multi-agent-ai-trader
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: floor-broker
+  template:
+    metadata:
+      labels:
+        app: floor-broker
+    spec:
+      containers:
+        - name: floor-broker
+          image: IMAGE_FLOOR_BROKER_PLACEHOLDER
+          envFrom:
+            - secretRef:
+                name: mlabs-api-keys
+          ports:
+            - containerPort: 8000
+              name: http
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 15
