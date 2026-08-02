@@ -1,8 +1,8 @@
 description: "3-agent trading floor (Analyst / Dealer / Floor Broker) — Analyst picks the tradeable universe, Dealer decides BUY/HOLD/SELL, Floor Broker executes on Alpaca."
 
 llm:
-  base_url: "http://vllm.TBD-serving-namespace.svc.cluster.local:8000/v1"  # set once the sibling serving repo is deployed
-  model: "TBD-served-model-alias"                                          # Qwen2.5-32B-Instruct-FP8, served alias TBD
+  base_url: "http://192.168.1.200:11434/v1"  # DGX_HOST_IP — Ollama systemd service on DGX (not in k3s)
+  model: "qwen3.6:35b-a3b"                   # see docs/models.md for model choice + Ollama-vs-vLLM decision
   temperature: 0.1
 
 langsmith:
