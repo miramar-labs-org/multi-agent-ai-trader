@@ -203,6 +203,13 @@ requests.post(f"{cfg.floor_broker.base_url}/execute", json={
 — standard k8s Service DNS, not a Miramar platform endpoint. HOLD signals never leave the
 Dealer pod (`execution_result = {"status": "skipped", "detail": "HOLD"}` is set locally).
 
+On a successful response, `call_floor_broker` forwards Floor Broker's `reason`, `fill_price`,
+`sl_price`, `tp_price` fields (see Floor Broker's `ExecuteResponse` below) straight through as
+keyword arguments to `slack.notify_floor_broker_result`, so the Slack notice for a BUY/SELL shows
+the actual fill price and TP/SL levels, not just the request Dealer sent. The error-response and
+request-exception branches are unchanged — they call `notify_floor_broker_result` with only the
+original 4 positional arguments, so those optional fields simply render as absent.
+
 ## Agent 3 — Floor Broker (`src/floor_broker/`)
 
 **Workload:** `apps/v1 Deployment` + `ClusterIP Service` on port 8000. No ServiceAccount —
@@ -221,6 +228,14 @@ calls an LLM.
 
 Alpaca `APIError`s are caught and returned as `{"status": "error", "detail": ...}` (HTTP 200)
 rather than raised; unexpected exceptions become a 500.
+
+`ExecuteResponse` also carries optional `reason`, `order_id`, `fill_price`, `sl_price`, `tp_price`
+fields (all `None` unless `execution.buy()`/`sell()` populate them — see below), so Dealer can
+forward the actual fill price and a stable reason code to Slack instead of only the request it
+sent. `reason` is one of `opening_position` (a BUY), `dealer_signal` (an explicit SELL from the
+Dealer's LLM decision), or `take_profit`/`stop_loss` (an asynchronous bracket-leg fill detected
+by the poller below — these never come back on the `/execute` HTTP response itself, only via the
+Slack post the poller sends directly).
 
 **Order logic** (`src/floor_broker/execution.py`):
 - **`buy()`** — safety gate first: if an open position or open order already exists for the
@@ -243,6 +258,40 @@ rather than raised; unexpected exceptions become a 500.
   path: if Alpaca rejects with error code `40310000` (conflicting orders blocking the sell),
   it cancels the blocking orders (ignoring 404s), *re-fetches* the now-current open quantity
   (it can change once blockers clear), and resubmits.
+
+Both `buy()` and `sell()` call `_wait_for_fill(order_id)` after submission — a short bounded poll
+(`get_order_by_id`, up to `FILL_POLL_ATTEMPTS=5` tries, `FILL_POLL_INTERVAL_S=1.0` apart, ~5s
+total) that returns the order's `filled_avg_price` if it confirms filled in that window, or
+`None` otherwise (the caller/response simply omits `fill_price` — this is not treated as an
+error, since a market order not yet reflected as filled within 5s is normal, not exceptional).
+
+**Async TP/SL fill detection.** A stock BUY's stop-loss/take-profit legs are a bracket
+(`OrderClass.BRACKET`, OCO) — whichever leg fills first, Alpaca auto-cancels the other, and
+neither fill is visible through the original `/execute` request/response cycle since it can
+happen minutes or hours later. To surface these as Slack notices, `buy()` registers the parent
+bracket order id in a module-level, in-memory dict, `_tracked_brackets: dict[symbol, order_id]`
+(stocks only — crypto has no bracket legs), and `sell()` removes the symbol from it immediately
+before submitting an explicit sell (so a manual/Dealer-driven SELL doesn't also get reported as
+a TP/SL fill once the bracket's legs are cancelled as a side effect).
+
+`src/floor_broker/main.py` starts a daemon background thread, `poll_bracket_fills()`, alongside
+uvicorn's HTTP server in the same process. Every `BRACKET_FILL_POLL_INTERVAL_S` (30s) it calls
+`execution.check_bracket_fills()`, which re-fetches each tracked bracket order
+(`get_order_by_id(..., filter=GetOrderByIdRequest(nested=True))` for the `legs`), classifies a
+terminal leg by `OrderType` (`LIMIT` → `take_profit`, `STOP` → `stop_loss`) and `OrderStatus`
+(`FILLED` vs. `CANCELED`/`EXPIRED`/`REJECTED`), untracks the symbol once either leg reaches a
+terminal state, and returns one event dict per resolved fill. `main.py` posts each event to
+Slack via `slack.notify_floor_broker_result(..., reason=event["reason"],
+fill_price=event["fill_price"])`. The loop catches and logs any exception per iteration so one
+bad poll (e.g. a transient Alpaca API error) never kills the thread.
+
+**Limitation:** `_tracked_brackets` is in-memory and single-process, with no persistence across
+pod restarts — matches this repo's existing `_last_market_open`-style edge-detection pattern in
+Dealer. If Floor Broker restarts while a bracket is still open, that symbol drops out of
+tracking; the underlying TP/SL order still executes correctly on Alpaca's side (Alpaca owns the
+bracket, not Floor Broker), but the Slack notice for that particular fill is silently missed.
+Accepted tradeoff — Floor Broker already holds no other durable state (see the workload note
+above), and adding persistence here for one notification path isn't worth a new dependency.
 
 ## EOD Report (`src/eod_report/`)
 
@@ -317,6 +366,9 @@ three components.
   `p.asset_class == AssetClass.CRYPTO` since live `Position.symbol` for crypto has **no** slash
   (e.g. `"BTCUSD"`) — a `"/" in symbol` check on positions silently matches nothing. Confirmed
   against a live paper account after the crypto EOD report came back empty with zero positions.
+  Each fill dict also carries `"time"` (Alpaca's raw `transaction_time`, an ISO 8601 UTC string),
+  passed through unformatted — `slack._format_fill_time()` converts it to Eastern-clock-time for
+  display only at the point each EOD report line is rendered.
 
 ## Data flow — one full cycle
 
@@ -348,7 +400,7 @@ three components.
 | `llm` | `base_url`, `model`, `temperature` | shared OpenAI-compatible endpoint for **both** Analyst and Dealer LLM calls — see [platform-services.md](platform-services.md) for current wiring status |
 | `langsmith` | `enabled`, `project` | toggles LangGraph/LangChain tracing to LangSmith (requires `LANGCHAIN_API_KEY`) |
 | `langsmith` | `sampling_rate` | fraction of traces actually sent to LangSmith (0.5) — keeps Dealer's poll-driven trace volume under the free Developer plan's 5k traces/month limit |
-| `slack` | `enabled` | toggles posting interesting events (Morning Report, Crypto EOD Report, Dealer signals, Floor Broker executions, EOD Report, EOD's non-trading-day notice, Dealer's live market-closed notice, errors) to `#miramar-trading-floor` (requires `SLACK_WEBHOOK_URL`) |
+| `slack` | `enabled` | toggles posting interesting events (Morning Report, Crypto EOD Report, Dealer signals, Floor Broker executions, EOD Report, EOD's non-trading-day notice, Dealer's live market-closed notice, errors) to `#miramar-trading-floor` (requires `SLACK_WEBHOOK_URL`) — Dealer signal and Floor Broker execution notices carry an Eastern-time timestamp, and a Floor Broker notice includes fill price/reason/SL/TP whenever `execution.py` supplies them; EOD Report/Crypto EOD Report fill lines each carry the fill's own Eastern-time timestamp |
 | `floor_broker` | `base_url` | in-cluster Service DNS Dealer uses to reach Floor Broker |
 | `taapi` | `min_request_interval_secs` | seconds Dealer waits between symbols' TAAPI `/bulk` calls (15) — sized to the TAAPI Free plan's 1 request/15s cap; lower it if the account is on a paid plan |
 | `trading` | `slP` / `tpP` | stop-loss/take-profit price multipliers on bracket orders (0.98/1.05 ≈ 2% stop, 5% target) |

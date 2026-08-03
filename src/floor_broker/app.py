@@ -23,6 +23,11 @@ class ExecuteRequest(BaseModel):
 class ExecuteResponse(BaseModel):
     status: Literal["executed", "skipped", "error"]
     detail: str
+    reason: str | None = None
+    order_id: str | None = None
+    fill_price: float | None = None
+    sl_price: float | None = None
+    tp_price: float | None = None
 
 
 app = FastAPI()

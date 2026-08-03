@@ -22,8 +22,8 @@ class FakeTradingClient:
         return self._activities
 
 
-def _activity(symbol, side="buy", qty="1", price="100.00"):
-    return {"symbol": symbol, "side": side, "qty": qty, "price": price}
+def _activity(symbol, side="buy", qty="1", price="100.00", transaction_time="2026-08-03T14:32:01.123456Z"):
+    return {"symbol": symbol, "side": side, "qty": qty, "price": price, "transaction_time": transaction_time}
 
 
 def test_fetch_fills_with_no_filter_returns_everything(monkeypatch):
@@ -55,7 +55,27 @@ def test_fetch_fills_shapes_qty_and_price_as_floats(monkeypatch):
 
     result = eod.fetch_fills("2026-08-03")
 
-    assert result == [{"symbol": "MGN", "side": "buy", "qty": 2.5, "price": 10.125}]
+    assert result == [
+        {
+            "symbol": "MGN",
+            "side": "buy",
+            "qty": 2.5,
+            "price": 10.125,
+            "time": "2026-08-03T14:32:01.123456Z",
+        }
+    ]
+
+
+def test_fetch_fills_carries_transaction_time_through_unchanged(monkeypatch):
+    """notify_eod_report/notify_crypto_eod_report format this into a per-fill timestamp -- must
+    be passed through as Alpaca returns it, not dropped or reformatted here."""
+    monkeypatch.setattr(
+        eod, "trading_client", FakeTradingClient([_activity("MGN", transaction_time="2026-08-03T09:31:05.5Z")])
+    )
+
+    result = eod.fetch_fills("2026-08-03")
+
+    assert result[0]["time"] == "2026-08-03T09:31:05.5Z"
 
 
 def _positions():

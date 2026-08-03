@@ -2,6 +2,7 @@ import json
 
 import pytest
 from alpaca.common.exceptions import APIError
+from alpaca.trading.enums import OrderStatus, OrderType
 
 from src.floor_broker import execution
 
@@ -12,14 +13,24 @@ def _api_error(payload: dict) -> APIError:
     return err
 
 
+@pytest.fixture(autouse=True)
+def _clear_tracked_brackets():
+    """_tracked_brackets is module-level state shared across every test in this file -- clear it
+    before and after each test so tests can't leak bracket-tracking into one another."""
+    execution._tracked_brackets.clear()
+    yield
+    execution._tracked_brackets.clear()
+
+
 class FakeTradingClient:
     """Stands in for alpaca-py's TradingClient. `submit_order` raises the given rejection(s)
     in order, then succeeds -- lets tests replay real Alpaca rejection payloads without any
     network access."""
 
-    def __init__(self, rejections=()):
+    def __init__(self, rejections=(), fill_price=101.0):
         self._rejections = list(rejections)
         self.submitted = []
+        self._fill_price = fill_price
 
     def get_open_position(self, symbol):
         raise APIError("no position")
@@ -32,6 +43,39 @@ class FakeTradingClient:
         if self._rejections:
             raise _api_error(self._rejections.pop(0))
         return type("Order", (), {"id": "order-123"})()
+
+    def get_order_by_id(self, order_id, filter=None):
+        # Immediate fill by default, so _wait_for_fill returns on its first check and never
+        # sleeps for real -- keeps the existing tests (which don't care about fill price) fast.
+        return type("Order", (), {"filled_avg_price": self._fill_price})()
+
+
+class FakeLeg:
+    def __init__(self, id, status, type_, filled_avg_price=None, filled_qty=None):
+        self.id = id
+        self.status = status
+        self.type = type_
+        self.filled_avg_price = filled_avg_price
+        self.filled_qty = filled_qty
+
+
+class FakeBracketOrder:
+    def __init__(self, legs):
+        self.legs = legs
+
+
+class FakeBracketTradingClient:
+    """Stands in for alpaca-py's TradingClient for check_bracket_fills() -- `orders_by_id` maps
+    a parent order id to either a FakeBracketOrder or an exception instance to raise."""
+
+    def __init__(self, orders_by_id):
+        self._orders_by_id = orders_by_id
+
+    def get_order_by_id(self, order_id, filter=None):
+        result = self._orders_by_id[order_id]
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
 def test_bracket_pricing_uses_ask_not_mid(monkeypatch):
@@ -156,3 +200,139 @@ def test_buy_reraises_on_unrelated_api_error(monkeypatch):
         execution.buy("MGN", "stocks", 5000.0, slP=0.98, tpP=1.05)
 
     assert len(fake_client.submitted) == 1, "must not retry on an unrelated rejection"
+
+
+def test_stock_buy_returns_reason_fill_price_sl_tp_and_tracks_the_bracket(monkeypatch):
+    fake_client = FakeTradingClient(fill_price=10.05)
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+    monkeypatch.setattr(execution, "get_current_ask_price", lambda symbol: 10.0)
+
+    result = execution.buy("MGN", "stocks", 5000.0, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "executed"
+    assert result["reason"] == "opening_position"
+    assert result["order_id"] == "order-123"
+    assert result["fill_price"] == pytest.approx(10.05)
+    assert result["sl_price"] == pytest.approx(9.8, abs=0.01)
+    assert result["tp_price"] == pytest.approx(10.5, abs=0.01)
+    assert execution._tracked_brackets["MGN"] == "order-123"
+
+
+def test_crypto_buy_has_no_sl_tp_price_and_is_not_tracked_as_a_bracket(monkeypatch):
+    """Crypto BUYs are plain notional market orders, not brackets -- there's no TP/SL leg to
+    later watch for a fill."""
+    fake_client = FakeTradingClient()
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    result = execution.buy("BTC/USD", "binance", 100.0, slP=0.98, tpP=1.05)
+
+    assert result["sl_price"] is None
+    assert result["tp_price"] is None
+    assert "BTC/USD" not in execution._tracked_brackets
+
+
+def test_wait_for_fill_gives_up_after_max_attempts_without_a_real_sleep(monkeypatch):
+    class NeverFillsClient:
+        def get_order_by_id(self, order_id, filter=None):
+            return type("Order", (), {"filled_avg_price": None})()
+
+    monkeypatch.setattr(execution, "trading_client", NeverFillsClient())
+    sleeps = []
+    monkeypatch.setattr(execution.time, "sleep", lambda s: sleeps.append(s))
+
+    result = execution._wait_for_fill("order-999")
+
+    assert result is None
+    assert len(sleeps) == execution.FILL_POLL_ATTEMPTS
+
+
+def test_sell_returns_dealer_signal_reason_fill_price_and_untracks_bracket(monkeypatch):
+    class FakeSellClient:
+        def get_open_position(self, symbol):
+            return type("Position", (), {"qty": "5"})()
+
+        def submit_order(self, req):
+            return type("Order", (), {"id": "sell-order-1"})()
+
+        def get_order_by_id(self, order_id, filter=None):
+            return type("Order", (), {"filled_avg_price": "12.00"})()
+
+    monkeypatch.setattr(execution, "trading_client", FakeSellClient())
+    execution._tracked_brackets["MGN"] = "parent-order-should-be-cleared"
+
+    result = execution.sell("MGN")
+
+    assert result["status"] == "executed"
+    assert result["reason"] == "dealer_signal"
+    assert result["order_id"] == "sell-order-1"
+    assert result["fill_price"] == pytest.approx(12.0)
+    assert "MGN" not in execution._tracked_brackets
+
+
+def test_check_bracket_fills_reports_take_profit_leg_filled(monkeypatch):
+    execution._tracked_brackets["MGN"] = "parent-1"
+    tp_leg = FakeLeg("tp-leg-1", OrderStatus.FILLED, OrderType.LIMIT, filled_avg_price="13.50", filled_qty="10")
+    sl_leg = FakeLeg("sl-leg-1", OrderStatus.CANCELED, OrderType.STOP)
+    fake_client = FakeBracketTradingClient({"parent-1": FakeBracketOrder([tp_leg, sl_leg])})
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    events = execution.check_bracket_fills()
+
+    assert events == [
+        {"symbol": "MGN", "order_id": "tp-leg-1", "reason": "take_profit", "fill_price": 13.50, "qty": 10.0}
+    ]
+    assert "MGN" not in execution._tracked_brackets
+
+
+def test_check_bracket_fills_reports_stop_loss_leg_filled(monkeypatch):
+    execution._tracked_brackets["MGN"] = "parent-1"
+    tp_leg = FakeLeg("tp-leg-1", OrderStatus.CANCELED, OrderType.LIMIT)
+    sl_leg = FakeLeg("sl-leg-1", OrderStatus.FILLED, OrderType.STOP, filled_avg_price="9.80", filled_qty="10")
+    fake_client = FakeBracketTradingClient({"parent-1": FakeBracketOrder([tp_leg, sl_leg])})
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    events = execution.check_bracket_fills()
+
+    assert events == [
+        {"symbol": "MGN", "order_id": "sl-leg-1", "reason": "stop_loss", "fill_price": 9.80, "qty": 10.0}
+    ]
+    assert "MGN" not in execution._tracked_brackets
+
+
+def test_check_bracket_fills_keeps_tracking_while_both_legs_still_open(monkeypatch):
+    execution._tracked_brackets["MGN"] = "parent-1"
+    legs = [FakeLeg("tp-leg-1", OrderStatus.NEW, OrderType.LIMIT), FakeLeg("sl-leg-1", OrderStatus.NEW, OrderType.STOP)]
+    fake_client = FakeBracketTradingClient({"parent-1": FakeBracketOrder(legs)})
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    events = execution.check_bracket_fills()
+
+    assert events == []
+    assert execution._tracked_brackets["MGN"] == "parent-1"
+
+
+def test_check_bracket_fills_untracks_symbol_when_both_legs_end_without_a_fill(monkeypatch):
+    """e.g. the position was closed some other way and Alpaca cancelled both legs -- must stop
+    polling rather than track forever."""
+    execution._tracked_brackets["MGN"] = "parent-1"
+    legs = [FakeLeg("tp-leg-1", OrderStatus.CANCELED, OrderType.LIMIT), FakeLeg("sl-leg-1", OrderStatus.CANCELED, OrderType.STOP)]
+    fake_client = FakeBracketTradingClient({"parent-1": FakeBracketOrder(legs)})
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    events = execution.check_bracket_fills()
+
+    assert events == []
+    assert "MGN" not in execution._tracked_brackets
+
+
+def test_check_bracket_fills_untracks_symbol_on_api_error(monkeypatch):
+    """A cancelled/expired parent order can eventually 404 -- treat that as nothing left to
+    watch rather than retrying forever."""
+    execution._tracked_brackets["MGN"] = "parent-1"
+    fake_client = FakeBracketTradingClient({"parent-1": APIError("not found")})
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    events = execution.check_bracket_fills()
+
+    assert events == []
+    assert "MGN" not in execution._tracked_brackets

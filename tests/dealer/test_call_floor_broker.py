@@ -70,3 +70,34 @@ def test_buy_with_authorized_budget_is_forwarded_to_floor_broker(monkeypatch):
 
     assert posted["json"]["budget"] == 5000.0
     assert result["execution_result"]["status"] == "executed"
+
+
+def test_execution_result_fields_are_forwarded_to_the_slack_notification(monkeypatch):
+    """execution.py's reason/fill_price/sl_price/tp_price must reach the Slack notice, not just
+    status/detail -- confirms call_floor_broker doesn't drop them on the way through."""
+    monkeypatch.setattr(graph.slack, "notify_dealer_signal", lambda *a, **k: None)
+    posted = {}
+    monkeypatch.setattr(graph.slack, "notify_floor_broker_result", lambda *a, **k: posted.update(kwargs=k))
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "status": "executed",
+                "detail": "buy order submitted: order-123",
+                "reason": "opening_position",
+                "order_id": "order-123",
+                "fill_price": 10.05,
+                "sl_price": 9.8,
+                "tp_price": 10.5,
+            }
+
+    monkeypatch.setattr(graph.requests, "post", lambda url, json, timeout: FakeResponse())
+
+    graph.call_floor_broker(_state("BUY", budget=5000.0), _cfg())
+
+    assert posted["kwargs"]["reason"] == "opening_position"
+    assert posted["kwargs"]["fill_price"] == 10.05
+    assert posted["kwargs"]["sl_price"] == 9.8
+    assert posted["kwargs"]["tp_price"] == 10.5

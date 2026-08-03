@@ -92,7 +92,16 @@ def call_floor_broker(state: DealerState, cfg) -> DealerState:
             slack.notify_floor_broker_result(state["symbol"], signal["action"], "error", response.text)
             return {**state, "execution_result": {"status": "error", "detail": response.text}}
         result = response.json()
-        slack.notify_floor_broker_result(state["symbol"], signal["action"], result["status"], result["detail"])
+        slack.notify_floor_broker_result(
+            state["symbol"],
+            signal["action"],
+            result["status"],
+            result["detail"],
+            reason=result.get("reason"),
+            fill_price=result.get("fill_price"),
+            sl_price=result.get("sl_price"),
+            tp_price=result.get("tp_price"),
+        )
         return {**state, "execution_result": result}
     except requests.RequestException as exc:
         log(f"💥 floor broker request failed: {exc}")

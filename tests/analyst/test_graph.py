@@ -88,8 +88,14 @@ def test_crypto_eod_report_posts_only_crypto_positions_and_fills_for_the_prior_d
         FakePosition("BTCUSD", "0.01", "600.00", "-0.02", AssetClass.CRYPTO),
     ]
     activities = [
-        {"symbol": "MGN", "side": "buy", "qty": "1", "price": "100.00"},
-        {"symbol": "BTC/USD", "side": "sell", "qty": "0.005", "price": "60000.00"},
+        {"symbol": "MGN", "side": "buy", "qty": "1", "price": "100.00", "transaction_time": "2026-08-02T14:00:00Z"},
+        {
+            "symbol": "BTC/USD",
+            "side": "sell",
+            "qty": "0.005",
+            "price": "60000.00",
+            "transaction_time": "2026-08-02T15:00:00Z",
+        },
     ]
     fake_client = FakeTradingClient(positions, activities)
     monkeypatch.setattr(graph, "trading_client", fake_client)

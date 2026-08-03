@@ -19,6 +19,7 @@ def fetch_fills(date: str, only_crypto: bool | None = None) -> list[dict]:
             "side": f["side"],
             "qty": float(f["qty"]),
             "price": float(f["price"]),
+            "time": f["transaction_time"],
         }
         for f in raw
     ]

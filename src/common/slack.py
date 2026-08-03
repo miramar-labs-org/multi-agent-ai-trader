@@ -1,5 +1,7 @@
 import os
+from datetime import datetime
 
+import pytz
 import requests
 
 from src.common.config import load_config
@@ -10,6 +12,17 @@ log = get_logger("SLACK")
 _cfg = load_config()
 _ENABLED = _cfg.slack.enabled
 _WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
+
+
+def _timestamp() -> str:
+    return datetime.now(pytz.timezone("US/Eastern")).strftime("%Y-%m-%d %I:%M:%S %p %Z")
+
+
+def _format_fill_time(iso_time: str) -> str:
+    # Alpaca's activities API returns transaction_time as an ISO 8601 UTC string (e.g.
+    # "2026-08-03T14:32:01.123456Z") -- fromisoformat needs "+00:00", not a bare "Z".
+    dt = datetime.fromisoformat(iso_time.replace("Z", "+00:00"))
+    return dt.astimezone(pytz.timezone("US/Eastern")).strftime("%I:%M %p %Z")
 
 
 def _post(text: str) -> None:
@@ -43,12 +56,36 @@ def notify_morning_report(report_date: str, account: dict, symbols: list[dict]) 
 
 def notify_dealer_signal(symbol: str, action: str, reasoning: str) -> None:
     emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪"}.get(action, "")
-    _post(f"{emoji} *Dealer* — *{action}* {symbol}\n> {reasoning}")
+    _post(f"{emoji} *Dealer* — *{action}* {symbol} _{_timestamp()}_\n> {reasoning}")
 
 
-def notify_floor_broker_result(symbol: str, action: str, status: str, detail: str) -> None:
+def notify_floor_broker_result(
+    symbol: str,
+    action: str,
+    status: str,
+    detail: str,
+    *,
+    reason: str | None = None,
+    fill_price: float | None = None,
+    sl_price: float | None = None,
+    tp_price: float | None = None,
+) -> None:
     emoji = "✅" if status == "executed" else ("⚠️" if status == "skipped" else "❌")
-    _post(f"{emoji} *Floor Broker* — {action} {symbol}: `{status}` — {detail}")
+    lines = [f"{emoji} *Floor Broker* — {action} {symbol}: `{status}` — {detail} _{_timestamp()}_"]
+
+    details = []
+    if reason is not None:
+        details.append(f"reason: {reason}")
+    if fill_price is not None:
+        details.append(f"fill: ${fill_price:,.2f}")
+    if sl_price is not None:
+        details.append(f"SL: ${sl_price:,.2f}")
+    if tp_price is not None:
+        details.append(f"TP: ${tp_price:,.2f}")
+    if details:
+        lines.append("> " + " | ".join(details))
+
+    _post("\n".join(lines))
 
 
 def notify_error(component: str, text: str) -> None:
@@ -76,7 +113,10 @@ def notify_eod_report(report_date: str, account: dict, fills: list[dict], positi
 
     if fills:
         lines.append(f"\n*Trades today ({len(fills)}):*")
-        lines += [f"• {f['side'].upper()} {f['qty']:g} {f['symbol']} @ ${f['price']:,.2f}" for f in fills]
+        lines += [
+            f"• {f['side'].upper()} {f['qty']:g} {f['symbol']} @ ${f['price']:,.2f} ({_format_fill_time(f['time'])})"
+            for f in fills
+        ]
     else:
         lines.append("\n*Trades today:* none")
 
@@ -100,7 +140,10 @@ def notify_crypto_eod_report(report_date: str, fills: list[dict], positions: lis
 
     if fills:
         lines.append(f"\n*Crypto trades ({len(fills)}):*")
-        lines += [f"• {f['side'].upper()} {f['qty']:g} {f['symbol']} @ ${f['price']:,.2f}" for f in fills]
+        lines += [
+            f"• {f['side'].upper()} {f['qty']:g} {f['symbol']} @ ${f['price']:,.2f} ({_format_fill_time(f['time'])})"
+            for f in fills
+        ]
     else:
         lines.append("\n*Crypto trades:* none")
 

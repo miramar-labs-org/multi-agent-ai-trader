@@ -1,8 +1,10 @@
 import json
+import time
 
 from alpaca.common.exceptions import APIError
-from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
+from alpaca.trading.enums import OrderClass, OrderSide, OrderStatus, OrderType, TimeInForce
 from alpaca.trading.requests import (
+    GetOrderByIdRequest,
     GetOrdersRequest,
     MarketOrderRequest,
     StopLossRequest,
@@ -15,6 +17,58 @@ from src.common.logging import get_logger
 log = get_logger("FLOOR")
 
 MIN_CRYPTO_NOTIONAL = 10.0  # Alpaca rejects a crypto notional below this (code 40310000)
+
+FILL_POLL_ATTEMPTS = 5
+FILL_POLL_INTERVAL_S = 1.0
+
+_TERMINAL_NO_FILL = {OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED}
+
+# Tracks the parent order id of each open bracket BUY, keyed by symbol, so the fill-watcher
+# (check_bracket_fills) can later find out which of its TP/SL legs eventually filled. In-memory
+# only -- lost on a Floor Broker pod restart, meaning a bracket that fills while the pod is down
+# won't produce a Slack notice for that fill (the trade itself still executes fine on Alpaca's
+# side, only the notification is missed).
+_tracked_brackets: dict[str, str] = {}
+
+
+def _wait_for_fill(order_id: str) -> float | None:
+    for _ in range(FILL_POLL_ATTEMPTS):
+        order = trading_client.get_order_by_id(order_id)
+        if order.filled_avg_price is not None:
+            return float(order.filled_avg_price)
+        time.sleep(FILL_POLL_INTERVAL_S)
+    return None
+
+
+def check_bracket_fills() -> list[dict]:
+    """Polls every tracked bracket BUY for a TP or SL leg that has since filled. A bracket's two
+    child legs are OCO (one-cancels-other) on Alpaca's side -- once either fills, the other is
+    auto-cancelled, so a symbol is untracked as soon as either outcome is observed."""
+    events = []
+    for symbol, order_id in list(_tracked_brackets.items()):
+        try:
+            order = trading_client.get_order_by_id(order_id, filter=GetOrderByIdRequest(nested=True))
+        except APIError:
+            _tracked_brackets.pop(symbol, None)
+            continue
+
+        legs = order.legs or []
+        filled_leg = next((leg for leg in legs if leg.status == OrderStatus.FILLED), None)
+        if filled_leg is not None:
+            events.append(
+                {
+                    "symbol": symbol,
+                    "order_id": filled_leg.id,
+                    "reason": "take_profit" if filled_leg.type == OrderType.LIMIT else "stop_loss",
+                    "fill_price": float(filled_leg.filled_avg_price) if filled_leg.filled_avg_price else None,
+                    "qty": float(filled_leg.filled_qty) if filled_leg.filled_qty else None,
+                }
+            )
+            _tracked_brackets.pop(symbol, None)
+        elif legs and all(leg.status in _TERMINAL_NO_FILL for leg in legs):
+            _tracked_brackets.pop(symbol, None)
+
+    return events
 
 
 def get_open_position(symbol: str) -> float:
@@ -144,7 +198,25 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
         order = trading_client.submit_order(req)
 
     log(f"✅  buy order submitted: {order.id}")
-    return {"status": "executed", "detail": f"buy order submitted: {order.id}"}
+    fill_price = _wait_for_fill(order.id)
+
+    if exchange == "stocks":
+        _tracked_brackets[symbol] = order.id
+        sl_price = req.stop_loss.stop_price
+        tp_price = req.take_profit.limit_price
+    else:
+        sl_price = None
+        tp_price = None
+
+    return {
+        "status": "executed",
+        "reason": "opening_position",
+        "detail": f"buy order submitted: {order.id}",
+        "order_id": order.id,
+        "fill_price": fill_price,
+        "sl_price": sl_price,
+        "tp_price": tp_price,
+    }
 
 
 def sell(symbol: str) -> dict:
@@ -156,10 +228,21 @@ def sell(symbol: str) -> dict:
 
     req = MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC)
 
+    # An explicit SELL closes the position, which also cancels any still-open TP/SL bracket legs
+    # on Alpaca's side -- stop watching for a bracket fill on this symbol immediately rather than
+    # waiting for check_bracket_fills() to notice the legs went terminal with no fill.
+    _tracked_brackets.pop(symbol, None)
+
     try:
         order = trading_client.submit_order(req)
         log(f"✅  sell order submitted: {order.id}")
-        return {"status": "executed", "detail": f"sell order submitted: {order.id}"}
+        return {
+            "status": "executed",
+            "reason": "dealer_signal",
+            "detail": f"sell order submitted: {order.id}",
+            "order_id": order.id,
+            "fill_price": _wait_for_fill(order.id),
+        }
     except APIError as exc:
         try:
             err = json.loads(str(exc))
@@ -186,7 +269,13 @@ def sell(symbol: str) -> dict:
             log("🔄  retrying after clean-up ...")
             order = trading_client.submit_order(req)
             log(f"✅  sell order submitted: {order.id}")
-            return {"status": "executed", "detail": f"sell order submitted: {order.id}"}
+            return {
+                "status": "executed",
+                "reason": "dealer_signal",
+                "detail": f"sell order submitted: {order.id}",
+                "order_id": order.id,
+                "fill_price": _wait_for_fill(order.id),
+            }
         except APIError as retry_exc:
             log(f"💥  sell retry failed for {symbol}: {retry_exc}")
             raise
