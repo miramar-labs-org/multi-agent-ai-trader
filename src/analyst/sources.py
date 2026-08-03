@@ -69,6 +69,7 @@ def fetch_news(days: int, limit: int = 20) -> str:
     client = NewsClient(
         api_key=os.getenv("ALPACA_PAPER_API_KEY"),
         secret_key=os.getenv("ALPACA_PAPER_API_SECRET"),
+        raw_data=True,
     )
 
     req = NewsRequest(
@@ -76,7 +77,6 @@ def fetch_news(days: int, limit: int = 20) -> str:
         end=datetime.now(),
         limit=limit,
         include_content=True,
-        raw_data=True,
     )
 
     articles = client.get_news(req)["news"]
