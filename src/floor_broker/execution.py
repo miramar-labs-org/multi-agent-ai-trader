@@ -95,9 +95,13 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
     if exchange == "stocks":
         req = bracket_buy_with_SLTP(symbol, budget, slP, tpP)
     else:
+        # Alpaca rejects a crypto notional with more than 2 decimal places (code 42210000); the
+        # BTCUSD failure came from a `budget` value with more precision than that (e.g. a
+        # merged position's market_value), so round before submitting rather than trusting the
+        # caller to have already done so.
         req = MarketOrderRequest(
             symbol=symbol,
-            notional=budget,
+            notional=round(budget, 2),
             side=OrderSide.BUY,
             time_in_force=TimeInForce.GTC,
         )

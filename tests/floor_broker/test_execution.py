@@ -106,6 +106,19 @@ def test_buy_retries_with_alpacas_base_price_on_bracket_rejection(monkeypatch, s
     assert retry_req.stop_loss.stop_price <= base_price - 0.01
 
 
+def test_crypto_buy_rounds_notional_to_2_decimal_places(monkeypatch):
+    """Regression for a live BUY BTCUSD rejection: {"code":42210000,"message":"notional value
+    must be limited to 2 decimal places"} -- a `budget` with more precision than that (e.g. a
+    merged position's market_value) must be rounded before being sent as notional."""
+    fake_client = FakeTradingClient()
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    result = execution.buy("BTC/USD", "binance", 123.456789, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "executed"
+    assert fake_client.submitted[0].notional == 123.46
+
+
 def test_buy_reraises_on_unrelated_api_error(monkeypatch):
     """buy()'s retry is specific to the base_price mismatch (code 42210000 with a base_price
     field) -- any other rejection must propagate, not be silently retried/swallowed."""
