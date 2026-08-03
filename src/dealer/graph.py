@@ -43,7 +43,10 @@ def llm_call(state: DealerState, cfg) -> DealerState:
 
     system_prompt = (
         "You are an expert technical trader in stocks. "
-        "Based on the values of ALL of the indicators below, decide if you should BUY, SELL, or HOLD."
+        "Based on the values of ALL of the indicators below, decide if you should BUY, SELL, or HOLD. "
+        "size_hint must be a decimal fraction between 0.0 and 1.0 representing the portion of the "
+        "symbol's budget to deploy on a BUY (e.g. 0.5 = half the budget, 1.0 = the full budget) -- "
+        "never a dollar amount or share count."
     )
     user_prompt = f"Indicators for {state['symbol']}:\n{state['indicators_text']}"
 
