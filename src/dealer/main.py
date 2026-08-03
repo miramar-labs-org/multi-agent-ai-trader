@@ -53,7 +53,7 @@ def main():
     while True:
         if market_is_open(cfg, log):
             try:
-                portfolio = merge_held_positions(read_portfolio())
+                portfolio = merge_held_positions(read_portfolio(), cfg)
             except (ApiException, json.JSONDecodeError) as exc:
                 log(f"⚠️ BAD portfolio read .. cannot proceed: {exc}")
                 slack.notify_error("DEALER", f"portfolio read failed: {exc}")
@@ -62,7 +62,7 @@ def main():
 
             taapi_calls = 0
             for entry in portfolio.get("symbols", []):
-                if entry["exchange"] != "stocks":
+                if entry["exchange"] != "stocks" and not cfg.trading.enable_crypto:
                     continue
                 if taapi_calls > 0:
                     # TAAPI's free plan allows 1 request/15s -- fetch_indicators makes exactly

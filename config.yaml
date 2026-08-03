@@ -22,6 +22,8 @@ trading:
   pollsecs: 600
   buffer: 15
   market_override: false
+  enable_crypto: true         # TEMPORARILY on to test crypto merge/trading live -- flip back to false once verified
+  crypto_taapi_exchange: "binance"   # TAAPI venue used for indicator requests on merged crypto positions
 
 eod_report:
   schedule: "30 21 * * 1-5"   # informational copy of the CronJob's own spec.schedule — 21:30 UTC Mon-Fri, after market close

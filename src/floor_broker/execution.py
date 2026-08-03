@@ -44,14 +44,20 @@ def get_qty(symbol: str, budget: float) -> int:
     return int(budget // ask)
 
 
+def _round_to_tick(price: float) -> float:
+    # SEC Rule 612 / Alpaca: sub-$1 stocks are quoted in $0.0001 increments, not $0.01 --
+    # rounding to 2dp for these can land TP/SL on the same cent as base_price and get rejected.
+    return round(price, 4) if price < 1.0 else round(price, 2)
+
+
 def bracket_buy_with_SLTP(symbol: str, budget: float, slP: float, tpP: float) -> MarketOrderRequest:
     # A bracket BUY fills near the ask, not the bid/ask mid -- pricing TP/SL off mid understates
     # the real entry price and can fall below Alpaca's `base_price + 0.01` floor on wide-spread
     # symbols, causing the whole order to be rejected.
     ask = get_current_ask_price(symbol)
 
-    take_profit_px = round(ask * tpP, 2)
-    stop_loss_px = round(ask * slP, 2)
+    take_profit_px = _round_to_tick(ask * tpP)
+    stop_loss_px = _round_to_tick(ask * slP)
 
     log(f"📈  ask-price {ask:.2f} => TP {take_profit_px}  |  SL {stop_loss_px}")
 
