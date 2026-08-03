@@ -2,180 +2,154 @@ import os
 
 import requests
 
-
-def build_props(indicators_cfg, indicator_name: str) -> str:
-    for indicator in indicators_cfg:
-        if indicator["name"] == indicator_name:
-            return "".join(f"&{k}={v}" for k, v in indicator["properties"].items())
-    return ""
+TAAPI_BULK_URL = "https://api.taapi.io/bulk"
 
 
-def _taapi_url(ind: str, secret: str, symbol: str, exchange: str, props: str) -> str:
-    if exchange != "stocks":
-        return f"https://api.taapi.io/{ind}?secret={secret}&exchange={exchange}&symbol={symbol}{props}"
-    return f"https://api.taapi.io/{ind}?secret={secret}&type=stocks&symbol={symbol}{props}"
+def _fmt_rsi(result, symbol):
+    return (
+        [f"📈 rsi: {result['value']}"],
+        f"The current Relative Strength Index (RSI) for {symbol} is {result['value']}",
+    )
 
 
-def fetch_rsi(indicators_cfg, symbol: str, exchange: str, log) -> str:
-    ind = "rsi"
-    secret = os.getenv("TAAPI_API_KEY")
-    props = build_props(indicators_cfg, ind)
-    url = _taapi_url(ind, secret, symbol, exchange, props)
-
-    response = requests.get(url)
-    if response.status_code == 200:
-        log(f"📈 rsi: {response.json()['value']}")
-        return f"The current Relative Strength Index (RSI) for {symbol} is {response.json()['value']}"
-    e = f"⚠️ rsi error: {response.status_code}"
-    log(e)
-    return e
+def _fmt_sma(result, symbol):
+    return (
+        [f"📈 sma: {result['value']}"],
+        f"The current Simple Moving Average (SMA) for {symbol} is {result['value']}",
+    )
 
 
-def fetch_sma(indicators_cfg, symbol: str, exchange: str, log) -> str:
-    ind = "sma"
-    secret = os.getenv("TAAPI_API_KEY")
-    props = build_props(indicators_cfg, ind)
-    url = _taapi_url(ind, secret, symbol, exchange, props)
-
-    response = requests.get(url)
-    if response.status_code == 200:
-        log(f"📈 sma: {response.json()['value']}")
-        return f"The current Simple Moving Average (SMA) for {symbol} is {response.json()['value']}"
-    e = f"⚠️ sma error: {response.status_code}"
-    log(e)
-    return e
+def _fmt_ema(result, symbol):
+    return (
+        [f"📈 ema: {result['value']}"],
+        f"The current Exponential Moving Average (EMA) for {symbol} is {result['value']}",
+    )
 
 
-def fetch_ema(indicators_cfg, symbol: str, exchange: str, log) -> str:
-    ind = "ema"
-    secret = os.getenv("TAAPI_API_KEY")
-    props = build_props(indicators_cfg, ind)
-    url = _taapi_url(ind, secret, symbol, exchange, props)
-
-    response = requests.get(url)
-    if response.status_code == 200:
-        log(f"📈 ema: {response.json()['value']}")
-        return f"The current Exponential Moving Average (EMA) for {symbol} is {response.json()['value']}"
-    e = f"⚠️ ema error: {response.status_code}"
-    log(e)
-    return e
+def _fmt_macd(result, symbol):
+    return (
+        [
+            f"📈 macd: {result['valueMACD']}",
+            f"📈 macdsig: {result['valueMACDSignal']}",
+            f"📈 macdhist: {result['valueMACDHist']}",
+        ],
+        f"The current Moving Average convergence Divergence (MACD) values for {symbol} are "
+        f"MACD {result['valueMACD']}, MACD Signal {result['valueMACDSignal']}, MACD History{result['valueMACDHist']}",
+    )
 
 
-def fetch_macd(indicators_cfg, symbol: str, exchange: str, log) -> str:
-    ind = "macd"
-    secret = os.getenv("TAAPI_API_KEY")
-    props = build_props(indicators_cfg, ind)
-    url = _taapi_url(ind, secret, symbol, exchange, props)
-
-    response = requests.get(url)
-    if response.status_code == 200:
-        body = response.json()
-        log(f"📈 macd: {body['valueMACD']}")
-        log(f"📈 macdsig: {body['valueMACDSignal']}")
-        log(f"📈 macdhist: {body['valueMACDHist']}")
-        return (
-            f"The current Moving Average convergence Divergence (MACD) values for {symbol} are "
-            f"MACD {body['valueMACD']}, MACD Signal {body['valueMACDSignal']}, MACD History{body['valueMACDHist']}"
-        )
-    e = f"⚠️ macd error: {response.status_code}"
-    log(e)
-    return e
+def _fmt_bbands(result, symbol):
+    return (
+        [
+            f"📈 bbandupper: {result['valueUpperBand']}",
+            f"📈 bbandmiddle: {result['valueMiddleBand']}",
+            f"📈 bbandlower: {result['valueLowerBand']}",
+        ],
+        f"The current Bollinger Bands for {symbol} are: Lower {result['valueLowerBand']}, "
+        f"LowMiddleer {result['valueMiddleBand']}, Upper {result['valueUpperBand']}",
+    )
 
 
-def fetch_bbands(indicators_cfg, symbol: str, exchange: str, log) -> str:
-    ind = "bbands"
-    secret = os.getenv("TAAPI_API_KEY")
-    props = build_props(indicators_cfg, ind)
-    url = _taapi_url(ind, secret, symbol, exchange, props)
-
-    response = requests.get(url)
-    if response.status_code == 200:
-        body = response.json()
-        log(f"📈 bbandupper: {body['valueUpperBand']}")
-        log(f"📈 bbandmiddle: {body['valueMiddleBand']}")
-        log(f"📈 bbandlower: {body['valueLowerBand']}")
-        return (
-            f"The current Bollinger Bands for {symbol} are: Lower {body['valueLowerBand']}, "
-            f"LowMiddleer {body['valueMiddleBand']}, Upper {body['valueUpperBand']}"
-        )
-    e = f"⚠️ bband error: {response.status_code}"
-    log(e)
-    return e
+def _fmt_volume(result, symbol):
+    return (
+        [f"📈 vol: {result['value']}"],
+        f"The current Volume for {symbol} is {result['value']}",
+    )
 
 
-def fetch_volume(indicators_cfg, symbol: str, exchange: str, log) -> str:
-    ind = "volume"
-    secret = os.getenv("TAAPI_API_KEY")
-    props = build_props(indicators_cfg, ind)
-    url = _taapi_url(ind, secret, symbol, exchange, props)
-
-    response = requests.get(url)
-    if response.status_code == 200:
-        log(f"📈 vol: {response.json()['value']}")
-        return f"The current Volume for {symbol} is {response.json()['value']}"
-    e = f"⚠️ vol error: {response.status_code}"
-    log(e)
-    return e
+def _fmt_vosc(result, symbol):
+    return (
+        [f"📈 vosc: {result['value']}"],
+        f"The current Volume Oscillator for {symbol} is {result['value']}",
+    )
 
 
-def fetch_vosc(indicators_cfg, symbol: str, exchange: str, log) -> str:
-    ind = "vosc"
-    secret = os.getenv("TAAPI_API_KEY")
-    props = build_props(indicators_cfg, ind)
-    url = _taapi_url(ind, secret, symbol, exchange, props)
-
-    response = requests.get(url)
-    if response.status_code == 200:
-        log(f"📈 vosc: {response.json()['value']}")
-        return f"The current Volume Oscillator for {symbol} is {response.json()['value']}"
-    e = f"⚠️ vosc error: {response.status_code}"
-    log(e)
-    return e
+def _fmt_vwap(result, symbol):
+    return (
+        [f"📈 vwap: {result['value']}"],
+        f"The current Volume Weighted Average Price (VWAP) for {symbol} is {result['value']}",
+    )
 
 
-def fetch_vwap(indicators_cfg, symbol: str, exchange: str, log) -> str:
-    ind = "vwap"
-    secret = os.getenv("TAAPI_API_KEY")
-    props = build_props(indicators_cfg, ind)
-    url = _taapi_url(ind, secret, symbol, exchange, props)
-
-    response = requests.get(url)
-    if response.status_code == 200:
-        log(f"📈 vwap: {response.json()['value']}")
-        return f"The current Volume Weighted Average Price (VWAP) for {symbol} is {response.json()['value']}"
-    e = f"⚠️ vwap error: {response.status_code}"
-    log(e)
-    return e
+def _fmt_stochrsi(result, symbol):
+    return (
+        [
+            f"📈 srsiFK: {result['valueFastK']}",
+            f"📈 srsiFD: {result['valueFastD']}",
+        ],
+        f"The current Stochastic Relative Strength Index values for {symbol} are: "
+        f"FastK {result['valueFastK']}, FastD {result['valueFastD']}",
+    )
 
 
-def fetch_stochrsi(indicators_cfg, symbol: str, exchange: str, log) -> str:
-    ind = "stochrsi"
-    secret = os.getenv("TAAPI_API_KEY")
-    props = build_props(indicators_cfg, ind)
-    url = _taapi_url(ind, secret, symbol, exchange, props)
-
-    response = requests.get(url)
-    if response.status_code == 200:
-        body = response.json()
-        log(f"📈 srsiFK: {body['valueFastK']}")
-        log(f"📈 srsiFD: {body['valueFastD']}")
-        return (
-            f"The current Stochastic Relative Strength Index values for {symbol} are: "
-            f"FastK {body['valueFastK']}, FastD {body['valueFastD']}"
-        )
-    e = f"⚠️ srsi error: {response.status_code}"
-    log(e)
-    return e
-
-
-INDICATOR_MAP = {
-    "rsi": fetch_rsi,
-    "stochrsi": fetch_stochrsi,
-    "sma": fetch_sma,
-    "ema": fetch_ema,
-    "volume": fetch_volume,
-    "vosc": fetch_vosc,
-    "macd": fetch_macd,
-    "bbands": fetch_bbands,
-    "vwap": fetch_vwap,
+RESULT_FORMATTERS = {
+    "rsi": _fmt_rsi,
+    "sma": _fmt_sma,
+    "ema": _fmt_ema,
+    "macd": _fmt_macd,
+    "bbands": _fmt_bbands,
+    "volume": _fmt_volume,
+    "vosc": _fmt_vosc,
+    "vwap": _fmt_vwap,
+    "stochrsi": _fmt_stochrsi,
 }
+
+
+def _build_constructs(indicators_cfg, symbol: str, exchange: str, names: list[str]) -> list[dict]:
+    by_interval: dict[str, list[dict]] = {}
+    for name in names:
+        entry = next((i for i in indicators_cfg if i["name"] == name), None)
+        if entry is None:
+            continue
+        props = dict(entry["properties"])
+        interval = props.pop("interval", "1h")
+        by_interval.setdefault(interval, []).append({"id": name, "indicator": name, **props})
+
+    constructs = []
+    for interval, indicators in by_interval.items():
+        construct = {"symbol": symbol, "interval": interval, "indicators": indicators}
+        if exchange == "stocks":
+            construct["type"] = "stocks"
+        else:
+            construct["exchange"] = exchange
+        constructs.append(construct)
+    return constructs
+
+
+def fetch_indicators_bulk(indicators_cfg, symbol: str, exchange: str, names: list[str], log) -> str:
+    """Fetches every requested indicator for one symbol in a single TAAPI /bulk request instead
+    of one GET per indicator. TAAPI's rate limit is per-15-second-window per plan (Free: 1
+    request/15s, Basic: 5, Pro: 30, Expert: 75) -- firing up to 9 individual GETs per symbol
+    back-to-back would blow through even the Pro plan's limit the moment two symbols overlap."""
+    secret = os.getenv("TAAPI_API_KEY")
+    constructs = _build_constructs(indicators_cfg, symbol, exchange, names)
+    if not constructs:
+        return ""
+
+    body = {"secret": secret, "construct": constructs if len(constructs) > 1 else constructs[0]}
+
+    try:
+        response = requests.post(TAAPI_BULK_URL, json=body, timeout=15)
+    except requests.RequestException as exc:
+        log(f"⚠️ taapi bulk request failed for {symbol}: {exc}")
+        return ""
+
+    if response.status_code != 200:
+        log(f"⚠️ taapi bulk error for {symbol}: {response.status_code} {response.text[:200]}")
+        return ""
+
+    lines = []
+    for item in response.json().get("data", []):
+        indicator_id = item.get("id")
+        formatter = RESULT_FORMATTERS.get(indicator_id)
+        if formatter is None:
+            continue
+        if item.get("errors"):
+            log(f"⚠️ {indicator_id} error for {symbol}: {item['errors']}")
+            continue
+        log_lines, text_line = formatter(item["result"], symbol)
+        for line in log_lines:
+            log(line)
+        lines.append(text_line)
+
+    return "\n".join(lines)

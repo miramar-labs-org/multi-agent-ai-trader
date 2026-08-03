@@ -1,7 +1,5 @@
-import os
-
 from src.analyst.graph import build_graph
-from src.common import slack
+from src.common import langsmith, slack
 from src.common.config import load_config
 from src.common.logging import get_logger
 
@@ -10,10 +8,7 @@ log = get_logger("ANALYST")
 
 def main():
     cfg = load_config()
-
-    if cfg.langsmith.enabled:
-        os.environ["LANGCHAIN_TRACING_V2"] = "true"
-        os.environ["LANGCHAIN_PROJECT"] = cfg.langsmith.project
+    langsmith.configure(cfg)
 
     try:
         graph = build_graph()

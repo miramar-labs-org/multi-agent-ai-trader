@@ -8,7 +8,7 @@ from langgraph.graph import END, StateGraph
 from src.common import slack
 from src.common.config import load_config
 from src.common.logging import get_logger
-from src.dealer.indicators import INDICATOR_MAP
+from src.dealer.indicators import fetch_indicators_bulk
 from src.dealer.schema import Signal
 
 log = get_logger("DEALER")
@@ -29,13 +29,8 @@ def fetch_indicators(state: DealerState, cfg) -> DealerState:
     if names == ["ALL"]:
         names = [ind["name"] for ind in cfg.indicators]
 
-    lines = []
-    for name in names:
-        result = INDICATOR_MAP[name](cfg.indicators, state["symbol"], state["exchange"], log)
-        if "error" not in result:
-            lines.append(result)
-
-    return {**state, "indicators_text": "\n".join(lines)}
+    indicators_text = fetch_indicators_bulk(cfg.indicators, state["symbol"], state["exchange"], names, log)
+    return {**state, "indicators_text": indicators_text}
 
 
 def llm_call(state: DealerState, cfg) -> DealerState:

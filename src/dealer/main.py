@@ -1,12 +1,11 @@
 import json
-import os
 import time
 from datetime import datetime, time as dtime, timedelta
 
 import pytz
 from kubernetes.client.exceptions import ApiException
 
-from src.common import slack
+from src.common import langsmith, slack
 from src.common.alpaca_client import trading_client
 from src.common.config import load_config
 from src.common.logging import get_logger
@@ -47,10 +46,7 @@ def market_is_open(cfg, log) -> bool:
 
 def main():
     cfg = load_config()
-
-    if cfg.langsmith.enabled:
-        os.environ["LANGCHAIN_TRACING_V2"] = "true"
-        os.environ["LANGCHAIN_PROJECT"] = cfg.langsmith.project
+    langsmith.configure(cfg)
 
     graph = build_graph()
 
@@ -64,9 +60,16 @@ def main():
                 time.sleep(60)
                 continue
 
+            taapi_calls = 0
             for entry in portfolio.get("symbols", []):
                 if entry["exchange"] != "stocks":
                     continue
+                if taapi_calls > 0:
+                    # TAAPI's free plan allows 1 request/15s -- fetch_indicators makes exactly
+                    # one bulk request per symbol, so spacing symbols out here keeps the whole
+                    # loop under whatever plan's rate limit is configured.
+                    time.sleep(cfg.taapi.min_request_interval_secs)
+                taapi_calls += 1
                 try:
                     state = {
                         "symbol": entry["symbol"],

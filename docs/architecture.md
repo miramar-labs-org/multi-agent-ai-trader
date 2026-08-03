@@ -158,7 +158,7 @@ while True:
 
 | Node | What it does |
 |---|---|
-| `fetch_indicators` | for each indicator configured for the symbol (or all of `cfg.indicators` if the entry says `["ALL"]`), calls the matching function in `indicators.py`, which queries **TAAPI.io** — a third-party technical-analysis API, unrelated to any Miramar platform service — and builds a natural-language indicator text block |
+| `fetch_indicators` | fetches every indicator configured for the symbol (or all of `cfg.indicators` if the entry says `["ALL"]`) from **TAAPI.io** — a third-party technical-analysis API, unrelated to any Miramar platform service — in a single `/bulk` POST request (`indicators.py`), and builds a natural-language indicator text block |
 | `llm_call` | the decision LLM call — see below |
 | `call_floor_broker` | HTTP POST to Floor Broker if action != HOLD |
 
@@ -262,8 +262,9 @@ three components.
    the `portfolio` ConfigMap → a "Morning Market Report" (picks + account balance) is posted to
    Slack, still before market open.
 3. **Every 600s while the market is open** — Dealer reads the ConfigMap fresh, and for each
-   symbol: fetches its configured indicators from TAAPI.io, asks the LLM for BUY/HOLD/SELL,
-   and (if not HOLD) POSTs to Floor Broker.
+   symbol: fetches its configured indicators from TAAPI.io in one `/bulk` request (throttled
+   `taapi.min_request_interval_secs` between symbols to respect TAAPI's per-15s rate limit),
+   asks the LLM for BUY/HOLD/SELL, and (if not HOLD) POSTs to Floor Broker.
 4. Floor Broker fetches a live quote, runs the position/order safety check, and submits a
    bracket order (stocks) or notional market order (crypto) to Alpaca's paper account.
 5. Floor Broker's `{"status": "executed"|"skipped"|"error"}` response is logged by Dealer and
@@ -280,8 +281,10 @@ three components.
 |---|---|---|
 | `llm` | `base_url`, `model`, `temperature` | shared OpenAI-compatible endpoint for **both** Analyst and Dealer LLM calls — see [platform-services.md](platform-services.md) for current wiring status |
 | `langsmith` | `enabled`, `project` | toggles LangGraph/LangChain tracing to LangSmith (requires `LANGCHAIN_API_KEY`) |
+| `langsmith` | `sampling_rate` | fraction of traces actually sent to LangSmith (0.5) — keeps Dealer's poll-driven trace volume under the free Developer plan's 5k traces/month limit |
 | `slack` | `enabled` | toggles posting interesting events (Morning Report, Dealer signals, Floor Broker executions, EOD Report, errors) to `#miramar-trading-floor` (requires `SLACK_WEBHOOK_URL`) |
 | `floor_broker` | `base_url` | in-cluster Service DNS Dealer uses to reach Floor Broker |
+| `taapi` | `min_request_interval_secs` | seconds Dealer waits between symbols' TAAPI `/bulk` calls (15) — sized to the TAAPI Free plan's 1 request/15s cap; lower it if the account is on a paid plan |
 | `trading` | `slP` / `tpP` | stop-loss/take-profit price multipliers on bracket orders (0.98/1.05 ≈ 2% stop, 5% target) |
 | `trading` | `pollsecs` | Dealer loop cadence (600s) |
 | `trading` | `buffer` | minutes to wait after market open before trading (15) |
@@ -310,6 +313,14 @@ three components.
 - **Sell-side retry logic** — Floor Broker explicitly handles Alpaca's "conflicting orders"
   error by cancelling blockers and re-fetching the current quantity before resubmitting,
   rather than failing the sell outright.
+- **TAAPI stays inside its rate limit** — Dealer fetches all of a symbol's indicators in one
+  `/bulk` POST instead of one GET per indicator (up to 9 individual calls per symbol would blow
+  through TAAPI's per-15s rate limit — even on the Pro plan — the moment two symbols overlapped),
+  and throttles `taapi.min_request_interval_secs` between symbols so the whole Dealer loop stays
+  inside whatever plan is configured, still comfortably inside the 600s poll cadence.
+- **LangSmith trace volume is sampled** — `langsmith.sampling_rate` (0.5) keeps Dealer's
+  poll-driven trace count under the free Developer plan's 5k traces/month allowance; set via
+  `LANGSMITH_TRACING_SAMPLING_RATE`, wired centrally in `src/common/langsmith.py`.
 - **Deploys always force a rollout** — `deploy.yaml` always resolves images to the same
   `:latest` tag string, so `kubectl apply` alone would see no pod-template diff and silently
   leave Dealer/Floor Broker pods on stale code. The `dealer`/`floor-broker` k3s manifests carry
