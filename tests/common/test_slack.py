@@ -126,11 +126,12 @@ def test_notify_market_closed_includes_timestamp(monkeypatch):
     assert re.search(_TIMESTAMP_RE, posted["text"])
 
 
-def test_notify_stock_market_closed_includes_timestamp(monkeypatch):
+def test_notify_stock_market_closed_has_no_second_competing_timestamp(monkeypatch):
+    # next_open is already a labeled clock time -- appending the generic "posted at" timestamp
+    # produced two AM/PM times with no indication of which was which.
     posted = {}
     monkeypatch.setattr(slack, "_post", lambda text: posted.update(text=text))
 
     slack.notify_stock_market_closed("2026-08-04 09:30:00 ET")
 
-    assert "2026-08-04 09:30:00 ET" in posted["text"]
-    assert re.search(_TIMESTAMP_RE, posted["text"])
+    assert posted["text"] == "🔒 *Dealer* — stock market is closed. Next open: 2026-08-04 09:30:00 ET"

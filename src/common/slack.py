@@ -97,7 +97,9 @@ def notify_market_closed(component: str, report_date: str) -> None:
 
 
 def notify_stock_market_closed(next_open: str) -> None:
-    _post(f"🔒 *Dealer* — stock market is closed. Next open: {next_open} _{_timestamp()}_")
+    # No trailing _timestamp() here -- next_open is already a labeled clock time, and appending
+    # a second one reads as two competing AM/PM times with no indication of which is which.
+    _post(f"🔒 *Dealer* — stock market is closed. Next open: {next_open}")
 
 
 def notify_eod_report(report_date: str, account: dict, fills: list[dict], positions: list[dict]) -> None:
