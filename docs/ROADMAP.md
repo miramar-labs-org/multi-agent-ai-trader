@@ -16,8 +16,8 @@ All trading remains **paper-only**. SELL operations that reduce exposure should 
 
 | ID | Item | Priority | Status | Depends on |
 |---|---|---:|---|---|
-| P0.1 | Skip crypto orders below minimum notional | P0 | Planned | — |
-| P0.2 | Validate merged-position budget semantics | P0 | Planned | P0.1 |
+| P0.1 | Skip crypto orders below minimum notional | P0 | Done | — |
+| P0.2 | Validate merged-position budget semantics | P0 | Done | P0.1 |
 | P0.3 | Constrained Floor Broker request schema | P0 | Planned | — |
 | P0.4 | Centralized Floor Broker risk policy | P0 | Planned | P0.3 |
 | P0.5 | Runtime BUY kill switch | P0 | Planned | P0.4 |

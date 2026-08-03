@@ -61,5 +61,43 @@ def test_crypto_position_merged_with_configured_exchange_when_enabled(monkeypatc
     result = portfolio_state.merge_held_positions({"symbols": []}, _cfg(enable_stocks=True, enable_crypto=True))
 
     assert result["symbols"] == [
-        {"symbol": "BTC/USD", "exchange": "binance", "budget": 10.0, "indicators": ["ALL"]}
+        {
+            "symbol": "BTC/USD",
+            "exchange": "binance",
+            "budget": 0.0,
+            "held_value": 10.0,
+            "is_held_only": True,
+            "indicators": ["ALL"],
+        }
     ]
+
+
+def test_merged_position_budget_never_equals_market_value(monkeypatch):
+    """Regression: a merged position's current market value must never flow through as new-BUY
+    `budget` -- that would let a large held position silently re-authorize an equally large new
+    BUY (or a shrunk one fall below Alpaca's crypto minimum notional). `held_value` carries the
+    observed exposure instead; `budget` stays 0 for any merged (held-only) entry."""
+    monkeypatch.setattr(
+        portfolio_state, "trading_client", FakeTradingClient([FakePosition("MGN", AssetClass.US_EQUITY, 987.65)])
+    )
+
+    result = portfolio_state.merge_held_positions({"symbols": []}, _cfg(enable_stocks=True, enable_crypto=True))
+
+    entry = result["symbols"][0]
+    assert entry["budget"] == 0.0
+    assert entry["held_value"] == 987.65
+    assert entry["is_held_only"] is True
+
+
+def test_analyst_picked_symbol_budget_is_left_untouched(monkeypatch):
+    """A symbol already in the watchlist (Analyst's own pick, with its own real budget) must not
+    be touched by the merge step at all -- the budget=0 rule only applies to entries the merge
+    step itself synthesizes for previously-unmanaged positions."""
+    monkeypatch.setattr(
+        portfolio_state, "trading_client", FakeTradingClient([FakePosition("NVDA", AssetClass.US_EQUITY, 500.0)])
+    )
+    portfolio = {"symbols": [{"symbol": "NVDA", "exchange": "stocks", "budget": 5000, "indicators": ["ALL"]}]}
+
+    result = portfolio_state.merge_held_positions(portfolio, _cfg(enable_stocks=True, enable_crypto=True))
+
+    assert result["symbols"] == [{"symbol": "NVDA", "exchange": "stocks", "budget": 5000, "indicators": ["ALL"]}]

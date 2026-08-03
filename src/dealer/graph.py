@@ -64,6 +64,18 @@ def call_floor_broker(state: DealerState, cfg) -> DealerState:
     if signal["action"] == "HOLD":
         return {**state, "execution_result": {"status": "skipped", "detail": "HOLD"}}
 
+    if signal["action"] == "BUY" and state["budget"] <= 0:
+        # A held-only position (merge_held_positions()) carries budget=0 -- its market value is
+        # observed exposure, not authorized new-BUY capital. Never forward a BUY for it.
+        log(f"⚠️  no authorized BUY budget for {state['symbol']} (held position) -- skipping")
+        result = {
+            "status": "skipped",
+            "reason": "no_authorized_budget",
+            "detail": "held position has no authorized new-BUY budget",
+        }
+        slack.notify_floor_broker_result(state["symbol"], signal["action"], result["status"], result["detail"])
+        return {**state, "execution_result": result}
+
     payload = {
         "symbol": state["symbol"],
         "exchange": state["exchange"],

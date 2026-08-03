@@ -172,7 +172,9 @@ of the indicators below, decide if you should BUY, SELL, or HOLD."* The `Signal`
 (`src/dealer/schema.py`) is `{symbol, action: BUY|HOLD|SELL, reasoning, size_hint}` —
 `size_hint` (a 0–1 fraction) is captured in the schema but **not currently consumed**;
 `call_floor_broker` forwards the symbol's configured `budget` unmodified regardless of
-`size_hint`.
+`size_hint` — except a BUY signal on a held-only entry (`budget == 0`, see
+`merge_held_positions()` above), which is refused locally (`status="skipped",
+reason="no_authorized_budget"`) rather than forwarded.
 
 **Dispatch to Floor Broker** — plain in-cluster HTTP, no message queue:
 ```python
@@ -215,12 +217,12 @@ rather than raised; unexpected exceptions become a 500.
   `base_price` and get rejected. For crypto symbols (`/` in the ticker), submits a plain
   notional market buy instead (`TimeInForce.GTC`) — bracket orders aren't used for crypto.
   The notional amount is rounded to 2 decimals before submitting — Alpaca rejects a crypto
-  notional with finer precision than that (`code 42210000`), which a `budget` value carrying
-  extra precision (e.g. a merged position's `market_value`) can otherwise trigger. The rounded
-  notional is then clamped up to `MIN_CRYPTO_NOTIONAL` ($10) if it falls below that floor —
-  Alpaca also rejects a crypto notional under its minimum order value (`code 40310000`, "cost
-  basis must be >= minimal amount of order 10"), which a merged position sized off a shrunk
-  `market_value` can otherwise trigger.
+  notional with finer precision than that (`code 42210000`). If the rounded notional is below
+  `MIN_CRYPTO_NOTIONAL` ($10) — Alpaca also rejects a crypto notional under its minimum order
+  value (`code 40310000`, "cost basis must be >= minimal amount of order 10") — the BUY is
+  **skipped** (`status="skipped", reason="budget_below_minimum"`), not clamped up: silently
+  raising the notional to the minimum could submit an order larger than the caller's intended
+  budget.
 - **`sell()`** — sells the full open quantity at market. Has an explicit **retry-after-cleanup**
   path: if Alpaca rejects with error code `40310000` (conflicting orders blocking the sell),
   it cancels the blocking orders (ignoring 404s), *re-fetches* the now-current open quantity
@@ -271,6 +273,17 @@ three components.
   TAAPI venue. Dealer's own poll loop applies the same two flags symmetrically via
   `should_process_entry()` (`src/dealer/main.py`), so a disabled market is skipped whether or
   not a stray position for it is already sitting in the ConfigMap.
+
+  A merged entry's current market value is **observed exposure, not authorized new-BUY
+  capital** — it's carried as `held_value`, while `budget` is set to `0.0` and `is_held_only:
+  true` is set. This distinction exists because the position's value flowing straight through
+  as `budget` would let a large held position silently re-authorize an equally large new BUY
+  (or a shrunk one fall below Alpaca's crypto minimum notional — the original bug behind the
+  crypto skip-vs-clamp fix above). `call_floor_broker` (`src/dealer/graph.py`) still lets the
+  LLM decide BUY/HOLD/SELL for a held-only entry (using `held_value` as context), but refuses
+  to forward a BUY when `budget <= 0` (`status="skipped", reason="no_authorized_budget"`)
+  rather than sizing an order off it. Symbols Analyst actually picked keep their own real
+  `budget` untouched by the merge step.
 - **`logging.py`** — an emoji-prefixed stdout logger (ported from `gpt-trader.py`) — the only
   durable trail of a trading decision is `kubectl logs` output plus whatever LangSmith
   captured of the LLM call chain; trade outcomes are not written to any database or MLflow.

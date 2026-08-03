@@ -119,15 +119,26 @@ def test_crypto_buy_rounds_notional_to_2_decimal_places(monkeypatch):
     assert fake_client.submitted[0].notional == 123.46
 
 
-def test_crypto_buy_clamps_notional_below_alpacas_minimum(monkeypatch):
-    """Regression for a live BUY BTCUSD rejection: {"code":40310000,"message":"cost basis must be
-    >= minimal amount of order 10"} -- a merged position's budget (sized off a shrunk
-    market_value) can fall under Alpaca's crypto minimum notional; it must be clamped up to that
-    floor rather than submitted as-is and rejected."""
+def test_crypto_buy_skips_notional_below_alpacas_minimum(monkeypatch):
+    """A budget below Alpaca's crypto minimum notional (code 40310000, "cost basis must be >=
+    minimal amount of order 10") must be skipped, not clamped up -- clamping would silently
+    submit an order larger than the caller's intended budget."""
     fake_client = FakeTradingClient()
     monkeypatch.setattr(execution, "trading_client", fake_client)
 
     result = execution.buy("BTC/USD", "binance", 3.5, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "budget_below_minimum"
+    assert fake_client.submitted == []
+
+
+def test_crypto_buy_executes_at_exactly_the_minimum_notional(monkeypatch):
+    """The minimum itself must still be accepted -- only strictly-below values are skipped."""
+    fake_client = FakeTradingClient()
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    result = execution.buy("BTC/USD", "binance", execution.MIN_CRYPTO_NOTIONAL, slP=0.98, tpP=1.05)
 
     assert result["status"] == "executed"
     assert fake_client.submitted[0].notional == execution.MIN_CRYPTO_NOTIONAL

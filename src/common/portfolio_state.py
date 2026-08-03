@@ -52,7 +52,15 @@ def merge_held_positions(portfolio: dict, cfg) -> dict:
             {
                 "symbol": position.symbol,
                 "exchange": exchange,
-                "budget": float(position.market_value),
+                # A merged position's current market value is observed exposure, not authorized
+                # new-BUY capital -- passing it through as `budget` would let a large held
+                # position silently re-authorize an equally large new BUY (and a shrunk one could
+                # fall below Alpaca's crypto minimum notional). `held_value` carries the value for
+                # SELL/HOLD context; `budget` stays 0 so a BUY on a held-only position is refused
+                # by call_floor_broker rather than sized off it.
+                "budget": 0.0,
+                "held_value": float(position.market_value),
+                "is_held_only": True,
                 "indicators": ["ALL"],
             }
         )

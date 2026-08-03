@@ -104,12 +104,16 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
         notional = round(budget, 2)
 
         # Alpaca also rejects a crypto notional below its minimum order value (code 40310000,
-        # "cost basis must be >= minimal amount of order 10") -- a merged position sized off a
-        # shrunk market_value can fall under that floor, so clamp up to it rather than let the
-        # BUY fail outright.
+        # "cost basis must be >= minimal amount of order 10"). Clamping up to that floor would
+        # silently submit an order larger than the caller's intended budget, so skip instead --
+        # the caller (Dealer) is responsible for supplying a sufficient budget in the first place.
         if notional < MIN_CRYPTO_NOTIONAL:
-            log(f"⚠️  budget {notional} below Alpaca's ${MIN_CRYPTO_NOTIONAL:.0f} crypto minimum -- clamping up")
-            notional = MIN_CRYPTO_NOTIONAL
+            log(f"⚠️  budget {notional} below Alpaca's ${MIN_CRYPTO_NOTIONAL:.0f} crypto minimum -- skipping")
+            return {
+                "status": "skipped",
+                "reason": "budget_below_minimum",
+                "detail": f"budget {notional} below ${MIN_CRYPTO_NOTIONAL:.0f} crypto minimum",
+            }
 
         req = MarketOrderRequest(
             symbol=symbol,
