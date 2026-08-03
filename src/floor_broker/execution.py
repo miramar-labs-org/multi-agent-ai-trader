@@ -56,8 +56,11 @@ def bracket_buy_with_SLTP(symbol: str, budget: float, slP: float, tpP: float) ->
     # symbols, causing the whole order to be rejected.
     ask = get_current_ask_price(symbol)
 
-    take_profit_px = _round_to_tick(ask * tpP)
-    stop_loss_px = _round_to_tick(ask * slP)
+    # Alpaca also enforces an absolute $0.01 minimum distance between TP/SL and base_price,
+    # regardless of stock price -- on sub-~$0.50 stocks, slP/tpP's percentage move (e.g. 2%/5%)
+    # doesn't reach a full cent, so the percentage-based price must be clamped to that floor.
+    take_profit_px = max(_round_to_tick(ask * tpP), _round_to_tick(ask + 0.01))
+    stop_loss_px = min(_round_to_tick(ask * slP), _round_to_tick(ask - 0.01))
 
     log(f"📈  ask-price {ask:.2f} => TP {take_profit_px}  |  SL {stop_loss_px}")
 
