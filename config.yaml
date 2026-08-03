@@ -23,7 +23,7 @@ trading:
   buffer: 15
   market_override: false
   enable_stocks: true         # set false to pause Analyst/Dealer handling of equities entirely
-  enable_crypto: true         # TEMPORARILY on to test crypto merge/trading live -- flip back to false once verified
+  enable_crypto: true         # crypto merge/trading verified live (BTC/USD test buy + Analyst crypto picks)
   crypto_taapi_exchange: "binance"   # TAAPI venue used for indicator requests on crypto symbols
 
 eod_report:
