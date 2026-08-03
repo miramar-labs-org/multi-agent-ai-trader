@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 
 import pytz
+from alpaca.trading.enums import AssetClass
 from omegaconf import OmegaConf
 
 from src.analyst import graph
@@ -46,11 +47,12 @@ def test_validate_selection_drops_hallucinated_pick():
 
 
 class FakePosition:
-    def __init__(self, symbol, qty, market_value, unrealized_plpc):
+    def __init__(self, symbol, qty, market_value, unrealized_plpc, asset_class):
         self.symbol = symbol
         self.qty = qty
         self.market_value = market_value
         self.unrealized_plpc = unrealized_plpc
+        self.asset_class = asset_class
 
 
 class FakeTradingClient:
@@ -79,9 +81,11 @@ def test_crypto_eod_report_posts_only_crypto_positions_and_fills_for_the_prior_d
     """Crypto trades 24/7 -- this rides along with the morning report and must cover the prior
     full ET calendar day, filtered to crypto-only positions/fills (equities are the stock EOD
     CronJob's job, not this one's)."""
+    # Alpaca's live Position.symbol for crypto has no slash (e.g. "BTCUSD"), unlike fill/activity
+    # records ("BTC/USD") -- filtering must key off asset_class, not symbol shape.
     positions = [
-        FakePosition("MGN", "3", "150.00", "0.05"),
-        FakePosition("BTC/USD", "0.01", "600.00", "-0.02"),
+        FakePosition("MGN", "3", "150.00", "0.05", AssetClass.US_EQUITY),
+        FakePosition("BTCUSD", "0.01", "600.00", "-0.02", AssetClass.CRYPTO),
     ]
     activities = [
         {"symbol": "MGN", "side": "buy", "qty": "1", "price": "100.00"},
@@ -102,4 +106,4 @@ def test_crypto_eod_report_posts_only_crypto_positions_and_fills_for_the_prior_d
     expected_date = (datetime.now(pytz.timezone("US/Eastern")) - timedelta(days=1)).date().isoformat()
     assert posted["report_date"] == expected_date
     assert [f["symbol"] for f in posted["fills"]] == ["BTC/USD"]
-    assert [p["symbol"] for p in posted["positions"]] == ["BTC/USD"]
+    assert [p["symbol"] for p in posted["positions"]] == ["BTCUSD"]

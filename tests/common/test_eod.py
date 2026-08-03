@@ -1,12 +1,15 @@
+from alpaca.trading.enums import AssetClass
+
 from src.common import eod
 
 
 class FakePosition:
-    def __init__(self, symbol, qty, market_value, unrealized_plpc):
+    def __init__(self, symbol, qty, market_value, unrealized_plpc, asset_class):
         self.symbol = symbol
         self.qty = qty
         self.market_value = market_value
         self.unrealized_plpc = unrealized_plpc
+        self.asset_class = asset_class
 
 
 class FakeTradingClient:
@@ -55,25 +58,28 @@ def test_fetch_fills_shapes_qty_and_price_as_floats(monkeypatch):
     assert result == [{"symbol": "MGN", "side": "buy", "qty": 2.5, "price": 10.125}]
 
 
+def _positions():
+    # Alpaca's live Position.symbol for crypto has no slash (e.g. "BTCUSD"), unlike fill/activity
+    # records -- summarize_positions must filter on asset_class, not symbol shape.
+    return [
+        FakePosition("MGN", "3", "150.00", "0.05", AssetClass.US_EQUITY),
+        FakePosition("BTCUSD", "0.01", "600.00", "-0.02", AssetClass.CRYPTO),
+    ]
+
+
 def test_summarize_positions_with_no_filter_returns_everything():
-    positions = [FakePosition("MGN", "3", "150.00", "0.05"), FakePosition("BTC/USD", "0.01", "600.00", "-0.02")]
+    result = eod.summarize_positions(_positions())
 
-    result = eod.summarize_positions(positions)
-
-    assert [p["symbol"] for p in result] == ["MGN", "BTC/USD"]
+    assert [p["symbol"] for p in result] == ["MGN", "BTCUSD"]
 
 
-def test_summarize_positions_only_crypto_true_keeps_only_slash_symbols():
-    positions = [FakePosition("MGN", "3", "150.00", "0.05"), FakePosition("BTC/USD", "0.01", "600.00", "-0.02")]
+def test_summarize_positions_only_crypto_true_keeps_only_crypto_asset_class():
+    result = eod.summarize_positions(_positions(), only_crypto=True)
 
-    result = eod.summarize_positions(positions, only_crypto=True)
-
-    assert result == [{"symbol": "BTC/USD", "qty": 0.01, "market_value": 600.0, "unrealized_plpc": -0.02}]
+    assert result == [{"symbol": "BTCUSD", "qty": 0.01, "market_value": 600.0, "unrealized_plpc": -0.02}]
 
 
-def test_summarize_positions_only_crypto_false_excludes_slash_symbols():
-    positions = [FakePosition("MGN", "3", "150.00", "0.05"), FakePosition("BTC/USD", "0.01", "600.00", "-0.02")]
-
-    result = eod.summarize_positions(positions, only_crypto=False)
+def test_summarize_positions_only_crypto_false_excludes_crypto_asset_class():
+    result = eod.summarize_positions(_positions(), only_crypto=False)
 
     assert result == [{"symbol": "MGN", "qty": 3.0, "market_value": 150.0, "unrealized_plpc": 0.05}]
