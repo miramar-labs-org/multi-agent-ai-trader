@@ -59,8 +59,11 @@ def bracket_buy_with_SLTP(symbol: str, budget: float, slP: float, tpP: float) ->
     # Alpaca also enforces an absolute $0.01 minimum distance between TP/SL and base_price,
     # regardless of stock price -- on sub-~$0.50 stocks, slP/tpP's percentage move (e.g. 2%/5%)
     # doesn't reach a full cent, so the percentage-based price must be clamped to that floor.
-    take_profit_px = max(_round_to_tick(ask * tpP), _round_to_tick(ask + 0.01))
-    stop_loss_px = min(_round_to_tick(ask * slP), _round_to_tick(ask - 0.01))
+    # Clamp to $0.02, not the bare $0.01 minimum -- Alpaca validates against its own base_price,
+    # which can drift slightly from the ask we just fetched on a fast-moving penny stock, and
+    # sitting exactly on the legal boundary leaves no room to absorb that.
+    take_profit_px = max(_round_to_tick(ask * tpP), _round_to_tick(ask + 0.02))
+    stop_loss_px = min(_round_to_tick(ask * slP), _round_to_tick(ask - 0.02))
 
     log(f"📈  ask-price {ask:.2f} => TP {take_profit_px}  |  SL {stop_loss_px}")
 
