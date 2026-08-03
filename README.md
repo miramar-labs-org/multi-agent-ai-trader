@@ -66,39 +66,18 @@ BUY/SELL call has already been made; it only handles order placement, safety che
 | [Slack](https://api.slack.com/messaging/webhooks) | Analyst, Dealer, Floor Broker, EOD Report | Incoming-webhook notifications for interesting events (morning report, BUY/SELL/HOLD signals, executions, EOD summary, errors) to `#miramar-trading-floor` — optional, `config.yaml`'s `slack.enabled`. |
 | OpenAI-compatible LLM endpoint (vLLM, planned) | Analyst, Dealer | Both agents' BUY/HOLD/SELL and symbol-selection decisions. Currently a placeholder in `config.yaml` pending a deployed vLLM serving endpoint. |
 
-## Platform endpoints
+## Quick links
 
-All services require the SSH tunnel from your laptop:
+| Link | Purpose |
+|---|---|
+| [Alpaca paper trading dashboard](https://app.alpaca.markets/paper/dashboard/overview) | Live account state, positions, order history |
+| [TAAPI.io](https://taapi.io/) | Technical indicator provider used by Dealer |
+| [LangSmith](https://smith.langchain.com/) | Agent tracing — project name is `config.yaml`'s `langsmith.project` |
+| [Slack incoming webhooks](https://api.slack.com/messaging/webhooks) | Notification channel: `#miramar-trading-floor` |
+| Ollama | `http://<DGX_HOST_IP>:11434` — LLM inference backend, see `config.yaml`'s `llm.base_url` and [docs/models.md](docs/models.md) |
+| Kubernetes dashboard | Via SSH tunnel (`ssh -L 8001:localhost:8001 <user>@spark-79b7.local`), then [http://localhost:8001/api/v1/namespaces/kubernetes-dashboard/services/http:kubernetes-dashboard:/proxy/](http://localhost:8001/api/v1/namespaces/kubernetes-dashboard/services/http:kubernetes-dashboard:/proxy/) — view the `multi-agent-ai-trader` namespace's pods/jobs |
 
-```sh
-ssh -L 8001:localhost:8001 \
-    -L 8888:localhost:8888 \
-    -L 5000:localhost:5000 \
-    -L 8080:localhost:8080 \
-    -L 8082:localhost:8082 \
-    -L 8890:localhost:8890 \
-    -L 11434:localhost:11434 \
-    -L 6333:localhost:6333 \
-    -L 8889:localhost:8889 \
-    -L 8084:localhost:8084 \
-    <user>@spark-79b7.local
-```
-
-Add to your laptop's `/etc/hosts` (Windows: `C:\Windows\System32\drivers\etc\hosts`):
-
-```
-127.0.0.1 nemo.test nim.test data-store.test
-```
-
-| Service              | URL                                                                                                                                                                                                                | Notes                              |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------- |
-| JupyterLab           | [http://localhost:8888](http://localhost:8888)                                                                                                                                                                     | Notebook environment               |
-| Kubernetes dashboard | [http://localhost:8001/api/v1/namespaces/kubernetes-dashboard/services/http:kubernetes-dashboard:/proxy/](http://localhost:8001/api/v1/namespaces/kubernetes-dashboard/services/http:kubernetes-dashboard:/proxy/) | Cluster state                      |
-| KFP UI               | [http://localhost:8080](http://localhost:8080)                                                                                                                                                                     | Kubeflow Pipelines UI              |
-| KFP API              | [http://localhost:8890/apis/v2beta1/healthz](http://localhost:8890/apis/v2beta1/healthz)                                                                                                                           | KFP REST API                       |
-| MLflow               | [http://localhost:5000](http://localhost:5000)                                                                                                                                                                     | Experiment tracking                |
-| NeMo / NIM           | [http://nemo.test:8082](http://nemo.test:8082)                                                                                                                                                                     | NeMo Microservices + NIM inference |
-| Ollama               | [http://localhost:11434](http://localhost:11434)                                                                                                                                                                   | Local LLM inference                |
-| Qdrant               | [http://localhost:6333/dashboard](http://localhost:6333/dashboard)                                                                                                                                                 | Vector database                    |
-| Nsight UI            | [http://localhost:8889](http://localhost:8889)                                                                                                                                                                     | Nsight Operator profiling UI       |
-| Open WebUI           | [http://localhost:8084](http://localhost:8084)                                                                                                                                                                     | Chat UI (Ollama / vLLM backend)    |
+The full Miramar platform endpoint table (KFP, MLflow, NeMo/NIM, Qdrant, Nsight, Open WebUI) isn't
+included here — this project doesn't use any of those services. See
+[docs/platform-services.md](docs/platform-services.md) for the full breakdown of what's actually
+wired up vs. unused template scaffolding.

@@ -1,32 +1,33 @@
 # Platform services usage
 
-This project scaffolds from the standard Miramar project template, which is
-why the top-level README lists the full platform endpoint table (JupyterLab,
-K8s dashboard, KFP UI/API, MLflow, NeMo/NIM, Ollama, Qdrant, Nsight UI, Open
-WebUI). Most of those are generic scaffolding this project doesn't actually
-call. This doc records which are real dependencies and which aren't, so a
-future reader doesn't have to grep the whole codebase to find out.
+This project scaffolds from the standard Miramar project template, which
+ships a full platform endpoint table (JupyterLab, K8s dashboard, KFP UI/API,
+MLflow, NeMo/NIM, Ollama, Qdrant, Nsight UI, Open WebUI). Most of those are
+generic scaffolding this project doesn't actually call, which is why the
+top-level README's Quick Links section only lists the ones that matter here.
+This doc records which are real dependencies and which aren't, so a future
+reader doesn't have to grep the whole codebase to find out.
 
 ## Actually used
 
 | Service    | How                                                                                                     |
 | ---------- | --------------------------------------------------------------------------------------------------------- |
-| vLLM       | `cfg.llm.base_url` (currently a `TBD` placeholder in `config.yaml`) is passed to `langchain_openai.ChatOpenAI` and called by both the Analyst and Dealer LangGraph agents. Not yet a deployed endpoint — this project is waiting on a shared vLLM serving deployment. Not in the README table because vLLM isn't one of the platform's generic always-on services; it's per-project `serving-vllm`. |
+| Ollama     | `cfg.llm.base_url` (`config.yaml`'s `llm.base_url`, an Ollama systemd service on the DGX host, not in k3s) is passed to `langchain_openai.ChatOpenAI` and called by both the Analyst and Dealer LangGraph agents. See [docs/models.md](models.md) for the model choice and Ollama-vs-vLLM decision — this project ended up on Ollama rather than a deployed vLLM `serving-vllm` endpoint. |
 | JupyterLab | Indirectly — the README's "Open in JupyterLab" badge is how you open `notebook.ipynb`, but the notebook here is a scratch/dev notebook, not a KFP pipeline definition (see [architecture.md](architecture.md)). |
+| Kubernetes dashboard | Ops only, not called from `src/` — used to inspect the `multi-agent-ai-trader` namespace's pods/jobs when debugging (see the top-level README's Quick Links). |
 
-## Listed in the README table but unused by this project's code
+## Listed in the full Miramar platform endpoint table but unused by this project's code
 
-Ollama, NeMo/NIM, Qdrant, MLflow, KFP (UI + API), Kubernetes dashboard,
-Nsight UI, Open WebUI — none of these are referenced anywhere in
-`src/`. They're part of the generic template scaffolding shared by every
-Miramar project and aren't wired into the Analyst/Dealer/Floor Broker code
-paths. In particular:
+NeMo/NIM, Qdrant, MLflow, KFP (UI + API), Nsight UI, Open WebUI — none of
+these are referenced anywhere in `src/`. They're part of the generic
+template scaffolding shared by every Miramar project and aren't wired into
+the Analyst/Dealer/Floor Broker code paths. In particular:
 
 - **MLflow / KFP** — this isn't a training or pipeline project; there's
   nothing to track experiments for or orchestrate as a DAG.
 - **Qdrant** — no retrieval/embedding step in any agent.
-- **NeMo/NIM, Ollama** — superseded by the `cfg.llm.base_url` vLLM
-  placeholder above; neither is called directly.
+- **NeMo/NIM** — superseded by the `cfg.llm.base_url` Ollama endpoint above;
+  neither is called directly.
 
 ## Real external dependencies not in the README table
 
