@@ -12,6 +12,8 @@ spec:
     metadata:
       labels:
         app: floor-broker
+      annotations:
+        deploy.miramar/commit-sha: DEPLOY_SHA_PLACEHOLDER  # forces a rollout even when the image tag string (":latest") doesn't change
     spec:
       imagePullSecrets:
         - name: ghcr-pull

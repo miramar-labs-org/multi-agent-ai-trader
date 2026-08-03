@@ -310,6 +310,12 @@ three components.
 - **Sell-side retry logic** — Floor Broker explicitly handles Alpaca's "conflicting orders"
   error by cancelling blockers and re-fetching the current quantity before resubmitting,
   rather than failing the sell outright.
+- **Deploys always force a rollout** — `deploy.yaml` always resolves images to the same
+  `:latest` tag string, so `kubectl apply` alone would see no pod-template diff and silently
+  leave Dealer/Floor Broker pods on stale code. The `dealer`/`floor-broker` k3s manifests carry
+  a `deploy.miramar/commit-sha` pod annotation that `deploy.yaml` stamps with `github.sha` on
+  every run, guaranteeing a real diff and a rollout each deploy. CronJobs (Analyst, EOD Report)
+  don't need this — every scheduled run already creates a brand-new pod.
 
 ## Secrets
 

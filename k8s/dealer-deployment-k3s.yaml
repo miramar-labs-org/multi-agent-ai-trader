@@ -14,6 +14,8 @@ spec:
     metadata:
       labels:
         app: dealer
+      annotations:
+        deploy.miramar/commit-sha: DEPLOY_SHA_PLACEHOLDER  # forces a rollout even when the image tag string (":latest") doesn't change
     spec:
       serviceAccountName: multi-agent-ai-trader-configmap-reader
       imagePullSecrets:

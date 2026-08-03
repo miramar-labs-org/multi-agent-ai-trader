@@ -76,6 +76,7 @@ jobs:
           DEALER_URI="${{ steps.images.outputs.dealer }}"
           FLOOR_BROKER_URI="${{ steps.images.outputs.floor_broker }}"
           EOD_REPORT_URI="${{ steps.images.outputs.eod_report }}"
+          COMMIT_SHA="${{ github.sha }}"
 
           for MANIFEST in \
             k8s/analyst-cronjob-k3s.yaml \
@@ -89,6 +90,7 @@ jobs:
               | sed "s|GHCR_IMAGE_DEALER_PLACEHOLDER|${DEALER_URI}|g" \
               | sed "s|GHCR_IMAGE_FLOOR_BROKER_PLACEHOLDER|${FLOOR_BROKER_URI}|g" \
               | sed "s|GHCR_IMAGE_EOD_REPORT_PLACEHOLDER|${EOD_REPORT_URI}|g" \
+              | sed "s|DEPLOY_SHA_PLACEHOLDER|${COMMIT_SHA}|g" \
               | kubectl apply --validate=false -f -
           done
 
