@@ -89,15 +89,15 @@ def notify_floor_broker_result(
 
 
 def notify_error(component: str, text: str) -> None:
-    _post(f"🚨 *ERROR [{component}]* {text}")
+    _post(f"🚨 *ERROR [{component}]* {text} _{_timestamp()}_")
 
 
 def notify_market_closed(component: str, report_date: str) -> None:
-    _post(f"📅 *{component}* — {report_date} was not a trading day, no report to send.")
+    _post(f"📅 *{component}* — {report_date} was not a trading day, no report to send. _{_timestamp()}_")
 
 
 def notify_stock_market_closed(next_open: str) -> None:
-    _post(f"🔒 *Dealer* — stock market is closed. Next open: {next_open}")
+    _post(f"🔒 *Dealer* — stock market is closed. Next open: {next_open} _{_timestamp()}_")
 
 
 def notify_eod_report(report_date: str, account: dict, fills: list[dict], positions: list[dict]) -> None:

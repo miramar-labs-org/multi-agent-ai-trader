@@ -98,3 +98,33 @@ def test_notify_crypto_eod_report_timestamps_each_fill_line(monkeypatch):
 def test_format_fill_time_converts_utc_iso_string_to_eastern_clock_time():
     # 2026-08-03 is EDT (UTC-4): 14:00 UTC -> 10:00 AM EDT.
     assert slack._format_fill_time("2026-08-03T14:00:00Z") == "10:00 AM EDT"
+
+
+def test_notify_error_includes_timestamp(monkeypatch):
+    posted = {}
+    monkeypatch.setattr(slack, "_post", lambda text: posted.update(text=text))
+
+    slack.notify_error("Dealer", "boom")
+
+    assert "boom" in posted["text"]
+    assert re.search(_TIMESTAMP_RE, posted["text"])
+
+
+def test_notify_market_closed_includes_timestamp(monkeypatch):
+    posted = {}
+    monkeypatch.setattr(slack, "_post", lambda text: posted.update(text=text))
+
+    slack.notify_market_closed("EOD", "2026-08-01")
+
+    assert "2026-08-01" in posted["text"]
+    assert re.search(_TIMESTAMP_RE, posted["text"])
+
+
+def test_notify_stock_market_closed_includes_timestamp(monkeypatch):
+    posted = {}
+    monkeypatch.setattr(slack, "_post", lambda text: posted.update(text=text))
+
+    slack.notify_stock_market_closed("2026-08-04 09:30:00 ET")
+
+    assert "2026-08-04 09:30:00 ET" in posted["text"]
+    assert re.search(_TIMESTAMP_RE, posted["text"])
