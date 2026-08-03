@@ -2,7 +2,7 @@ import re
 
 from src.common import slack
 
-_TIMESTAMP_RE = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} (AM|PM)"
+_TIMESTAMP_RE = r"\d{2}:\d{2}:\d{2} (AM|PM)"
 
 
 def test_notify_dealer_signal_includes_timestamp(monkeypatch):
@@ -13,6 +13,12 @@ def test_notify_dealer_signal_includes_timestamp(monkeypatch):
 
     assert "strong momentum" in posted["text"]
     assert re.search(_TIMESTAMP_RE, posted["text"])
+
+
+def test_timestamp_omits_the_date():
+    # Trading only happens within a single calendar day, so the date is redundant noise --
+    # only the time of day is worth showing.
+    assert not re.search(r"\d{4}-\d{2}-\d{2}", slack._timestamp())
 
 
 def test_notify_floor_broker_result_includes_timestamp_and_opening_position_fields(monkeypatch):

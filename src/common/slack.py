@@ -15,7 +15,7 @@ _WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
 
 
 def _timestamp() -> str:
-    return datetime.now(pytz.timezone("US/Eastern")).strftime("%Y-%m-%d %I:%M:%S %p %Z")
+    return datetime.now(pytz.timezone("US/Eastern")).strftime("%I:%M:%S %p %Z")
 
 
 def _format_fill_time(iso_time: str) -> str:
