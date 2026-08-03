@@ -59,6 +59,10 @@ def notify_market_closed(component: str, report_date: str) -> None:
     _post(f"📅 *{component}* — {report_date} was not a trading day, no report to send.")
 
 
+def notify_stock_market_closed(next_open: str) -> None:
+    _post(f"🔒 *Dealer* — stock market is closed. Next open: {next_open}")
+
+
 def notify_eod_report(report_date: str, account: dict, fills: list[dict], positions: list[dict]) -> None:
     pl = account["equity"] - account["last_equity"]
     pl_pct = (pl / account["last_equity"] * 100) if account["last_equity"] else 0.0

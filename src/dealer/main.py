@@ -14,6 +14,9 @@ from src.dealer.graph import build_graph
 
 log = get_logger("DEALER")
 
+_last_market_open = None  # edge-detects open/closed transitions so Slack gets one notice per
+                          # transition, not a repeat every poll cycle while the market stays closed
+
 
 def is_after_open_buffer(buffer_minutes: int) -> bool:
     eastern = pytz.timezone("US/Eastern")
@@ -36,11 +39,16 @@ def should_process_entry(entry: dict, cfg) -> bool:
 
 
 def market_is_open(cfg, log) -> bool:
+    global _last_market_open
+
     if cfg.trading.market_override:
         log("📈 OVERRIDE: stock market is OPEN.")
+        _last_market_open = True
         return True
 
-    if trading_client.get_clock().is_open:
+    clock = trading_client.get_clock()
+    if clock.is_open:
+        _last_market_open = True
         if not is_after_open_buffer(cfg.trading.buffer):
             log(f"📈 stock market is OPEN but we are waiting {cfg.trading.buffer} minutes to avoid volatility")
             return False
@@ -48,8 +56,13 @@ def market_is_open(cfg, log) -> bool:
         return True
 
     log("🔒 stock market is CLOSED.")
-    log(f"next open: {trading_client.get_clock().next_open}")
-    log(f"next close: {trading_client.get_clock().next_close}")
+    log(f"next open: {clock.next_open}")
+    log(f"next close: {clock.next_close}")
+    if _last_market_open is not False:
+        eastern = pytz.timezone("US/Eastern")
+        next_open_et = clock.next_open.astimezone(eastern).strftime("%Y-%m-%d %I:%M %p %Z")
+        slack.notify_stock_market_closed(next_open_et)
+    _last_market_open = False
     return False
 
 
