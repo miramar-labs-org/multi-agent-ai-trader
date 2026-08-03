@@ -133,6 +133,15 @@ posts a "Morning Market Report" to Slack (`slack.notify_morning_report`): the da
 budgets/rationale, plus current equity/cash/buying power. This is a by-product of the same run,
 not a separate schedule — there is no dedicated Slack CronJob for it, unlike the EOD Report below.
 
+Right after that, a `crypto_eod_report` graph node (gated on `cfg.trading.enable_crypto`) posts a
+second, crypto-only "Crypto EOD Report" to Slack covering the **prior full ET calendar day's**
+crypto fills/positions (`slack.notify_crypto_eod_report`). Crypto trades 24/7, so it has no market
+close to hang a report off of the way stocks do — rather than a separate always-on schedule, it
+piggybacks on the Analyst's existing daily 06:00 UTC run, right before the new day's picks. Uses
+the same `src.common.eod.fetch_fills`/`summarize_positions` helpers as the stock EOD Report below,
+filtered to crypto (`"/" in symbol`, the same convention `alpaca_client.get_current_ask_price`
+already uses to distinguish crypto tickers).
+
 ## Agent 2 — Dealer (`src/dealer/`)
 
 **Workload:** `apps/v1 Deployment`, `replicas: 1`, `strategy: {type: Recreate}` — explicitly
@@ -230,9 +239,14 @@ rather than raised; unexpected exceptions become a 500.
 
 ## EOD Report (`src/eod_report/`)
 
-**Workload:** `batch/v1 CronJob`, schedule `30 21 * * 1-5` (21:30 UTC Mon-Fri — after the 4pm ET
+**Workload:** `batch/v1 CronJob`, schedule `30 21 * * *` (21:30 UTC **daily** — after the 4pm ET
 close in both EDT and EST), `concurrencyPolicy: Forbid`, `backoffLimit: 1`. No ServiceAccount —
-like Floor Broker, it never touches the k8s API. Entrypoint: `python -m src.eod_report.main`.
+like Floor Broker, it never touches the k8s API. Entrypoint: `python -m src.eod_report.main`. The
+schedule runs every day rather than `1-5` (Mon-Fri) specifically so `main()`'s own
+Alpaca-calendar check (below) gets a chance to fire and post a Slack notice on weekends/holidays
+— previously the cron schedule itself silently excluded weekends, and a weekday holiday made
+`main()` log locally and return with no Slack post at all, so a closed market was
+indistinguishable from the CronJob never running.
 
 **Purpose:** once a day after market close, post a plain-language summary of the day — account
 equity/cash/P&L and every fill across all three trading agents — to `#miramar-trading-floor`. It
@@ -241,14 +255,13 @@ Alpaca.
 
 **Logic** (`src/eod_report/main.py`):
 1. Checks `trading_client.get_calendar()` for today's date (Eastern) — if today wasn't a trading
-   day (market holiday; weekends are already excluded by the cron schedule itself), it logs and
-   exits without posting, so the channel never gets a noisy "nothing happened" message.
+   day (weekend or market holiday), it posts `slack.notify_market_closed("EOD", ...)` and exits
+   without the rest of the report, so a closed market is always visibly reported, not silent.
 2. `trading_client.get_account()` — equity, cash, buying power, and `last_equity` (prior close)
    to compute the day's P&L.
 3. `trading_client.get_all_positions()` — current open positions and their unrealized P&L.
-4. `trading_client.get("/account/activities", data={"activity_types": "FILL", "date": ...})` — a
-   raw REST call (no dedicated `alpaca-py` method exists for this endpoint) for every fill
-   executed that day.
+4. `src.common.eod.fetch_fills(today)` — a raw REST call under the hood (no dedicated `alpaca-py`
+   method exists for `/account/activities`) for every fill executed that day, across all assets.
 5. `slack.notify_eod_report(...)` formats and posts all of the above as one message.
 
 Errors call `slack.notify_error("EOD", ...)` before re-raising, same convention as the other
@@ -287,6 +300,11 @@ three components.
 - **`logging.py`** — an emoji-prefixed stdout logger (ported from `gpt-trader.py`) — the only
   durable trail of a trading decision is `kubectl logs` output plus whatever LangSmith
   captured of the LLM call chain; trade outcomes are not written to any database or MLflow.
+- **`eod.py`** — `fetch_fills(date, only_crypto=None)` / `summarize_positions(positions,
+  only_crypto=None)` shape Alpaca's raw position/activity objects into the plain dicts
+  `slack.notify_eod_report`/`notify_crypto_eod_report` expect, with an optional crypto/equity
+  filter (`"/" in symbol`). Shared by the stock EOD Report (no filter — every asset) and the
+  Analyst's crypto EOD node (`only_crypto=True`) so the fetch/shape logic isn't duplicated.
 
 ## Data flow — one full cycle
 
@@ -294,7 +312,8 @@ three components.
 2. Discover ≤20 screener candidates (Alpaca `most-actives`/`movers`) → fetch 2 days of news +
    Yahoo RSS headlines → LLM picks ≤10 symbols with budgets/indicators/rationale → written to
    the `portfolio` ConfigMap → a "Morning Market Report" (picks + account balance) is posted to
-   Slack, still before market open.
+   Slack, still before market open → if `enable_crypto`, a crypto-only "Crypto EOD Report"
+   covering the prior full ET day's crypto fills/positions is posted right after.
 3. **Every 600s while the market is open** — Dealer reads the ConfigMap fresh, and for each
    symbol: fetches its configured indicators from TAAPI.io in one `/bulk` request (throttled
    `taapi.min_request_interval_secs` between symbols to respect TAAPI's per-15s rate limit),
@@ -306,8 +325,9 @@ three components.
 6. Repeat step 3 until market close; the cycle restarts fresh at 06:00 UTC the next day using
    whatever portfolio the Analyst produces (or the prior day's, if the Analyst hasn't run yet
    or failed — the Dealer has no fallback logic here, it just reads whatever ConfigMap exists).
-7. **21:30 UTC Mon-Fri** — independently of the above cycle, the EOD Report CronJob queries
-   Alpaca directly for the day's account state and fills, and posts a summary to Slack.
+7. **21:30 UTC daily** — independently of the above cycle, the EOD Report CronJob queries
+   Alpaca directly for the day's account state and fills, and posts a summary to Slack — or, on
+   a weekend/holiday, posts a market-closed notice instead and skips the rest of the report.
 
 ## `config.yaml` reference
 
@@ -316,7 +336,7 @@ three components.
 | `llm` | `base_url`, `model`, `temperature` | shared OpenAI-compatible endpoint for **both** Analyst and Dealer LLM calls — see [platform-services.md](platform-services.md) for current wiring status |
 | `langsmith` | `enabled`, `project` | toggles LangGraph/LangChain tracing to LangSmith (requires `LANGCHAIN_API_KEY`) |
 | `langsmith` | `sampling_rate` | fraction of traces actually sent to LangSmith (0.5) — keeps Dealer's poll-driven trace volume under the free Developer plan's 5k traces/month limit |
-| `slack` | `enabled` | toggles posting interesting events (Morning Report, Dealer signals, Floor Broker executions, EOD Report, errors) to `#miramar-trading-floor` (requires `SLACK_WEBHOOK_URL`) |
+| `slack` | `enabled` | toggles posting interesting events (Morning Report, Crypto EOD Report, Dealer signals, Floor Broker executions, EOD Report, market-closed notices, errors) to `#miramar-trading-floor` (requires `SLACK_WEBHOOK_URL`) |
 | `floor_broker` | `base_url` | in-cluster Service DNS Dealer uses to reach Floor Broker |
 | `taapi` | `min_request_interval_secs` | seconds Dealer waits between symbols' TAAPI `/bulk` calls (15) — sized to the TAAPI Free plan's 1 request/15s cap; lower it if the account is on a paid plan |
 | `trading` | `slP` / `tpP` | stop-loss/take-profit price multipliers on bracket orders (0.98/1.05 ≈ 2% stop, 5% target) |

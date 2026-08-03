@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TypedDict
 
 import pytz
@@ -12,6 +12,7 @@ from src.analyst.schema import PortfolioSelection
 from src.common import slack
 from src.common.alpaca_client import trading_client
 from src.common.config import load_config
+from src.common.eod import fetch_fills, summarize_positions
 from src.common.logging import get_logger
 from src.common.portfolio_state import write_portfolio as _write_portfolio
 
@@ -121,6 +122,20 @@ def write_portfolio(state: AnalystState, cfg) -> AnalystState:
     return state
 
 
+def crypto_eod_report(state: AnalystState, cfg) -> AnalystState:
+    """Crypto trades 24/7, so it has no market close to hang an EOD report off of -- instead this
+    rides along with the Analyst's morning run and covers the prior full ET calendar day, right
+    before today's new picks go out in notify_morning_report()."""
+    if not cfg.trading.enable_crypto:
+        return state
+
+    report_date = (datetime.now(pytz.timezone("US/Eastern")) - timedelta(days=1)).date().isoformat()
+    positions = summarize_positions(trading_client.get_all_positions(), only_crypto=True)
+    fills = fetch_fills(report_date, only_crypto=True)
+    slack.notify_crypto_eod_report(report_date, fills, positions)
+    return state
+
+
 def build_graph():
     cfg = load_config()
 
@@ -130,12 +145,14 @@ def build_graph():
     graph.add_node("llm_select", lambda state: llm_select(state, cfg))
     graph.add_node("validate_selection", lambda state: validate_selection(state, cfg))
     graph.add_node("write_portfolio", lambda state: write_portfolio(state, cfg))
+    graph.add_node("crypto_eod_report", lambda state: crypto_eod_report(state, cfg))
 
     graph.set_entry_point("discover_candidates")
     graph.add_edge("discover_candidates", "fetch_research")
     graph.add_edge("fetch_research", "llm_select")
     graph.add_edge("llm_select", "validate_selection")
     graph.add_edge("validate_selection", "write_portfolio")
-    graph.add_edge("write_portfolio", END)
+    graph.add_edge("write_portfolio", "crypto_eod_report")
+    graph.add_edge("crypto_eod_report", END)
 
     return graph.compile()

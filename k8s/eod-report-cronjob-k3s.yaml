@@ -4,7 +4,8 @@ metadata:
   name: eod-report
   namespace: multi-agent-ai-trader
 spec:
-  schedule: "30 21 * * 1-5"  # 21:30 UTC Mon-Fri — after the 4pm ET close (5:30pm EDT / 4:30pm EST) — matches config.yaml's eod_report.schedule
+  schedule: "30 21 * * *"  # 21:30 UTC daily (not just Mon-Fri) — main()'s calendar check posts a Slack
+                           # market-closed notice on weekends/holidays — matches config.yaml's eod_report.schedule
   concurrencyPolicy: Forbid
   jobTemplate:
     spec:

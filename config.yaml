@@ -27,7 +27,8 @@ trading:
   crypto_taapi_exchange: "binance"   # TAAPI venue used for indicator requests on crypto symbols
 
 eod_report:
-  schedule: "30 21 * * 1-5"   # informational copy of the CronJob's own spec.schedule — 21:30 UTC Mon-Fri, after market close
+  schedule: "30 21 * * *"   # informational copy of the CronJob's own spec.schedule — 21:30 UTC daily, after
+                            # market close; runs every day so closed days get a Slack notice, not silence
 
 analyst:
   schedule: "0 6 * * *"       # daily 06:00 UTC, before US market open

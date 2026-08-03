@@ -55,6 +55,10 @@ def notify_error(component: str, text: str) -> None:
     _post(f"🚨 *ERROR [{component}]* {text}")
 
 
+def notify_market_closed(component: str, report_date: str) -> None:
+    _post(f"📅 *{component}* — {report_date} was not a trading day, no report to send.")
+
+
 def notify_eod_report(report_date: str, account: dict, fills: list[dict], positions: list[dict]) -> None:
     pl = account["equity"] - account["last_equity"]
     pl_pct = (pl / account["last_equity"] * 100) if account["last_equity"] else 0.0
@@ -80,5 +84,30 @@ def notify_eod_report(report_date: str, account: dict, fills: list[dict], positi
         ]
     else:
         lines.append("\n*Open positions:* none")
+
+    _post("\n".join(lines))
+
+
+def notify_crypto_eod_report(report_date: str, fills: list[dict], positions: list[dict]) -> None:
+    """Crypto trades 24/7 -- there's no market close to report against, so this rides along with
+    the Analyst's morning report instead of the stock EOD's after-close CronJob, covering the
+    prior full calendar day."""
+    lines = [f"🪙 *Crypto EOD Report — {report_date}* (24/7 market, no close)"]
+
+    if fills:
+        lines.append(f"\n*Crypto trades ({len(fills)}):*")
+        lines += [f"• {f['side'].upper()} {f['qty']:g} {f['symbol']} @ ${f['price']:,.2f}" for f in fills]
+    else:
+        lines.append("\n*Crypto trades:* none")
+
+    if positions:
+        total_value = sum(p["market_value"] for p in positions)
+        lines.append(f"\n*Crypto positions ({len(positions)}, ${total_value:,.2f} total):*")
+        lines += [
+            f"• {p['symbol']}: {p['qty']:g}, ${p['market_value']:,.2f} ({p['unrealized_plpc'] * 100:+.2f}%)"
+            for p in positions
+        ]
+    else:
+        lines.append("\n*Crypto positions:* none")
 
     _post("\n".join(lines))
