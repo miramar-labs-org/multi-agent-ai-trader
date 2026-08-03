@@ -111,6 +111,26 @@ kubectl logs -n multi-agent-ai-trader job/analyst-test
 A successful run ends with `wrote portfolio with N symbols` and, if Slack is enabled, a morning
 report in your configured channel. To tear everything down: `gh workflow run "Undeploy" --ref main`.
 
+## Releases
+
+Every `Build and Push` run tags each image with `:latest` and the 8-char commit SHA (e.g.
+`:a1b2c3d4`) — so any past build is already individually pinned and deployable via `Deploy`'s
+`image_tag` input, with no separate release process required.
+
+Pushing a `v*` git tag additionally triggers `Build and Push` and tags the images with that
+version (e.g. `:v0.1.0`), for a human-readable pin instead of a raw SHA. To cut a release:
+
+```sh
+git tag v0.1.0            # on the commit you want to release
+git push origin v0.1.0    # triggers Build and Push automatically
+gh release create v0.1.0 --generate-notes
+```
+
+Then deploy that exact version with `gh workflow run "Deploy" --ref main -f image_tag=v0.1.0`.
+
+Versioning is semver by convention (no enforcement tooling): PATCH for bug fixes, MINOR for new
+features, MAJOR reserved for a breaking config/behavior change.
+
 ## How it decides trades
 
 Both Analyst and Dealer make their decisions the same way: gather data, hand it to an LLM as

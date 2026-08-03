@@ -7,6 +7,9 @@ name: Build and Push
 
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
 
 permissions:
   contents: read
@@ -42,19 +45,28 @@ jobs:
           COMMIT_SHA="${{ github.sha }}"
           echo "uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
           echo "tag=${COMMIT_SHA::8}" >> "$GITHUB_OUTPUT"
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "version=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build and push
         run: |
           IMAGE_URI="${{ steps.image.outputs.uri }}"
           TAG="${{ steps.image.outputs.tag }}"
-          docker build \
-            -f "${{ matrix.dockerfile }}" \
-            -t "${IMAGE_URI}:latest" \
-            -t "${IMAGE_URI}:${TAG}" \
-            .
+          VERSION="${{ steps.image.outputs.version }}"
+
+          BUILD_TAGS=(-t "${IMAGE_URI}:latest" -t "${IMAGE_URI}:${TAG}")
+          [[ -n "$VERSION" ]] && BUILD_TAGS+=(-t "${IMAGE_URI}:${VERSION}")
+
+          docker build -f "${{ matrix.dockerfile }}" "${BUILD_TAGS[@]}" .
           docker push "${IMAGE_URI}:latest"
           docker push "${IMAGE_URI}:${TAG}"
-          echo "Pushed ${IMAGE_URI}:${TAG}"
+          if [[ -n "$VERSION" ]]; then
+            docker push "${IMAGE_URI}:${VERSION}"
+            echo "Pushed ${IMAGE_URI}:{latest,${TAG},${VERSION}}"
+          else
+            echo "Pushed ${IMAGE_URI}:{latest,${TAG}}"
+          fi
 
       - name: Summary
         run: |
@@ -66,4 +78,7 @@ jobs:
             echo "| Service | \`${{ matrix.name }}\` |"
             echo "| Registry | GHCR |"
             echo "| Image | \`${{ steps.image.outputs.uri }}:${{ steps.image.outputs.tag }}\` |"
+            if [[ -n "${{ steps.image.outputs.version }}" ]]; then
+              echo "| Version | \`${{ steps.image.outputs.version }}\` |"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
