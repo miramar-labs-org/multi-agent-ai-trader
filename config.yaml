@@ -22,6 +22,9 @@ trading:
   buffer: 15
   market_override: false
 
+eod_report:
+  schedule: "30 21 * * 1-5"   # informational copy of the CronJob's own spec.schedule — 21:30 UTC Mon-Fri, after market close
+
 analyst:
   schedule: "0 6 * * *"       # daily 06:00 UTC, before US market open
   max_universe_size: 10

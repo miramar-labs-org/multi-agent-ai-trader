@@ -27,6 +27,8 @@ jobs:
             dockerfile: Dockerfile.dealer
           - name: floor-broker
             dockerfile: Dockerfile.floor-broker
+          - name: eod-report
+            dockerfile: Dockerfile.eod-report
     steps:
       - uses: actions/checkout@v4
 

@@ -68,23 +68,27 @@ jobs:
           echo "analyst=ghcr.io/miramar-labs-org/${PROJECT_NAME}-analyst:${TAG}" >> "$GITHUB_OUTPUT"
           echo "dealer=ghcr.io/miramar-labs-org/${PROJECT_NAME}-dealer:${TAG}" >> "$GITHUB_OUTPUT"
           echo "floor_broker=ghcr.io/miramar-labs-org/${PROJECT_NAME}-floor-broker:${TAG}" >> "$GITHUB_OUTPUT"
+          echo "eod_report=ghcr.io/miramar-labs-org/${PROJECT_NAME}-eod-report:${TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Substitute and apply k3s manifests
         run: |
           ANALYST_URI="${{ steps.images.outputs.analyst }}"
           DEALER_URI="${{ steps.images.outputs.dealer }}"
           FLOOR_BROKER_URI="${{ steps.images.outputs.floor_broker }}"
+          EOD_REPORT_URI="${{ steps.images.outputs.eod_report }}"
 
           for MANIFEST in \
             k8s/analyst-cronjob-k3s.yaml \
             k8s/dealer-deployment-k3s.yaml \
             k8s/floor-broker-deployment-k3s.yaml \
-            k8s/floor-broker-service-k3s.yaml
+            k8s/floor-broker-service-k3s.yaml \
+            k8s/eod-report-cronjob-k3s.yaml
           do
             echo "Applying ${MANIFEST}..."
             sed "s|GHCR_IMAGE_ANALYST_PLACEHOLDER|${ANALYST_URI}|g" "${MANIFEST}" \
               | sed "s|GHCR_IMAGE_DEALER_PLACEHOLDER|${DEALER_URI}|g" \
               | sed "s|GHCR_IMAGE_FLOOR_BROKER_PLACEHOLDER|${FLOOR_BROKER_URI}|g" \
+              | sed "s|GHCR_IMAGE_EOD_REPORT_PLACEHOLDER|${EOD_REPORT_URI}|g" \
               | kubectl apply --validate=false -f -
           done
 
@@ -113,6 +117,7 @@ jobs:
             echo "| Analyst | \`${{ steps.images.outputs.analyst }}\` |"
             echo "| Dealer | \`${{ steps.images.outputs.dealer }}\` |"
             echo "| Floor Broker | \`${{ steps.images.outputs.floor_broker }}\` |"
+            echo "| EOD Report | \`${{ steps.images.outputs.eod_report }}\` |"
             echo ""
             echo "Namespace: \`$PROJECT_NAME\`"
           } >> "$GITHUB_STEP_SUMMARY"

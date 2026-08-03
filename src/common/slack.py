@@ -25,12 +25,20 @@ def _post(text: str) -> None:
         log(f"⚠️ Slack post failed: {exc}")
 
 
-def notify_analyst_picks(symbols: list[dict]) -> None:
-    if not symbols:
-        _post("*Analyst* — daily run picked 0 symbols today.")
-        return
-    lines = [f"• *{s['symbol']}* (${s['budget']:.0f}) — {s['rationale']}" for s in symbols]
-    _post(f"*Analyst* picked {len(symbols)} symbol(s) today:\n" + "\n".join(lines))
+def notify_morning_report(report_date: str, account: dict, symbols: list[dict]) -> None:
+    lines = [
+        f"🌅 *Morning Market Report — {report_date}*",
+        f"Equity ${account['equity']:,.2f} | Cash ${account['cash']:,.2f}"
+        f" | Buying Power ${account['buying_power']:,.2f}",
+    ]
+
+    if symbols:
+        lines.append(f"\n*Today's picks ({len(symbols)}):*")
+        lines += [f"• *{s['symbol']}* (${s['budget']:.0f}) — {s['rationale']}" for s in symbols]
+    else:
+        lines.append("\n*Today's picks:* none")
+
+    _post("\n".join(lines))
 
 
 def notify_dealer_signal(symbol: str, action: str, reasoning: str) -> None:
@@ -45,3 +53,32 @@ def notify_floor_broker_result(symbol: str, action: str, status: str, detail: st
 
 def notify_error(component: str, text: str) -> None:
     _post(f"🚨 *ERROR [{component}]* {text}")
+
+
+def notify_eod_report(report_date: str, account: dict, fills: list[dict], positions: list[dict]) -> None:
+    pl = account["equity"] - account["last_equity"]
+    pl_pct = (pl / account["last_equity"] * 100) if account["last_equity"] else 0.0
+    pl_emoji = "🟢" if pl >= 0 else "🔴"
+
+    lines = [
+        f"📊 *End of Day Report — {report_date}*",
+        f"{pl_emoji} Equity ${account['equity']:,.2f} ({pl:+,.2f} / {pl_pct:+.2f}% today)"
+        f" | Cash ${account['cash']:,.2f} | Buying Power ${account['buying_power']:,.2f}",
+    ]
+
+    if fills:
+        lines.append(f"\n*Trades today ({len(fills)}):*")
+        lines += [f"• {f['side'].upper()} {f['qty']:g} {f['symbol']} @ ${f['price']:,.2f}" for f in fills]
+    else:
+        lines.append("\n*Trades today:* none")
+
+    if positions:
+        lines.append(f"\n*Open positions ({len(positions)}):*")
+        lines += [
+            f"• {p['symbol']}: {p['qty']:g} shares, ${p['market_value']:,.2f} ({p['unrealized_plpc'] * 100:+.2f}%)"
+            for p in positions
+        ]
+    else:
+        lines.append("\n*Open positions:* none")
+
+    _post("\n".join(lines))

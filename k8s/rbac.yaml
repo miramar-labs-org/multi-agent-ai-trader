@@ -1,7 +1,8 @@
 # Shared by both the Analyst CronJob (writes the portfolio ConfigMap) and the
 # Dealer Deployment (reads it) — one ServiceAccount/Role/RoleBinding rather than
 # two near-duplicate RBAC objects, since both workloads only ever touch the same
-# ConfigMap in this same namespace. Floor Broker does not use this ServiceAccount.
+# ConfigMap in this same namespace. Floor Broker and EOD Report do not use this
+# ServiceAccount — neither ever touches the k8s API.
 apiVersion: v1
 kind: ServiceAccount
 metadata:

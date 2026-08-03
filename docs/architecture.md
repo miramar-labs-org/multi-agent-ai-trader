@@ -41,19 +41,32 @@ Analyst and Floor Broker never talk to each other directly. There is no message 
 database, and no shared filesystem — the only durable state between agents is the
 `portfolio` ConfigMap, and the only network hop is Dealer → Floor Broker.
 
+Independently of that cycle, a fourth CronJob queries Alpaca directly once a day after market
+close and posts a summary to Slack — it has no dependency on the ConfigMap or on Dealer/Floor
+Broker's HTTP hop:
+
+```
+                         21:30 UTC Mon-Fri (k8s CronJob)
+                         ┌─────────────────────────┐
+                         │       EOD Report        │
+                         │ account + fills → Slack │
+                         └─────────────────────────┘
+```
+
 ## Repo layout
 
 ```
 multi-agent-ai-trader/
-├── config.yaml                  # single source of config for all 3 agents
+├── config.yaml                  # single source of config for all agents + EOD report
 ├── notebook.ipynb                # bare JupyterLab entry point (no pipeline logic — see below)
-├── Dockerfile.analyst/.dealer/.floor-broker
-├── k8s/                          # CronJob, 2 Deployments, 1 Service, RBAC, namespace, secrets doc
+├── Dockerfile.analyst/.dealer/.floor-broker/.eod-report
+├── k8s/                          # 2 CronJobs, 2 Deployments, 1 Service, RBAC, namespace, secrets doc
 └── src/
-    ├── common/                   # shared: Alpaca clients, config loader, logger, portfolio I/O
-    ├── analyst/                  # CronJob — picks the tradeable universe
+    ├── common/                   # shared: Alpaca clients, config loader, logger, portfolio I/O, Slack
+    ├── analyst/                  # CronJob — picks the tradeable universe, posts the morning report
     ├── dealer/                   # Deployment — decides BUY/HOLD/SELL per symbol
-    └── floor_broker/             # Deployment+Service — executes orders on Alpaca
+    ├── floor_broker/             # Deployment+Service — executes orders on Alpaca
+    └── eod_report/                # CronJob — posts a daily account/trade summary to Slack
 ```
 
 Each agent is its own Docker image and k8s workload — they scale, restart, and fail
@@ -109,6 +122,12 @@ that entirely.
 This is the **only** interface between Analyst and the rest of the system. No RAG, no
 vector search, no MLflow logging of the selection — the "research" step is plain text
 concatenation fed straight into the prompt.
+
+Immediately after writing the ConfigMap — still inside the same CronJob pod, before market
+open — `write_portfolio` also fetches the account balance (`trading_client.get_account()`) and
+posts a "Morning Market Report" to Slack (`slack.notify_morning_report`): the day's picks with
+budgets/rationale, plus current equity/cash/buying power. This is a by-product of the same run,
+not a separate schedule — there is no dedicated Slack CronJob for it, unlike the EOD Report below.
 
 ## Agent 2 — Dealer (`src/dealer/`)
 
@@ -193,6 +212,32 @@ rather than raised; unexpected exceptions become a 500.
   it cancels the blocking orders (ignoring 404s), *re-fetches* the now-current open quantity
   (it can change once blockers clear), and resubmits.
 
+## EOD Report (`src/eod_report/`)
+
+**Workload:** `batch/v1 CronJob`, schedule `30 21 * * 1-5` (21:30 UTC Mon-Fri — after the 4pm ET
+close in both EDT and EST), `concurrencyPolicy: Forbid`, `backoffLimit: 1`. No ServiceAccount —
+like Floor Broker, it never touches the k8s API. Entrypoint: `python -m src.eod_report.main`.
+
+**Purpose:** once a day after market close, post a plain-language summary of the day — account
+equity/cash/P&L and every fill across all three trading agents — to `#miramar-trading-floor`. It
+makes no trading decisions (no LLM, no LangGraph); it only reads state that already exists in
+Alpaca.
+
+**Logic** (`src/eod_report/main.py`):
+1. Checks `trading_client.get_calendar()` for today's date (Eastern) — if today wasn't a trading
+   day (market holiday; weekends are already excluded by the cron schedule itself), it logs and
+   exits without posting, so the channel never gets a noisy "nothing happened" message.
+2. `trading_client.get_account()` — equity, cash, buying power, and `last_equity` (prior close)
+   to compute the day's P&L.
+3. `trading_client.get_all_positions()` — current open positions and their unrealized P&L.
+4. `trading_client.get("/account/activities", data={"activity_types": "FILL", "date": ...})` — a
+   raw REST call (no dedicated `alpaca-py` method exists for this endpoint) for every fill
+   executed that day.
+5. `slack.notify_eod_report(...)` formats and posts all of the above as one message.
+
+Errors call `slack.notify_error("EOD", ...)` before re-raising, same convention as the other
+three components.
+
 ## Shared code (`src/common/`)
 
 - **`alpaca_client.py`** — one shared `TradingClient(..., paper=True)` (hardcoded — this is
@@ -214,7 +259,8 @@ rather than raised; unexpected exceptions become a 500.
 1. **06:00 UTC** — Analyst CronJob pod starts.
 2. Discover ≤20 screener candidates (Alpaca `most-actives`/`movers`) → fetch 2 days of news +
    Yahoo RSS headlines → LLM picks ≤10 symbols with budgets/indicators/rationale → written to
-   the `portfolio` ConfigMap.
+   the `portfolio` ConfigMap → a "Morning Market Report" (picks + account balance) is posted to
+   Slack, still before market open.
 3. **Every 600s while the market is open** — Dealer reads the ConfigMap fresh, and for each
    symbol: fetches its configured indicators from TAAPI.io, asks the LLM for BUY/HOLD/SELL,
    and (if not HOLD) POSTs to Floor Broker.
@@ -225,6 +271,8 @@ rather than raised; unexpected exceptions become a 500.
 6. Repeat step 3 until market close; the cycle restarts fresh at 06:00 UTC the next day using
    whatever portfolio the Analyst produces (or the prior day's, if the Analyst hasn't run yet
    or failed — the Dealer has no fallback logic here, it just reads whatever ConfigMap exists).
+7. **21:30 UTC Mon-Fri** — independently of the above cycle, the EOD Report CronJob queries
+   Alpaca directly for the day's account state and fills, and posts a summary to Slack.
 
 ## `config.yaml` reference
 
@@ -232,12 +280,13 @@ rather than raised; unexpected exceptions become a 500.
 |---|---|---|
 | `llm` | `base_url`, `model`, `temperature` | shared OpenAI-compatible endpoint for **both** Analyst and Dealer LLM calls — see [platform-services.md](platform-services.md) for current wiring status |
 | `langsmith` | `enabled`, `project` | toggles LangGraph/LangChain tracing to LangSmith (requires `LANGCHAIN_API_KEY`) |
-| `slack` | `enabled` | toggles posting interesting events (Analyst picks, Dealer signals, Floor Broker executions, errors) to `#miramar-trading-floor` (requires `SLACK_WEBHOOK_URL`) |
+| `slack` | `enabled` | toggles posting interesting events (Morning Report, Dealer signals, Floor Broker executions, EOD Report, errors) to `#miramar-trading-floor` (requires `SLACK_WEBHOOK_URL`) |
 | `floor_broker` | `base_url` | in-cluster Service DNS Dealer uses to reach Floor Broker |
 | `trading` | `slP` / `tpP` | stop-loss/take-profit price multipliers on bracket orders (0.98/1.05 ≈ 2% stop, 5% target) |
 | `trading` | `pollsecs` | Dealer loop cadence (600s) |
 | `trading` | `buffer` | minutes to wait after market open before trading (15) |
 | `trading` | `market_override` | force-treat-market-as-open, for testing outside market hours |
+| `eod_report` | `schedule` | informational copy of the CronJob's own `spec.schedule` — not templated, must be kept in sync manually |
 | `analyst` | `schedule` | informational copy of the CronJob's own `spec.schedule` — not templated, must be kept in sync manually |
 | `analyst` | `max_universe_size`, `default_budget`, `screener_top_n`, `news_days`, `yahoo_rss_url` | Analyst's selection parameters |
 | `indicators` | list of `{name, properties}` | TAAPI.io query-parameter catalog per indicator, shared by Dealer |
@@ -268,8 +317,8 @@ All credentials live in one k8s Secret, `mlabs-api-keys` (documented, not create
 `k8s/secrets.example.yaml` — deploy fails fast if it's missing): `TAAPI_API_KEY`,
 `ALPACA_PAPER_API_KEY`, `ALPACA_PAPER_API_SECRET`, `LANGCHAIN_API_KEY`, `SLACK_WEBHOOK_URL`.
 Analyst and Dealer get it via `envFrom.secretRef` for both k8s-API access (via their shared
-ServiceAccount) and these external API keys; Floor Broker gets the same secret for its Alpaca
-keys and `SLACK_WEBHOOK_URL` — it has no ServiceAccount/k8s API access at all.
+ServiceAccount) and these external API keys; Floor Broker and EOD Report get the same secret for
+their Alpaca keys and `SLACK_WEBHOOK_URL` — neither has a ServiceAccount/k8s API access at all.
 
 ## `notebook.ipynb`
 

@@ -2,6 +2,7 @@ import json
 from datetime import datetime, timezone
 from typing import TypedDict
 
+import pytz
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
@@ -9,6 +10,7 @@ from langgraph.graph import END, StateGraph
 from src.analyst import sources
 from src.analyst.schema import PortfolioSelection
 from src.common import slack
+from src.common.alpaca_client import trading_client
 from src.common.config import load_config
 from src.common.logging import get_logger
 from src.common.portfolio_state import write_portfolio as _write_portfolio
@@ -74,7 +76,15 @@ def write_portfolio(state: AnalystState, cfg) -> AnalystState:
     }
     _write_portfolio(payload)
     log(f"✅ wrote portfolio with {len(payload['symbols'])} symbols")
-    slack.notify_analyst_picks(payload["symbols"])
+
+    account = trading_client.get_account()
+    account_summary = {
+        "equity": float(account.equity),
+        "cash": float(account.cash),
+        "buying_power": float(account.buying_power),
+    }
+    report_date = datetime.now(pytz.timezone("US/Eastern")).date().isoformat()
+    slack.notify_morning_report(report_date, account_summary, payload["symbols"])
     return state
 
 

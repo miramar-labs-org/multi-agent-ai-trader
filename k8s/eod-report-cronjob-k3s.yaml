@@ -1,0 +1,32 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: eod-report
+  namespace: multi-agent-ai-trader
+spec:
+  schedule: "30 21 * * 1-5"  # 21:30 UTC Mon-Fri — after the 4pm ET close (5:30pm EDT / 4:30pm EST) — matches config.yaml's eod_report.schedule
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 1  # a failed report run should surface, not silently retry-storm
+      template:
+        metadata:
+          labels:
+            app: eod-report
+        spec:
+          imagePullSecrets:
+            - name: ghcr-pull
+          restartPolicy: Never
+          containers:
+            - name: eod-report
+              image: GHCR_IMAGE_EOD_REPORT_PLACEHOLDER
+              envFrom:
+                - secretRef:
+                    name: mlabs-api-keys
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: "256Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "512Mi"

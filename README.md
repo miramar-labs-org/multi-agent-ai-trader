@@ -19,6 +19,8 @@ trading loop against Alpaca's **paper** trading account:
 - **Floor Broker** — a `Deployment` + `Service` that is the only component that actually
   places orders. It never calls an LLM — it takes a BUY/SELL decision and executes it as a
   bracket order (stocks) or notional market order (crypto) on Alpaca.
+- **EOD Report** — a `CronJob` that runs once a day after market close, and posts an account
+  balance + trade summary to Slack. It makes no trading decisions — pure reporting.
 
 Analyst and Dealer never talk to each other directly — Analyst writes its daily watchlist to
 a shared `portfolio` ConfigMap, and Dealer reads it fresh on every poll. Dealer talks to
@@ -61,7 +63,7 @@ BUY/SELL call has already been made; it only handles order placement, safety che
 | [TAAPI.io](https://taapi.io/) | Dealer | Technical indicators (RSI, MACD, VWAP, Bollinger Bands, SMA, EMA) per watchlist symbol — a third-party service, unrelated to any Miramar platform component. |
 | Yahoo Finance RSS | Analyst | Supplementary headline research alongside Alpaca's News API. |
 | [LangSmith](https://www.langchain.com/langsmith) | Analyst, Dealer | Tracing for both LangGraph agent runs (optional, `config.yaml`'s `langsmith.enabled`). This is the tracing layer actually in use — not MLflow, despite MLflow appearing in the platform endpoint table below. |
-| [Slack](https://api.slack.com/messaging/webhooks) | Analyst, Dealer, Floor Broker | Incoming-webhook notifications for interesting events (portfolio picks, BUY/SELL/HOLD signals, executions, errors) to `#miramar-trading-floor` — optional, `config.yaml`'s `slack.enabled`. |
+| [Slack](https://api.slack.com/messaging/webhooks) | Analyst, Dealer, Floor Broker, EOD Report | Incoming-webhook notifications for interesting events (morning report, BUY/SELL/HOLD signals, executions, EOD summary, errors) to `#miramar-trading-floor` — optional, `config.yaml`'s `slack.enabled`. |
 | OpenAI-compatible LLM endpoint (vLLM, planned) | Analyst, Dealer | Both agents' BUY/HOLD/SELL and symbol-selection decisions. Currently a placeholder in `config.yaml` pending a deployed vLLM serving endpoint. |
 
 ## Platform endpoints
