@@ -9,7 +9,7 @@ from src.common import langsmith, slack
 from src.common.alpaca_client import trading_client
 from src.common.config import load_config
 from src.common.logging import get_logger
-from src.common.portfolio_state import read_portfolio
+from src.common.portfolio_state import merge_held_positions, read_portfolio
 from src.dealer.graph import build_graph
 
 log = get_logger("DEALER")
@@ -53,7 +53,7 @@ def main():
     while True:
         if market_is_open(cfg, log):
             try:
-                portfolio = read_portfolio()
+                portfolio = merge_held_positions(read_portfolio())
             except (ApiException, json.JSONDecodeError) as exc:
                 log(f"⚠️ BAD portfolio read .. cannot proceed: {exc}")
                 slack.notify_error("DEALER", f"portfolio read failed: {exc}")

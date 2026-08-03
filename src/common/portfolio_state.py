@@ -1,9 +1,12 @@
 import json
 import os
 
+from alpaca.trading.enums import AssetClass
 from kubernetes import client
 from kubernetes import config as k8s_config
 from kubernetes.client.exceptions import ApiException
+
+from src.common.alpaca_client import trading_client
 
 NAMESPACE = os.getenv("POD_NAMESPACE", "multi-agent-ai-trader")
 CONFIGMAP_NAME = "portfolio"
@@ -23,6 +26,29 @@ def read_portfolio() -> dict:
     v1 = client.CoreV1Api()
     cm = v1.read_namespaced_config_map(CONFIGMAP_NAME, NAMESPACE)
     return json.loads(cm.data.get(DATA_KEY, "{}"))
+
+
+def merge_held_positions(portfolio: dict) -> dict:
+    """Adds any Alpaca stock position not already in the watchlist -- e.g. one opened before
+    this app existed -- so Dealer keeps deciding BUY/HOLD/SELL on it instead of leaving it
+    unmanaged forever. Crypto positions are left out for now, matching Dealer's existing
+    stocks-only poll loop."""
+    symbols = portfolio.get("symbols", [])
+    known = {entry["symbol"] for entry in symbols}
+
+    for position in trading_client.get_all_positions():
+        if position.symbol in known or position.asset_class != AssetClass.US_EQUITY:
+            continue
+        symbols.append(
+            {
+                "symbol": position.symbol,
+                "exchange": "stocks",
+                "budget": float(position.market_value),
+                "indicators": ["ALL"],
+            }
+        )
+
+    return {**portfolio, "symbols": symbols}
 
 
 def write_portfolio(portfolio: dict) -> None:
