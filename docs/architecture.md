@@ -167,6 +167,13 @@ while True:
 `cfg.trading.buffer` (15 min) wait after the 9:30 ET open bell "to avoid volatility"; a
 `cfg.trading.market_override` config flag can force-treat the market as open for testing.
 
+On the open→closed transition, it also posts `slack.notify_stock_market_closed(next_open)` —
+edge-detected via a module-level `_last_market_open` flag so it fires once per transition, not on
+every 600s poll while the market stays closed for hours. This is distinct from EOD Report's
+`notify_market_closed` (a once-daily "today wasn't a trading day" notice) — this one is Dealer's
+own live status signal, so a genuinely closed market and a stuck/crashed Dealer pod are
+distinguishable from Slack alone.
+
 **Graph** (`src/dealer/graph.py`), a 3-node state machine over `DealerState`:
 
 | Node | What it does |
@@ -302,9 +309,14 @@ three components.
   captured of the LLM call chain; trade outcomes are not written to any database or MLflow.
 - **`eod.py`** — `fetch_fills(date, only_crypto=None)` / `summarize_positions(positions,
   only_crypto=None)` shape Alpaca's raw position/activity objects into the plain dicts
-  `slack.notify_eod_report`/`notify_crypto_eod_report` expect, with an optional crypto/equity
-  filter (`"/" in symbol`). Shared by the stock EOD Report (no filter — every asset) and the
-  Analyst's crypto EOD node (`only_crypto=True`) so the fetch/shape logic isn't duplicated.
+  `slack.notify_eod_report`/`notify_crypto_eod_report` expect. Shared by the stock EOD Report (no
+  filter — every asset) and the Analyst's crypto EOD node (`only_crypto=True`) so the fetch/shape
+  logic isn't duplicated. The two functions filter differently because Alpaca's own API is
+  internally inconsistent: `fetch_fills` filters on `"/" in symbol` since `/account/activities`
+  fill records are always slash-formatted (e.g. `"BTC/USD"`), but `summarize_positions` filters on
+  `p.asset_class == AssetClass.CRYPTO` since live `Position.symbol` for crypto has **no** slash
+  (e.g. `"BTCUSD"`) — a `"/" in symbol` check on positions silently matches nothing. Confirmed
+  against a live paper account after the crypto EOD report came back empty with zero positions.
 
 ## Data flow — one full cycle
 
@@ -336,7 +348,7 @@ three components.
 | `llm` | `base_url`, `model`, `temperature` | shared OpenAI-compatible endpoint for **both** Analyst and Dealer LLM calls — see [platform-services.md](platform-services.md) for current wiring status |
 | `langsmith` | `enabled`, `project` | toggles LangGraph/LangChain tracing to LangSmith (requires `LANGCHAIN_API_KEY`) |
 | `langsmith` | `sampling_rate` | fraction of traces actually sent to LangSmith (0.5) — keeps Dealer's poll-driven trace volume under the free Developer plan's 5k traces/month limit |
-| `slack` | `enabled` | toggles posting interesting events (Morning Report, Crypto EOD Report, Dealer signals, Floor Broker executions, EOD Report, market-closed notices, errors) to `#miramar-trading-floor` (requires `SLACK_WEBHOOK_URL`) |
+| `slack` | `enabled` | toggles posting interesting events (Morning Report, Crypto EOD Report, Dealer signals, Floor Broker executions, EOD Report, EOD's non-trading-day notice, Dealer's live market-closed notice, errors) to `#miramar-trading-floor` (requires `SLACK_WEBHOOK_URL`) |
 | `floor_broker` | `base_url` | in-cluster Service DNS Dealer uses to reach Floor Broker |
 | `taapi` | `min_request_interval_secs` | seconds Dealer waits between symbols' TAAPI `/bulk` calls (15) — sized to the TAAPI Free plan's 1 request/15s cap; lower it if the account is on a paid plan |
 | `trading` | `slP` / `tpP` | stop-loss/take-profit price multipliers on bracket orders (0.98/1.05 ≈ 2% stop, 5% target) |
