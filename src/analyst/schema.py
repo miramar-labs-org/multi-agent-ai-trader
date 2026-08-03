@@ -1,11 +1,14 @@
-from typing import List, Literal
+from typing import List
 
 from pydantic import BaseModel, Field
 
 
 class CandidateResearch(BaseModel):
     symbol: str
-    exchange: Literal["stocks"] = "stocks"  # crypto plumbed through end-to-end but out of scope for v1 screening
+    # Not constrained to a Literal: the allowed value ("stocks" or cfg.trading.crypto_taapi_exchange)
+    # is config-driven, not fixed. graph.py's validate_selection() overrides this against the actual
+    # candidate's known market rather than trusting the LLM's copy of the field.
+    exchange: str = "stocks"
     budget: float
     indicators: List[str]
     rationale: str = Field(description="One-line reason this candidate made the book")

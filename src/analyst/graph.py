@@ -27,7 +27,20 @@ class AnalystState(TypedDict):
 
 
 def discover_candidates(state: AnalystState, cfg) -> AnalystState:
-    candidates = sources.fetch_screener_candidates(cfg.analyst.screener_top_n)
+    candidates = []
+
+    if cfg.trading.enable_stocks:
+        stock_candidates = sources.fetch_screener_candidates(cfg.analyst.screener_top_n)
+        for c in stock_candidates:
+            c["market"] = "stocks"
+        candidates.extend(stock_candidates)
+
+    if cfg.trading.enable_crypto:
+        crypto_candidates = sources.fetch_crypto_candidates(cfg.analyst.screener_top_n)
+        for c in crypto_candidates:
+            c["market"] = cfg.trading.crypto_taapi_exchange
+        candidates.extend(crypto_candidates)
+
     return {**state, "raw_candidates": candidates}
 
 
@@ -47,10 +60,12 @@ def llm_select(state: AnalystState, cfg) -> AnalystState:
     ).with_structured_output(PortfolioSelection)
 
     system_prompt = (
-        "You are the Analyst agent on an automated stock trading floor. "
-        f"Pick at most {cfg.analyst.max_universe_size} stock symbols worth trading today, "
+        "You are the Analyst agent on an automated trading floor. "
+        f"Pick at most {cfg.analyst.max_universe_size} symbols worth trading today, "
         "drawn from the candidate list and informed by the research text. "
-        f"Each pick needs exchange=\"stocks\", a budget in USD (default to {cfg.analyst.default_budget} "
+        "Each candidate object includes a `market` field (\"stocks\", or a crypto exchange name "
+        "for a 24/7-traded crypto pair) -- set your pick's exchange field to exactly that value. "
+        f"Give each pick a budget in USD (default to {cfg.analyst.default_budget} "
         "unless you have a specific reason to size a position differently), an indicators list "
         f"(default {DEFAULT_INDICATORS} unless a symbol warrants different indicators), "
         "and a one-line rationale."
@@ -66,6 +81,24 @@ def llm_select(state: AnalystState, cfg) -> AnalystState:
     )
 
     return {**state, "selection": selection.model_dump()}
+
+
+def validate_selection(state: AnalystState, cfg) -> AnalystState:
+    """The LLM's `exchange` field is regenerated text, not guaranteed to match the candidate it
+    was actually given -- trust discover_candidates()'s own `market` tag instead, and drop any
+    pick whose symbol isn't one we actually offered (a hallucination)."""
+    market_by_symbol = {c["symbol"]: c["market"] for c in state["raw_candidates"]}
+
+    validated = []
+    for pick in state["selection"]["symbols"]:
+        market = market_by_symbol.get(pick["symbol"])
+        if market is None:
+            log(f"⚠️ dropping hallucinated pick {pick['symbol']} -- not in candidate list")
+            continue
+        pick["exchange"] = market
+        validated.append(pick)
+
+    return {**state, "selection": {**state["selection"], "symbols": validated}}
 
 
 def write_portfolio(state: AnalystState, cfg) -> AnalystState:
@@ -95,12 +128,14 @@ def build_graph():
     graph.add_node("discover_candidates", lambda state: discover_candidates(state, cfg))
     graph.add_node("fetch_research", lambda state: fetch_research(state, cfg))
     graph.add_node("llm_select", lambda state: llm_select(state, cfg))
+    graph.add_node("validate_selection", lambda state: validate_selection(state, cfg))
     graph.add_node("write_portfolio", lambda state: write_portfolio(state, cfg))
 
     graph.set_entry_point("discover_candidates")
     graph.add_edge("discover_candidates", "fetch_research")
     graph.add_edge("fetch_research", "llm_select")
-    graph.add_edge("llm_select", "write_portfolio")
+    graph.add_edge("llm_select", "validate_selection")
+    graph.add_edge("validate_selection", "write_portfolio")
     graph.add_edge("write_portfolio", END)
 
     return graph.compile()

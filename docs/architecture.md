@@ -84,14 +84,15 @@ is meant to surface immediately, not retry-storm. Entrypoint: `python -m src.ana
 **Purpose:** once a day, decide *which symbols are worth trading today* and hand that list
 off to the Dealer.
 
-**Implementation:** a 4-node LangGraph state machine (`src/analyst/graph.py`) over an
+**Implementation:** a 5-node LangGraph state machine (`src/analyst/graph.py`) over an
 `AnalystState`:
 
 | Node | What it does |
 |---|---|
-| `discover_candidates` | `sources.fetch_screener_candidates(screener_top_n=20)` — raw REST calls (not wrapped by `alpaca-py`) to Alpaca's `/v1beta1/screener/stocks/most-actives` and `/movers` endpoints, merged into a symbol→{volume, change_pct} dict |
+| `discover_candidates` | when `cfg.trading.enable_stocks`, `sources.fetch_screener_candidates(screener_top_n=20)` — raw REST calls (not wrapped by `alpaca-py`) to Alpaca's `/v1beta1/screener/stocks/most-actives` and `/movers` endpoints, merged into a symbol→{volume, change_pct} dict, each tagged `market: "stocks"`. When `cfg.trading.enable_crypto`, also `sources.fetch_crypto_candidates(...)` — a fixed watchlist (`BTC/USD`, `ETH/USD`, `SOL/USD`; Alpaca's crypto screener has no most-actives equivalent) merged with `/v1beta1/screener/crypto/movers`, tagged `market: cfg.trading.crypto_taapi_exchange` |
 | `fetch_research` | `sources.fetch_news(news_days=2)` (Alpaca News API, HTML stripped via BeautifulSoup) + `sources.fetch_yahoo_rss_headlines(...)` (Yahoo Finance RSS), concatenated into plain text |
 | `llm_select` | the actual LLM call — see below |
+| `validate_selection` | overrides each pick's `exchange` field with the `market` tag `discover_candidates` actually assigned that symbol (never trusts the LLM's own copy of `exchange`), and drops any pick whose symbol isn't in `raw_candidates` at all (a hallucination) |
 | `write_portfolio` | patches the `portfolio` ConfigMap via the `kubernetes` Python client |
 
 **LLM call:**
@@ -108,7 +109,10 @@ the candidates/research, each with a `budget` (default `default_budget`=5000), a
 `indicators` list (default `[rsi, macd, vwap, bbands, sma, ema]`), and a rationale. Output is
 enforced as structured JSON via `PortfolioSelection` (pydantic, `src/analyst/schema.py`) —
 there is no manual JSON-parsing/regex step; LangChain's `.with_structured_output()` handles
-that entirely.
+that entirely. Each candidate the LLM sees carries a `market` field ("stocks", or a crypto
+exchange name); the prompt tells it to copy that value into the pick's `exchange` field, but
+`validate_selection` re-derives `exchange` from the known `market` tag regardless — the LLM's
+own copy is never trusted as-is.
 
 **Output — the `portfolio` ConfigMap** (namespace `multi-agent-ai-trader`):
 ```json
@@ -254,9 +258,12 @@ three components.
   `portfolio` ConfigMap via the `kubernetes` Python client. This is the entire
   Analyst↔Dealer interface. `merge_held_positions()` additionally folds any Alpaca position
   not already in the watchlist (e.g. one opened before this app existed) into it on every
-  Dealer poll — stock positions are always merged in as `exchange: "stocks"`; crypto positions
-  are only merged in when `cfg.trading.enable_crypto` is set, tagged with
-  `cfg.trading.crypto_taapi_exchange` as their TAAPI venue.
+  Dealer poll — stock positions are only merged in as `exchange: "stocks"` when
+  `cfg.trading.enable_stocks` is set; crypto positions are only merged in when
+  `cfg.trading.enable_crypto` is set, tagged with `cfg.trading.crypto_taapi_exchange` as their
+  TAAPI venue. Dealer's own poll loop applies the same two flags symmetrically via
+  `should_process_entry()` (`src/dealer/main.py`), so a disabled market is skipped whether or
+  not a stray position for it is already sitting in the ConfigMap.
 - **`logging.py`** — an emoji-prefixed stdout logger (ported from `gpt-trader.py`) — the only
   durable trail of a trading decision is `kubectl logs` output plus whatever LangSmith
   captured of the LLM call chain; trade outcomes are not written to any database or MLflow.
@@ -296,7 +303,8 @@ three components.
 | `trading` | `pollsecs` | Dealer loop cadence (600s) |
 | `trading` | `buffer` | minutes to wait after market open before trading (15) |
 | `trading` | `market_override` | force-treat-market-as-open, for testing outside market hours |
-| `trading` | `enable_crypto` | when true, Dealer also polls merged-in crypto positions and `merge_held_positions()` folds pre-existing crypto positions into the watchlist; default off, gated until verified live |
+| `trading` | `enable_stocks` | when true, Analyst screens/picks equities, and Dealer processes/merges stock symbols; set false to pause equities handling entirely |
+| `trading` | `enable_crypto` | when true, Analyst also screens/picks from a fixed crypto watchlist (`BTC/USD`, `ETH/USD`, `SOL/USD`) via `fetch_crypto_candidates()`, Dealer also polls merged-in crypto positions, and `merge_held_positions()` folds pre-existing crypto positions into the watchlist |
 | `trading` | `crypto_taapi_exchange` | TAAPI venue name (e.g. `"binance"`) used as the `exchange` for crypto positions merged in by `merge_held_positions()` — TAAPI's `/bulk` API requires an actual venue, not the literal word "crypto" |
 | `eod_report` | `schedule` | informational copy of the CronJob's own `spec.schedule` — not templated, must be kept in sync manually |
 | `analyst` | `schedule` | informational copy of the CronJob's own `spec.schedule` — not templated, must be kept in sync manually |

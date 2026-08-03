@@ -11,6 +11,8 @@ from src.common.logging import get_logger
 log = get_logger("ANALYST")
 
 SCREENER_BASE_URL = "https://data.alpaca.markets/v1beta1/screener/stocks"
+CRYPTO_SCREENER_BASE_URL = "https://data.alpaca.markets/v1beta1/screener/crypto"
+CRYPTO_WATCHLIST = ["BTC/USD", "ETH/USD", "SOL/USD"]
 
 
 def html_to_text(html_content):
@@ -62,6 +64,37 @@ def fetch_screener_candidates(top_n: int) -> list[dict]:
 
     candidates = list(by_symbol.values())
     log(f"📈 fetched {len(candidates)} screener candidates")
+    return candidates
+
+
+def fetch_crypto_candidates(top_n: int) -> list[dict]:
+    # Alpaca's crypto screener only exposes movers (no most-actives equivalent for crypto), so a
+    # small fixed watchlist guarantees baseline coverage of major pairs regardless of movers data.
+    by_symbol: dict[str, dict] = {symbol: {"symbol": symbol} for symbol in CRYPTO_WATCHLIST}
+
+    url = f"{CRYPTO_SCREENER_BASE_URL}/movers?top={top_n}"
+    try:
+        resp = requests.get(url, headers=_alpaca_headers(), timeout=10)
+    except requests.RequestException as exc:
+        log(f"⚠️ crypto screener request failed for {url}: {exc}")
+        resp = None
+
+    if resp is not None:
+        if resp.status_code != 200:
+            log(f"⚠️ crypto screener returned {resp.status_code} for {url}: {resp.text[:200]}")
+        else:
+            payload = resp.json()
+            for key in ("gainers", "losers"):
+                for item in payload.get(key, []):
+                    symbol = item.get("symbol")
+                    if not symbol:
+                        continue
+                    entry = by_symbol.setdefault(symbol, {"symbol": symbol})
+                    if "change" in item or "percent_change" in item:
+                        entry["change_pct"] = item.get("percent_change", item.get("change"))
+
+    candidates = list(by_symbol.values())
+    log(f"📈 fetched {len(candidates)} crypto screener candidates")
     return candidates
 
 

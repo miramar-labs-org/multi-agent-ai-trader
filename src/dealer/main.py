@@ -26,6 +26,15 @@ def is_after_open_buffer(buffer_minutes: int) -> bool:
     return now_et >= adj_open_et
 
 
+def should_process_entry(entry: dict, cfg) -> bool:
+    is_crypto = entry["exchange"] != "stocks"
+    if is_crypto and not cfg.trading.enable_crypto:
+        return False
+    if not is_crypto and not cfg.trading.enable_stocks:
+        return False
+    return True
+
+
 def market_is_open(cfg, log) -> bool:
     if cfg.trading.market_override:
         log("📈 OVERRIDE: stock market is OPEN.")
@@ -62,7 +71,7 @@ def main():
 
             taapi_calls = 0
             for entry in portfolio.get("symbols", []):
-                if entry["exchange"] != "stocks" and not cfg.trading.enable_crypto:
+                if not should_process_entry(entry, cfg):
                     continue
                 if taapi_calls > 0:
                     # TAAPI's free plan allows 1 request/15s -- fetch_indicators makes exactly

@@ -81,9 +81,10 @@ kubectl create secret generic mlabs-api-keys -n multi-agent-ai-trader \
 
 At minimum, set `llm.base_url` to your DGX's Ollama endpoint. Also worth checking:
 `trading.market_override` (forces "market open" for testing outside trading hours),
-`trading.enable_crypto` (off by default — merges pre-existing crypto positions into the
-watchlist and lets Dealer trade them once verified live),
-`analyst.default_budget`/`max_universe_size`, and the `slack`/`langsmith` `enabled` flags.
+`trading.enable_stocks`/`trading.enable_crypto` (independently gate equities/crypto for both
+Analyst's daily candidate screening and Dealer's poll loop — crypto also merges pre-existing
+positions into the watchlist), `analyst.default_budget`/`max_universe_size`, and the
+`slack`/`langsmith` `enabled` flags.
 
 ### 5. Deploy
 
@@ -117,8 +118,10 @@ context, and parse the response into a strict structured-output schema (via Lang
 `.with_structured_output()` — no hand-rolled JSON parsing). Both are implemented as small
 [LangGraph](https://langchain-ai.github.io/langgraph/) state machines:
 
-- **Analyst** (4 nodes): discover screener candidates → fetch news/RSS research → LLM picks
-  up to 10 symbols with a budget and rationale each → write the `portfolio` ConfigMap.
+- **Analyst** (5 nodes): discover screener candidates (stocks and/or a fixed crypto watchlist,
+  per `trading.enable_stocks`/`enable_crypto`) → fetch news/RSS research → LLM picks up to 10
+  symbols with a budget and rationale each → validate each pick's exchange against the actual
+  candidate it came from (dropping any hallucinated symbol) → write the `portfolio` ConfigMap.
 - **Dealer** (3 nodes, per symbol per poll): fetch technical indicators → LLM decides
   BUY/HOLD/SELL → if not HOLD, dispatch to Floor Broker over HTTP.
 

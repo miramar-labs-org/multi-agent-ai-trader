@@ -31,8 +31,9 @@ def read_portfolio() -> dict:
 def merge_held_positions(portfolio: dict, cfg) -> dict:
     """Adds any Alpaca position not already in the watchlist -- e.g. one opened before this app
     existed -- so Dealer keeps deciding BUY/HOLD/SELL on it instead of leaving it unmanaged
-    forever. Crypto positions are only merged in when `cfg.trading.enable_crypto` is set,
-    matching Dealer's own exchange-filter gate."""
+    forever. Stock positions are only merged in when `cfg.trading.enable_stocks` is set, and
+    crypto positions only when `cfg.trading.enable_crypto` is set, matching Dealer's own
+    exchange-filter gate."""
     symbols = portfolio.get("symbols", [])
     known = {entry["symbol"] for entry in symbols}
 
@@ -40,7 +41,7 @@ def merge_held_positions(portfolio: dict, cfg) -> dict:
         if position.symbol in known:
             continue
 
-        if position.asset_class == AssetClass.US_EQUITY:
+        if position.asset_class == AssetClass.US_EQUITY and cfg.trading.enable_stocks:
             exchange = "stocks"
         elif position.asset_class == AssetClass.CRYPTO and cfg.trading.enable_crypto:
             exchange = cfg.trading.crypto_taapi_exchange
