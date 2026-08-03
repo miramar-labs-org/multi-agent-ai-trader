@@ -9,7 +9,7 @@ from alpaca.trading.requests import (
     TakeProfitRequest,
 )
 
-from src.common.alpaca_client import get_current_ask_price, get_current_bid_price, trading_client
+from src.common.alpaca_client import get_current_ask_price, trading_client
 from src.common.logging import get_logger
 
 log = get_logger("FLOOR")
@@ -45,14 +45,15 @@ def get_qty(symbol: str, budget: float) -> int:
 
 
 def bracket_buy_with_SLTP(symbol: str, budget: float, slP: float, tpP: float) -> MarketOrderRequest:
+    # A bracket BUY fills near the ask, not the bid/ask mid -- pricing TP/SL off mid understates
+    # the real entry price and can fall below Alpaca's `base_price + 0.01` floor on wide-spread
+    # symbols, causing the whole order to be rejected.
     ask = get_current_ask_price(symbol)
-    bid = get_current_bid_price(symbol)
-    mid = (ask + bid) / 2
 
-    take_profit_px = round(mid * tpP, 2)
-    stop_loss_px = round(mid * slP, 2)
+    take_profit_px = round(ask * tpP, 2)
+    stop_loss_px = round(ask * slP, 2)
 
-    log(f"📈  mid-price {mid:.2f} => TP {take_profit_px}  |  SL {stop_loss_px}")
+    log(f"📈  ask-price {ask:.2f} => TP {take_profit_px}  |  SL {stop_loss_px}")
 
     return MarketOrderRequest(
         symbol=symbol,

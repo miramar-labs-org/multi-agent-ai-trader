@@ -203,8 +203,9 @@ rather than raised; unexpected exceptions become a 500.
 **Order logic** (`src/floor_broker/execution.py`):
 - **`buy()`** — safety gate first: if an open position or open order already exists for the
   symbol, the buy is skipped ("aborting BUY") rather than pyramiding. For stocks, submits a
-  **bracket order** (`OrderClass.BRACKET`) with computed stop-loss (`mid_price * slP`) and
-  take-profit (`mid_price * tpP`) legs, `TimeInForce.DAY`. For crypto symbols (`/` in the
+  **bracket order** (`OrderClass.BRACKET`) with computed stop-loss (`ask_price * slP`) and
+  take-profit (`ask_price * tpP`) legs, `TimeInForce.DAY` — priced off the ask since that's
+  where a BUY actually fills, not the bid/ask mid. For crypto symbols (`/` in the
   ticker), submits a plain notional market buy instead (`TimeInForce.GTC`) — bracket orders
   aren't used for crypto.
 - **`sell()`** — sells the full open quantity at market. Has an explicit **retry-after-cleanup**
