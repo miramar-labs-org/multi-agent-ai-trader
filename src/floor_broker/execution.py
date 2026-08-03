@@ -14,6 +14,8 @@ from src.common.logging import get_logger
 
 log = get_logger("FLOOR")
 
+MIN_CRYPTO_NOTIONAL = 10.0  # Alpaca rejects a crypto notional below this (code 40310000)
+
 
 def get_open_position(symbol: str) -> float:
     try:
@@ -99,9 +101,19 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
         # BTCUSD failure came from a `budget` value with more precision than that (e.g. a
         # merged position's market_value), so round before submitting rather than trusting the
         # caller to have already done so.
+        notional = round(budget, 2)
+
+        # Alpaca also rejects a crypto notional below its minimum order value (code 40310000,
+        # "cost basis must be >= minimal amount of order 10") -- a merged position sized off a
+        # shrunk market_value can fall under that floor, so clamp up to it rather than let the
+        # BUY fail outright.
+        if notional < MIN_CRYPTO_NOTIONAL:
+            log(f"⚠️  budget {notional} below Alpaca's ${MIN_CRYPTO_NOTIONAL:.0f} crypto minimum -- clamping up")
+            notional = MIN_CRYPTO_NOTIONAL
+
         req = MarketOrderRequest(
             symbol=symbol,
-            notional=round(budget, 2),
+            notional=notional,
             side=OrderSide.BUY,
             time_in_force=TimeInForce.GTC,
         )

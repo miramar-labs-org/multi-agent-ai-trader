@@ -119,6 +119,20 @@ def test_crypto_buy_rounds_notional_to_2_decimal_places(monkeypatch):
     assert fake_client.submitted[0].notional == 123.46
 
 
+def test_crypto_buy_clamps_notional_below_alpacas_minimum(monkeypatch):
+    """Regression for a live BUY BTCUSD rejection: {"code":40310000,"message":"cost basis must be
+    >= minimal amount of order 10"} -- a merged position's budget (sized off a shrunk
+    market_value) can fall under Alpaca's crypto minimum notional; it must be clamped up to that
+    floor rather than submitted as-is and rejected."""
+    fake_client = FakeTradingClient()
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    result = execution.buy("BTC/USD", "binance", 3.5, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "executed"
+    assert fake_client.submitted[0].notional == execution.MIN_CRYPTO_NOTIONAL
+
+
 def test_buy_reraises_on_unrelated_api_error(monkeypatch):
     """buy()'s retry is specific to the base_price mismatch (code 42210000 with a base_price
     field) -- any other rejection must propagate, not be silently retried/swallowed."""

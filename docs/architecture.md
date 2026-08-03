@@ -216,7 +216,11 @@ rather than raised; unexpected exceptions become a 500.
   notional market buy instead (`TimeInForce.GTC`) — bracket orders aren't used for crypto.
   The notional amount is rounded to 2 decimals before submitting — Alpaca rejects a crypto
   notional with finer precision than that (`code 42210000`), which a `budget` value carrying
-  extra precision (e.g. a merged position's `market_value`) can otherwise trigger.
+  extra precision (e.g. a merged position's `market_value`) can otherwise trigger. The rounded
+  notional is then clamped up to `MIN_CRYPTO_NOTIONAL` ($10) if it falls below that floor —
+  Alpaca also rejects a crypto notional under its minimum order value (`code 40310000`, "cost
+  basis must be >= minimal amount of order 10"), which a merged position sized off a shrunk
+  `market_value` can otherwise trigger.
 - **`sell()`** — sells the full open quantity at market. Has an explicit **retry-after-cleanup**
   path: if Alpaca rejects with error code `40310000` (conflicting orders blocking the sell),
   it cancels the blocking orders (ignoring 404s), *re-fetches* the now-current open quantity
