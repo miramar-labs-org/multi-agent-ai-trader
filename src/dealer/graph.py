@@ -5,6 +5,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 
+from src.common import slack
 from src.common.config import load_config
 from src.common.logging import get_logger
 from src.dealer.indicators import INDICATOR_MAP
@@ -60,6 +61,7 @@ def llm_call(state: DealerState, cfg) -> DealerState:
 
 def call_floor_broker(state: DealerState, cfg) -> DealerState:
     signal = state["signal"]
+    slack.notify_dealer_signal(state["symbol"], signal["action"], signal["reasoning"])
 
     if signal["action"] == "HOLD":
         return {**state, "execution_result": {"status": "skipped", "detail": "HOLD"}}
@@ -77,10 +79,14 @@ def call_floor_broker(state: DealerState, cfg) -> DealerState:
         response = requests.post(f"{cfg.floor_broker.base_url}/execute", json=payload, timeout=30)
         if response.status_code != 200:
             log(f"💥 floor broker error: {response.status_code} {response.text}")
+            slack.notify_floor_broker_result(state["symbol"], signal["action"], "error", response.text)
             return {**state, "execution_result": {"status": "error", "detail": response.text}}
-        return {**state, "execution_result": response.json()}
+        result = response.json()
+        slack.notify_floor_broker_result(state["symbol"], signal["action"], result["status"], result["detail"])
+        return {**state, "execution_result": result}
     except requests.RequestException as exc:
         log(f"💥 floor broker request failed: {exc}")
+        slack.notify_floor_broker_result(state["symbol"], signal["action"], "error", str(exc))
         return {**state, "execution_result": {"status": "error", "detail": str(exc)}}
 
 

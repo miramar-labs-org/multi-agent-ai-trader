@@ -6,6 +6,7 @@ from datetime import datetime, time as dtime, timedelta
 import pytz
 from kubernetes.client.exceptions import ApiException
 
+from src.common import slack
 from src.common.alpaca_client import trading_client
 from src.common.config import load_config
 from src.common.logging import get_logger
@@ -59,6 +60,7 @@ def main():
                 portfolio = read_portfolio()
             except (ApiException, json.JSONDecodeError) as exc:
                 log(f"⚠️ BAD portfolio read .. cannot proceed: {exc}")
+                slack.notify_error("DEALER", f"portfolio read failed: {exc}")
                 time.sleep(60)
                 continue
 
@@ -78,6 +80,7 @@ def main():
                     graph.invoke(state, config={"tags": ["dealer"]})
                 except Exception as exc:
                     log(f"💥 failed processing {entry['symbol']}: {exc}")
+                    slack.notify_error("DEALER", f"{entry['symbol']}: {exc}")
                     continue
 
         log(f"------------------ PAUSED FOR {cfg.trading.pollsecs}s -----------------------")

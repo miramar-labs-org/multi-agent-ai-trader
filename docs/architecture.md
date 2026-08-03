@@ -232,6 +232,7 @@ rather than raised; unexpected exceptions become a 500.
 |---|---|---|
 | `llm` | `base_url`, `model`, `temperature` | shared OpenAI-compatible endpoint for **both** Analyst and Dealer LLM calls — see [platform-services.md](platform-services.md) for current wiring status |
 | `langsmith` | `enabled`, `project` | toggles LangGraph/LangChain tracing to LangSmith (requires `LANGCHAIN_API_KEY`) |
+| `slack` | `enabled` | toggles posting interesting events (Analyst picks, Dealer signals, Floor Broker executions, errors) to `#miramar-trading-floor` (requires `SLACK_WEBHOOK_URL`) |
 | `floor_broker` | `base_url` | in-cluster Service DNS Dealer uses to reach Floor Broker |
 | `trading` | `slP` / `tpP` | stop-loss/take-profit price multipliers on bracket orders (0.98/1.05 ≈ 2% stop, 5% target) |
 | `trading` | `pollsecs` | Dealer loop cadence (600s) |
@@ -265,10 +266,10 @@ rather than raised; unexpected exceptions become a 500.
 
 All credentials live in one k8s Secret, `mlabs-api-keys` (documented, not created, by
 `k8s/secrets.example.yaml` — deploy fails fast if it's missing): `TAAPI_API_KEY`,
-`ALPACA_PAPER_API_KEY`, `ALPACA_PAPER_API_SECRET`, `LANGCHAIN_API_KEY`. Analyst and Dealer
-get it via `envFrom.secretRef` for both k8s-API access (via their shared ServiceAccount) and
-these external API keys; Floor Broker gets the same secret only for its Alpaca keys — it has
-no ServiceAccount/k8s API access at all.
+`ALPACA_PAPER_API_KEY`, `ALPACA_PAPER_API_SECRET`, `LANGCHAIN_API_KEY`, `SLACK_WEBHOOK_URL`.
+Analyst and Dealer get it via `envFrom.secretRef` for both k8s-API access (via their shared
+ServiceAccount) and these external API keys; Floor Broker gets the same secret for its Alpaca
+keys and `SLACK_WEBHOOK_URL` — it has no ServiceAccount/k8s API access at all.
 
 ## `notebook.ipynb`
 

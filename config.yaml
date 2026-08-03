@@ -9,6 +9,9 @@ langsmith:
   enabled: true
   project: "multi-agent-ai-trader"   # requires LANGCHAIN_API_KEY in the mlabs-api-keys secret
 
+slack:
+  enabled: true   # requires SLACK_WEBHOOK_URL in the mlabs-api-keys secret; posts to #miramar-trading-floor
+
 floor_broker:
   base_url: "http://floor-broker.multi-agent-ai-trader.svc.cluster.local:8000"
 

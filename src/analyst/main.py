@@ -1,6 +1,7 @@
 import os
 
 from src.analyst.graph import build_graph
+from src.common import slack
 from src.common.config import load_config
 from src.common.logging import get_logger
 
@@ -24,6 +25,7 @@ def main():
         log(f"wrote portfolio with {len(selection.get('symbols', []))} symbols")
     except Exception as exc:
         log(f"💥 Analyst run failed: {exc}")
+        slack.notify_error("ANALYST", str(exc))
         raise
 
 

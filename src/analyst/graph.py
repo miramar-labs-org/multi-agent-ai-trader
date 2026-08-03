@@ -8,6 +8,7 @@ from langgraph.graph import END, StateGraph
 
 from src.analyst import sources
 from src.analyst.schema import PortfolioSelection
+from src.common import slack
 from src.common.config import load_config
 from src.common.logging import get_logger
 from src.common.portfolio_state import write_portfolio as _write_portfolio
@@ -73,6 +74,7 @@ def write_portfolio(state: AnalystState, cfg) -> AnalystState:
     }
     _write_portfolio(payload)
     log(f"✅ wrote portfolio with {len(payload['symbols'])} symbols")
+    slack.notify_analyst_picks(payload["symbols"])
     return state
 
 
