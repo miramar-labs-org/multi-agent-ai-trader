@@ -205,9 +205,11 @@ rather than raised; unexpected exceptions become a 500.
   symbol, the buy is skipped ("aborting BUY") rather than pyramiding. For stocks, submits a
   **bracket order** (`OrderClass.BRACKET`) with computed stop-loss (`ask_price * slP`) and
   take-profit (`ask_price * tpP`) legs, `TimeInForce.DAY` — priced off the ask since that's
-  where a BUY actually fills, not the bid/ask mid. For crypto symbols (`/` in the
-  ticker), submits a plain notional market buy instead (`TimeInForce.GTC`) — bracket orders
-  aren't used for crypto.
+  where a BUY actually fills, not the bid/ask mid. TP/SL prices are rounded to 4 decimals for
+  stocks under $1.00 and 2 decimals otherwise (`_round_to_tick`) — sub-$1 stocks are quoted in
+  $0.0001 increments (SEC Rule 612), so 2dp rounding can land TP/SL on the same cent as
+  `base_price` and get rejected. For crypto symbols (`/` in the ticker), submits a plain
+  notional market buy instead (`TimeInForce.GTC`) — bracket orders aren't used for crypto.
 - **`sell()`** — sells the full open quantity at market. Has an explicit **retry-after-cleanup**
   path: if Alpaca rejects with error code `40310000` (conflicting orders blocking the sell),
   it cancels the blocking orders (ignoring 404s), *re-fetches* the now-current open quantity
@@ -250,7 +252,11 @@ three components.
   loader, so there is exactly one config schema for the whole system.
 - **`portfolio_state.py`** — `read_portfolio()`/`write_portfolio()` against the k8s
   `portfolio` ConfigMap via the `kubernetes` Python client. This is the entire
-  Analyst↔Dealer interface.
+  Analyst↔Dealer interface. `merge_held_positions()` additionally folds any Alpaca position
+  not already in the watchlist (e.g. one opened before this app existed) into it on every
+  Dealer poll — stock positions are always merged in as `exchange: "stocks"`; crypto positions
+  are only merged in when `cfg.trading.enable_crypto` is set, tagged with
+  `cfg.trading.crypto_taapi_exchange` as their TAAPI venue.
 - **`logging.py`** — an emoji-prefixed stdout logger (ported from `gpt-trader.py`) — the only
   durable trail of a trading decision is `kubectl logs` output plus whatever LangSmith
   captured of the LLM call chain; trade outcomes are not written to any database or MLflow.
@@ -290,6 +296,8 @@ three components.
 | `trading` | `pollsecs` | Dealer loop cadence (600s) |
 | `trading` | `buffer` | minutes to wait after market open before trading (15) |
 | `trading` | `market_override` | force-treat-market-as-open, for testing outside market hours |
+| `trading` | `enable_crypto` | when true, Dealer also polls merged-in crypto positions and `merge_held_positions()` folds pre-existing crypto positions into the watchlist; default off, gated until verified live |
+| `trading` | `crypto_taapi_exchange` | TAAPI venue name (e.g. `"binance"`) used as the `exchange` for crypto positions merged in by `merge_held_positions()` — TAAPI's `/bulk` API requires an actual venue, not the literal word "crypto" |
 | `eod_report` | `schedule` | informational copy of the CronJob's own `spec.schedule` — not templated, must be kept in sync manually |
 | `analyst` | `schedule` | informational copy of the CronJob's own `spec.schedule` — not templated, must be kept in sync manually |
 | `analyst` | `max_universe_size`, `default_budget`, `screener_top_n`, `news_days`, `yahoo_rss_url` | Analyst's selection parameters |

@@ -81,6 +81,8 @@ kubectl create secret generic mlabs-api-keys -n multi-agent-ai-trader \
 
 At minimum, set `llm.base_url` to your DGX's Ollama endpoint. Also worth checking:
 `trading.market_override` (forces "market open" for testing outside trading hours),
+`trading.enable_crypto` (off by default — merges pre-existing crypto positions into the
+watchlist and lets Dealer trade them once verified live),
 `analyst.default_budget`/`max_universe_size`, and the `slack`/`langsmith` `enabled` flags.
 
 ### 5. Deploy
