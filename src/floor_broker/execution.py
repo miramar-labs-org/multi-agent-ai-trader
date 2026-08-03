@@ -50,18 +50,22 @@ def _round_to_tick(price: float) -> float:
     return round(price, 4) if price < 1.0 else round(price, 2)
 
 
-def bracket_buy_with_SLTP(symbol: str, budget: float, slP: float, tpP: float) -> MarketOrderRequest:
+def bracket_buy_with_SLTP(
+    symbol: str, budget: float, slP: float, tpP: float, base_price: float | None = None
+) -> MarketOrderRequest:
     # A bracket BUY fills near the ask, not the bid/ask mid -- pricing TP/SL off mid understates
     # the real entry price and can fall below Alpaca's `base_price + 0.01` floor on wide-spread
-    # symbols, causing the whole order to be rejected.
-    ask = get_current_ask_price(symbol)
+    # symbols, causing the whole order to be rejected. `base_price`, when given, is Alpaca's own
+    # rejection-supplied reference price for a retry (see `buy()`) -- it takes priority over a
+    # fresh client-side quote, which can diverge from Alpaca's reference on thin, low-priced
+    # symbols (e.g. our free-tier IEX-only feed missing the true NBBO).
+    ask = base_price if base_price is not None else get_current_ask_price(symbol)
 
     # Alpaca also enforces an absolute $0.01 minimum distance between TP/SL and base_price,
     # regardless of stock price -- on sub-~$0.50 stocks, slP/tpP's percentage move (e.g. 2%/5%)
     # doesn't reach a full cent, so the percentage-based price must be clamped to that floor.
-    # Clamp to $0.02, not the bare $0.01 minimum -- Alpaca validates against its own base_price,
-    # which can drift slightly from the ask we just fetched on a fast-moving penny stock, and
-    # sitting exactly on the legal boundary leaves no room to absorb that.
+    # Clamp to $0.02, not the bare $0.01 minimum, for a small safety margin against price
+    # movement in the moments between quoting `ask` and Alpaca validating the order.
     take_profit_px = max(_round_to_tick(ask * tpP), _round_to_tick(ask + 0.02))
     stop_loss_px = min(_round_to_tick(ask * slP), _round_to_tick(ask - 0.02))
 
@@ -98,7 +102,27 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
             time_in_force=TimeInForce.GTC,
         )
 
-    order = trading_client.submit_order(req)
+    try:
+        order = trading_client.submit_order(req)
+    except APIError as exc:
+        if exchange != "stocks":
+            raise
+        try:
+            err = json.loads(str(exc))
+        except json.JSONDecodeError:
+            raise
+
+        base_price = err.get("base_price")
+        if err.get("code") != 42210000 or base_price is None:
+            raise
+
+        # Our client-quoted `ask` can diverge from Alpaca's own base_price on thin, low-priced
+        # symbols -- rather than guess an ever-bigger buffer around our own quote, retry once
+        # using Alpaca's own authoritative reference price straight from the rejection.
+        log(f"🔄  retrying BUY {symbol} priced off Alpaca's own base_price {base_price} ...")
+        req = bracket_buy_with_SLTP(symbol, budget, slP, tpP, base_price=float(base_price))
+        order = trading_client.submit_order(req)
+
     log(f"✅  buy order submitted: {order.id}")
     return {"status": "executed", "detail": f"buy order submitted: {order.id}"}
 
