@@ -55,6 +55,65 @@ def test_poll_bracket_fills_survives_an_exception_and_reaches_the_next_sleep(mon
         fb_main.poll_bracket_fills()
 
 
+def test_poll_pending_fills_posts_slack_notification_for_each_event(monkeypatch):
+    monkeypatch.setattr(
+        fb_main.execution,
+        "check_pending_fills",
+        lambda: [
+            {
+                "symbol": "MGN",
+                "action": "BUY",
+                "reason": "opening_position",
+                "order_id": "order-1",
+                "fill_price": 10.05,
+                "sl_price": 9.8,
+                "tp_price": 10.5,
+            }
+        ],
+    )
+    posted = []
+    monkeypatch.setattr(fb_main.slack, "notify_floor_broker_result", lambda *a, **k: posted.append((a, k)))
+    monkeypatch.setattr(fb_main.time, "sleep", lambda s: (_ for _ in ()).throw(_StopLoop))
+
+    with pytest.raises(_StopLoop):
+        fb_main.poll_pending_fills()
+
+    assert len(posted) == 1
+    args, kwargs = posted[0]
+    assert args[0] == "MGN"
+    assert args[1] == "BUY"
+    assert kwargs["reason"] == "opening_position"
+    assert kwargs["fill_price"] == 10.05
+    assert kwargs["sl_price"] == 9.8
+    assert kwargs["tp_price"] == 10.5
+
+
+def test_poll_pending_fills_posts_nothing_when_no_events(monkeypatch):
+    monkeypatch.setattr(fb_main.execution, "check_pending_fills", lambda: [])
+    posted = []
+    monkeypatch.setattr(fb_main.slack, "notify_floor_broker_result", lambda *a, **k: posted.append((a, k)))
+    monkeypatch.setattr(fb_main.time, "sleep", lambda s: (_ for _ in ()).throw(_StopLoop))
+
+    with pytest.raises(_StopLoop):
+        fb_main.poll_pending_fills()
+
+    assert posted == []
+
+
+def test_poll_pending_fills_survives_an_exception_and_reaches_the_next_sleep(monkeypatch):
+    """A transient Alpaca error inside one poll iteration must not kill the background thread --
+    it should be caught, logged, and the loop must still reach time.sleep() to try again."""
+
+    def _raise():
+        raise RuntimeError("alpaca unavailable")
+
+    monkeypatch.setattr(fb_main.execution, "check_pending_fills", _raise)
+    monkeypatch.setattr(fb_main.time, "sleep", lambda s: (_ for _ in ()).throw(_StopLoop))
+
+    with pytest.raises(_StopLoop):
+        fb_main.poll_pending_fills()
+
+
 def _stop_after(n):
     """Lets poll_kill_switch() run for exactly `n` iterations (n calls to time.sleep()) before
     breaking out via _StopLoop, so a multi-iteration transition sequence can be tested without an

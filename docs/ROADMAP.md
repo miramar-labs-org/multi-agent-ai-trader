@@ -29,6 +29,7 @@ All trading remains **paper-only**. SELL operations that reduce exposure should 
 | P0.11 | Dependency split and reproducible pinning | P0 | Planned | — |
 | P0.12 | CI, linting, validation, and image-build checks | P0 | Partial (pytest + ruff check only; see below) | P0.11 |
 | P0.13 | Baseline container security | P0 | Planned | P0.11 |
+| P0.14 | Asynchronous order submission and fill reporting | P0 | Done | — |
 | P1.1 | Durable decision and event schema | P1 | Planned | P0 complete |
 | P1.2 | Exact model, prompt, and input version capture | P1 | Planned | P1.1 |
 | P1.3 | Shadow execution mode | P1 | Planned | P1.1 |
@@ -582,6 +583,52 @@ Read-only root filesystems may be deferred for workloads that require additional
 - Kubernetes manifests contain baseline `securityContext`.
 - Containers do not require added Linux capabilities.
 - CI validates manifests and image startup where practical.
+
+---
+
+## P0.14 — Asynchronous order submission and fill reporting
+
+**Done.** `_wait_for_fill()` used to block the synchronous `/execute` route for up to ~5s
+(`FILL_POLL_ATTEMPTS=5` x `FILL_POLL_INTERVAL_S=1.0`) after every BUY/SELL submission, polling
+Alpaca for the fill price before responding -- tying up a request-handling worker thread and
+mixing order acceptance with fill observation into one request/response cycle. `buy()`/`sell()`
+now submit the order and return immediately with `status="submitted"` and `order_id` (stock BUYs
+still return `sl_price`/`tp_price` immediately -- those are computed pre-submission and need no
+polling). A new `execution.check_pending_fills()`, tracking `_pending_fills: dict[order_id,
+context]`, mirrors the existing `check_bracket_fills()`/`_tracked_brackets` pattern already used
+for TP/SL leg fills; it's polled by a new `poll_pending_fills()` daemon thread in
+`src/floor_broker/main.py` (same shape as `poll_bracket_fills()`/`poll_kill_switch()`), which
+posts the eventual fill as its own Slack notification
+(`slack.notify_floor_broker_result(status="executed", fill_price=...)`) once observed --
+decoupling order acceptance from fill reporting, matching the async model the bracket-fill
+watcher already established for TP/SL legs. `ExecuteResponse.status` and
+`notify_floor_broker_result`'s emoji mapping both gained a `"submitted"` case. `_wait_for_fill()`
+and its two constants are removed -- no caller needs bounded synchronous polling anymore.
+
+### Problem
+
+`_wait_for_fill()` blocks the synchronous `/execute` FastAPI route for up to ~5s after every
+BUY/SELL submission, polling Alpaca for the fill price before responding. This ties up a
+request-handling worker thread on every trade, increases request latency, increases the chance
+of tripping Dealer's 30s HTTP timeout under load, and mixes order acceptance with eventual fill
+observation into a single request/response cycle. The existing bracket-fill watcher
+(`poll_bracket_fills()`) already reports TP/SL leg fills asynchronously and separately from
+`/execute` -- the initial order's own fill is the one part of this flow still handled
+synchronously.
+
+### Change
+
+Submit the order and return immediately with `status="submitted"` and the order ID; track the
+fill asynchronously via a background poller; report the fill event separately (a new Slack
+notification), reusing the same tracking-dict-plus-daemon-thread pattern the bracket-fill watcher
+already established.
+
+### Acceptance criteria
+
+- `/execute` returns without blocking on a fill for any BUY or SELL.
+- The eventual fill is reported via a separate Slack notification, not the `/execute` response.
+- `ExecuteResponse.status` includes `"submitted"`.
+- Existing bracket TP/SL fill reporting (`poll_bracket_fills`) is unaffected.
 
 ---
 

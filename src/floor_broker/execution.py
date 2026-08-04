@@ -1,5 +1,4 @@
 import json
-import time
 
 from alpaca.common.exceptions import APIError
 from alpaca.trading.enums import OrderClass, OrderSide, OrderStatus, OrderType, TimeInForce
@@ -18,9 +17,6 @@ from src.common.logging import get_logger
 log = get_logger("FLOOR")
 
 MIN_CRYPTO_NOTIONAL = 10.0  # Alpaca rejects a crypto notional below this (code 40310000)
-
-FILL_POLL_ATTEMPTS = 5
-FILL_POLL_INTERVAL_S = 1.0
 
 _TERMINAL_NO_FILL = {OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED}
 
@@ -43,14 +39,33 @@ class InsufficientQuantity(InvalidOrderParameters):
 # side, only the notification is missed).
 _tracked_brackets: dict[str, str] = {}
 
+# Tracks every order buy()/sell() itself submitted, keyed by order id, so check_pending_fills()
+# can later report that order's own fill (ROADMAP P0.14) -- distinct from _tracked_brackets
+# above, which is only for a bracket's *child* TP/SL legs. Same in-memory-only caveat as
+# _tracked_brackets: lost on a pod restart, so a fill observed while the pod is down produces no
+# Slack notice (the trade itself still executes fine on Alpaca's side).
+_pending_fills: dict[str, dict] = {}
 
-def _wait_for_fill(order_id: str) -> float | None:
-    for _ in range(FILL_POLL_ATTEMPTS):
-        order = trading_client.get_order_by_id(order_id)
+
+def check_pending_fills() -> list[dict]:
+    """Polls every order buy()/sell() submitted for its own fill -- /execute now returns
+    status="submitted" before this is known (ROADMAP P0.14), so this is the only place a
+    submitted order's fill is ever observed and reported."""
+    events = []
+    for order_id, ctx in list(_pending_fills.items()):
+        try:
+            order = trading_client.get_order_by_id(order_id)
+        except APIError:
+            _pending_fills.pop(order_id, None)
+            continue
+
         if order.filled_avg_price is not None:
-            return float(order.filled_avg_price)
-        time.sleep(FILL_POLL_INTERVAL_S)
-    return None
+            events.append({**ctx, "order_id": order_id, "fill_price": float(order.filled_avg_price)})
+            _pending_fills.pop(order_id, None)
+        elif order.status in _TERMINAL_NO_FILL:
+            _pending_fills.pop(order_id, None)
+
+    return events
 
 
 def check_bracket_fills() -> list[dict]:
@@ -252,7 +267,6 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
         order = trading_client.submit_order(req)
 
     log(f"✅  buy order submitted: {order.id}")
-    fill_price = _wait_for_fill(order.id)
 
     if exchange == "stocks":
         _tracked_brackets[symbol] = order.id
@@ -262,12 +276,19 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
         sl_price = None
         tp_price = None
 
+    _pending_fills[order.id] = {
+        "symbol": symbol,
+        "action": "BUY",
+        "reason": "opening_position",
+        "sl_price": sl_price,
+        "tp_price": tp_price,
+    }
+
     return {
-        "status": "executed",
+        "status": "submitted",
         "reason": "opening_position",
         "detail": f"buy order submitted: {order.id}",
         "order_id": order.id,
-        "fill_price": fill_price,
         "sl_price": sl_price,
         "tp_price": tp_price,
     }
@@ -290,12 +311,12 @@ def sell(symbol: str) -> dict:
     try:
         order = trading_client.submit_order(req)
         log(f"✅  sell order submitted: {order.id}")
+        _pending_fills[order.id] = {"symbol": symbol, "action": "SELL", "reason": "dealer_signal", "sl_price": None, "tp_price": None}
         return {
-            "status": "executed",
+            "status": "submitted",
             "reason": "dealer_signal",
             "detail": f"sell order submitted: {order.id}",
             "order_id": order.id,
-            "fill_price": _wait_for_fill(order.id),
         }
     except APIError as exc:
         try:
@@ -323,12 +344,12 @@ def sell(symbol: str) -> dict:
             log("🔄  retrying after clean-up ...")
             order = trading_client.submit_order(req)
             log(f"✅  sell order submitted: {order.id}")
+            _pending_fills[order.id] = {"symbol": symbol, "action": "SELL", "reason": "dealer_signal", "sl_price": None, "tp_price": None}
             return {
-                "status": "executed",
+                "status": "submitted",
                 "reason": "dealer_signal",
                 "detail": f"sell order submitted: {order.id}",
                 "order_id": order.id,
-                "fill_price": _wait_for_fill(order.id),
             }
         except APIError as retry_exc:
             log(f"💥  sell retry failed for {symbol}: {retry_exc}")

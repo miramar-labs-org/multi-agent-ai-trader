@@ -70,7 +70,7 @@ def notify_floor_broker_result(
     sl_price: float | None = None,
     tp_price: float | None = None,
 ) -> None:
-    emoji = "✅" if status == "executed" else ("⚠️" if status == "skipped" else "❌")
+    emoji = {"executed": "✅", "submitted": "📨", "skipped": "⚠️"}.get(status, "❌")
     lines = [f"{emoji} *Floor Broker* — {action} {symbol}: `{status}` — {detail} _{_timestamp()}_"]
 
     details = []

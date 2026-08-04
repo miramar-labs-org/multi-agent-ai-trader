@@ -11,6 +11,7 @@ log = get_logger("FLOOR")
 
 BRACKET_FILL_POLL_INTERVAL_S = 30
 KILL_SWITCH_POLL_INTERVAL_S = 30
+PENDING_FILL_POLL_INTERVAL_S = 30
 
 
 def poll_bracket_fills():
@@ -32,6 +33,29 @@ def poll_bracket_fills():
         except Exception as exc:
             log(f"💥 bracket-fill poll failed: {exc}")
         time.sleep(BRACKET_FILL_POLL_INTERVAL_S)
+
+
+def poll_pending_fills():
+    """Runs for the lifetime of the process, watching for the fill of orders buy()/sell()
+    themselves submitted (ROADMAP P0.14) -- /execute now returns status="submitted" before the
+    fill is known, so this is the only place that fill is ever observed and reported."""
+    while True:
+        try:
+            for event in execution.check_pending_fills():
+                log(f"💰 {event['action']} filled for {event['symbol']} @ {event['fill_price']}")
+                slack.notify_floor_broker_result(
+                    event["symbol"],
+                    event["action"],
+                    "executed",
+                    f"{event['reason']} order filled: {event['order_id']}",
+                    reason=event["reason"],
+                    fill_price=event["fill_price"],
+                    sl_price=event.get("sl_price"),
+                    tp_price=event.get("tp_price"),
+                )
+        except Exception as exc:
+            log(f"💥 pending-fill poll failed: {exc}")
+        time.sleep(PENDING_FILL_POLL_INTERVAL_S)
 
 
 def poll_kill_switch():
@@ -56,6 +80,7 @@ def poll_kill_switch():
 
 def main():
     threading.Thread(target=poll_bracket_fills, daemon=True).start()
+    threading.Thread(target=poll_pending_fills, daemon=True).start()
     threading.Thread(target=poll_kill_switch, daemon=True).start()
     uvicorn.run("src.floor_broker.app:app", host="0.0.0.0", port=8000)
 

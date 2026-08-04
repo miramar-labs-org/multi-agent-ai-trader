@@ -52,7 +52,7 @@ class ExecuteRequest(BaseModel):
 
 
 class ExecuteResponse(BaseModel):
-    status: Literal["executed", "skipped", "error"]
+    status: Literal["executed", "submitted", "skipped", "error"]
     detail: str
     reason: str | None = None
     order_id: str | None = None

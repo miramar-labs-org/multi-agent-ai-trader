@@ -44,6 +44,28 @@ def test_notify_floor_broker_result_includes_timestamp_and_opening_position_fiel
     assert "TP: $13.00" in text
 
 
+def test_notify_floor_broker_result_uses_a_distinct_emoji_for_submitted(monkeypatch):
+    """ROADMAP P0.14: a "submitted" order has not yet filled -- it must not render with the same
+    ❌ used for "error", nor the ✅ used for a confirmed "executed" fill."""
+    posted = {}
+    monkeypatch.setattr(slack, "_post", lambda text: posted.update(text=text))
+
+    slack.notify_floor_broker_result(
+        "MGN",
+        "BUY",
+        "submitted",
+        "buy order submitted: order-123",
+        reason="opening_position",
+        sl_price=9.8,
+        tp_price=10.5,
+    )
+
+    text = posted["text"]
+    assert text.startswith("📨")
+    assert "❌" not in text
+    assert "✅" not in text
+
+
 def test_notify_buy_kill_switch_activated_mentions_buy_blocked_and_sell_allowed(monkeypatch):
     posted = {}
     monkeypatch.setattr(slack, "_post", lambda text: posted.update(text=text))

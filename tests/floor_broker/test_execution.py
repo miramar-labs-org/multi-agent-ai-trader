@@ -15,11 +15,14 @@ def _api_error(payload: dict) -> APIError:
 
 @pytest.fixture(autouse=True)
 def _clear_tracked_brackets():
-    """_tracked_brackets is module-level state shared across every test in this file -- clear it
-    before and after each test so tests can't leak bracket-tracking into one another."""
+    """_tracked_brackets and _pending_fills are module-level state shared across every test in
+    this file -- clear them before and after each test so tests can't leak tracking into one
+    another."""
     execution._tracked_brackets.clear()
+    execution._pending_fills.clear()
     yield
     execution._tracked_brackets.clear()
+    execution._pending_fills.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -35,10 +38,9 @@ class FakeTradingClient:
     in order, then succeeds -- lets tests replay real Alpaca rejection payloads without any
     network access."""
 
-    def __init__(self, rejections=(), fill_price=101.0):
+    def __init__(self, rejections=()):
         self._rejections = list(rejections)
         self.submitted = []
-        self._fill_price = fill_price
 
     def get_open_position(self, symbol):
         raise APIError("no position")
@@ -51,11 +53,6 @@ class FakeTradingClient:
         if self._rejections:
             raise _api_error(self._rejections.pop(0))
         return type("Order", (), {"id": "order-123"})()
-
-    def get_order_by_id(self, order_id, filter=None):
-        # Immediate fill by default, so _wait_for_fill returns on its first check and never
-        # sleeps for real -- keeps the existing tests (which don't care about fill price) fast.
-        return type("Order", (), {"filled_avg_price": self._fill_price})()
 
 
 class FakeLeg:
@@ -220,7 +217,7 @@ def test_buy_retries_with_alpacas_base_price_on_bracket_rejection(monkeypatch, s
 
     result = execution.buy(symbol, "stocks", 5000.0, slP=0.98, tpP=1.05)
 
-    assert result["status"] == "executed"
+    assert result["status"] == "submitted"
     assert len(fake_client.submitted) == 2, "expected one rejected attempt + one retry"
 
     retry_req = fake_client.submitted[1]
@@ -240,7 +237,7 @@ def test_crypto_buy_rounds_notional_to_2_decimal_places(monkeypatch):
 
     result = execution.buy("BTC/USD", "binance", 123.456789, slP=0.98, tpP=1.05)
 
-    assert result["status"] == "executed"
+    assert result["status"] == "submitted"
     assert fake_client.submitted[0].notional == 123.46
 
 
@@ -265,7 +262,7 @@ def test_crypto_buy_executes_at_exactly_the_minimum_notional(monkeypatch):
 
     result = execution.buy("BTC/USD", "binance", execution.MIN_CRYPTO_NOTIONAL, slP=0.98, tpP=1.05)
 
-    assert result["status"] == "executed"
+    assert result["status"] == "submitted"
     assert fake_client.submitted[0].notional == execution.MIN_CRYPTO_NOTIONAL
 
 
@@ -283,20 +280,27 @@ def test_buy_reraises_on_unrelated_api_error(monkeypatch):
     assert len(fake_client.submitted) == 1, "must not retry on an unrelated rejection"
 
 
-def test_stock_buy_returns_reason_fill_price_sl_tp_and_tracks_the_bracket(monkeypatch):
-    fake_client = FakeTradingClient(fill_price=10.05)
+def test_stock_buy_returns_reason_sl_tp_and_tracks_the_bracket_and_pending_fill(monkeypatch):
+    fake_client = FakeTradingClient()
     monkeypatch.setattr(execution, "trading_client", fake_client)
     monkeypatch.setattr(execution, "get_current_ask_price", lambda symbol: 10.0)
 
     result = execution.buy("MGN", "stocks", 5000.0, slP=0.98, tpP=1.05)
 
-    assert result["status"] == "executed"
+    assert result["status"] == "submitted"
     assert result["reason"] == "opening_position"
     assert result["order_id"] == "order-123"
-    assert result["fill_price"] == pytest.approx(10.05)
+    assert "fill_price" not in result
     assert result["sl_price"] == pytest.approx(9.8, abs=0.01)
     assert result["tp_price"] == pytest.approx(10.5, abs=0.01)
     assert execution._tracked_brackets["MGN"] == "order-123"
+    assert execution._pending_fills["order-123"] == {
+        "symbol": "MGN",
+        "action": "BUY",
+        "reason": "opening_position",
+        "sl_price": pytest.approx(9.8, abs=0.01),
+        "tp_price": pytest.approx(10.5, abs=0.01),
+    }
 
 
 def test_crypto_buy_has_no_sl_tp_price_and_is_not_tracked_as_a_bracket(monkeypatch):
@@ -312,22 +316,7 @@ def test_crypto_buy_has_no_sl_tp_price_and_is_not_tracked_as_a_bracket(monkeypat
     assert "BTC/USD" not in execution._tracked_brackets
 
 
-def test_wait_for_fill_gives_up_after_max_attempts_without_a_real_sleep(monkeypatch):
-    class NeverFillsClient:
-        def get_order_by_id(self, order_id, filter=None):
-            return type("Order", (), {"filled_avg_price": None})()
-
-    monkeypatch.setattr(execution, "trading_client", NeverFillsClient())
-    sleeps = []
-    monkeypatch.setattr(execution.time, "sleep", lambda s: sleeps.append(s))
-
-    result = execution._wait_for_fill("order-999")
-
-    assert result is None
-    assert len(sleeps) == execution.FILL_POLL_ATTEMPTS
-
-
-def test_sell_returns_dealer_signal_reason_fill_price_and_untracks_bracket(monkeypatch):
+def test_sell_returns_dealer_signal_reason_and_untracks_bracket_and_tracks_pending_fill(monkeypatch):
     class FakeSellClient:
         def get_open_position(self, symbol):
             return type("Position", (), {"qty": "5"})()
@@ -335,19 +324,23 @@ def test_sell_returns_dealer_signal_reason_fill_price_and_untracks_bracket(monke
         def submit_order(self, req):
             return type("Order", (), {"id": "sell-order-1"})()
 
-        def get_order_by_id(self, order_id, filter=None):
-            return type("Order", (), {"filled_avg_price": "12.00"})()
-
     monkeypatch.setattr(execution, "trading_client", FakeSellClient())
     execution._tracked_brackets["MGN"] = "parent-order-should-be-cleared"
 
     result = execution.sell("MGN")
 
-    assert result["status"] == "executed"
+    assert result["status"] == "submitted"
     assert result["reason"] == "dealer_signal"
     assert result["order_id"] == "sell-order-1"
-    assert result["fill_price"] == pytest.approx(12.0)
+    assert "fill_price" not in result
     assert "MGN" not in execution._tracked_brackets
+    assert execution._pending_fills["sell-order-1"] == {
+        "symbol": "MGN",
+        "action": "SELL",
+        "reason": "dealer_signal",
+        "sl_price": None,
+        "tp_price": None,
+    }
 
 
 def test_check_bracket_fills_reports_take_profit_leg_filled(monkeypatch):
@@ -434,14 +427,11 @@ def test_sell_still_permitted_when_kill_switch_active(monkeypatch):
         def submit_order(self, req):
             return type("Order", (), {"id": "sell-order-1"})()
 
-        def get_order_by_id(self, order_id, filter=None):
-            return type("Order", (), {"filled_avg_price": "12.00"})()
-
     monkeypatch.setattr(execution, "trading_client", FakeSellClient())
 
     result = execution.sell("MGN")
 
-    assert result["status"] == "executed"
+    assert result["status"] == "submitted"
 
 
 def test_check_bracket_fills_untracks_symbol_on_api_error(monkeypatch):
@@ -455,3 +445,77 @@ def test_check_bracket_fills_untracks_symbol_on_api_error(monkeypatch):
 
     assert events == []
     assert "MGN" not in execution._tracked_brackets
+
+
+class FakePendingOrder:
+    def __init__(self, filled_avg_price=None, status=None):
+        self.filled_avg_price = filled_avg_price
+        self.status = status
+
+
+class FakePendingFillTradingClient:
+    """Stands in for alpaca-py's TradingClient for check_pending_fills() -- `orders_by_id` maps
+    an order id to either a FakePendingOrder or an exception instance to raise."""
+
+    def __init__(self, orders_by_id):
+        self._orders_by_id = orders_by_id
+
+    def get_order_by_id(self, order_id, filter=None):
+        result = self._orders_by_id[order_id]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+def test_check_pending_fills_reports_a_filled_order(monkeypatch):
+    execution._pending_fills["order-1"] = {"symbol": "MGN", "action": "BUY", "reason": "opening_position", "sl_price": 9.8, "tp_price": 10.5}
+    fake_client = FakePendingFillTradingClient({"order-1": FakePendingOrder(filled_avg_price="10.05")})
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    events = execution.check_pending_fills()
+
+    assert events == [
+        {
+            "symbol": "MGN",
+            "action": "BUY",
+            "reason": "opening_position",
+            "sl_price": 9.8,
+            "tp_price": 10.5,
+            "order_id": "order-1",
+            "fill_price": 10.05,
+        }
+    ]
+    assert "order-1" not in execution._pending_fills
+
+
+def test_check_pending_fills_keeps_tracking_an_unfilled_order(monkeypatch):
+    execution._pending_fills["order-1"] = {"symbol": "MGN", "action": "BUY", "reason": "opening_position", "sl_price": None, "tp_price": None}
+    fake_client = FakePendingFillTradingClient({"order-1": FakePendingOrder(filled_avg_price=None, status=OrderStatus.NEW)})
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    events = execution.check_pending_fills()
+
+    assert events == []
+    assert "order-1" in execution._pending_fills
+
+
+def test_check_pending_fills_untracks_order_on_terminal_no_fill_status(monkeypatch):
+    execution._pending_fills["order-1"] = {"symbol": "MGN", "action": "BUY", "reason": "opening_position", "sl_price": None, "tp_price": None}
+    fake_client = FakePendingFillTradingClient({"order-1": FakePendingOrder(filled_avg_price=None, status=OrderStatus.CANCELED)})
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    events = execution.check_pending_fills()
+
+    assert events == []
+    assert "order-1" not in execution._pending_fills
+
+
+def test_check_pending_fills_untracks_order_on_api_error(monkeypatch):
+    execution._pending_fills["order-1"] = {"symbol": "MGN", "action": "BUY", "reason": "opening_position", "sl_price": None, "tp_price": None}
+    fake_client = FakePendingFillTradingClient({"order-1": APIError("not found")})
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    events = execution.check_pending_fills()
+
+    assert events == []
+    assert "order-1" not in execution._pending_fills

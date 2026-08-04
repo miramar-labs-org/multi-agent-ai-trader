@@ -14,16 +14,15 @@ def _payload(action="BUY", **overrides):
     return payload
 
 
-def test_execute_response_includes_fill_price_sl_tp_and_reason_for_a_buy(monkeypatch):
+def test_execute_response_includes_sl_tp_and_reason_for_a_buy(monkeypatch):
     monkeypatch.setattr(
         app_module.execution,
         "buy",
         lambda symbol, exchange, budget, slP, tpP: {
-            "status": "executed",
+            "status": "submitted",
             "reason": "opening_position",
             "detail": "buy order submitted: order-123",
             "order_id": "order-123",
-            "fill_price": 10.05,
             "sl_price": 9.8,
             "tp_price": 10.5,
         },
@@ -33,24 +32,23 @@ def test_execute_response_includes_fill_price_sl_tp_and_reason_for_a_buy(monkeyp
 
     assert response.status_code == 200
     body = response.json()
-    assert body["status"] == "executed"
+    assert body["status"] == "submitted"
     assert body["reason"] == "opening_position"
     assert body["order_id"] == "order-123"
-    assert body["fill_price"] == 10.05
+    assert body["fill_price"] is None
     assert body["sl_price"] == 9.8
     assert body["tp_price"] == 10.5
 
 
-def test_execute_response_includes_dealer_signal_reason_and_fill_price_for_a_sell(monkeypatch):
+def test_execute_response_includes_dealer_signal_reason_for_a_sell(monkeypatch):
     monkeypatch.setattr(
         app_module.execution,
         "sell",
         lambda symbol: {
-            "status": "executed",
+            "status": "submitted",
             "reason": "dealer_signal",
             "detail": "sell order submitted: order-456",
             "order_id": "order-456",
-            "fill_price": 12.0,
         },
     )
 
@@ -58,8 +56,9 @@ def test_execute_response_includes_dealer_signal_reason_and_fill_price_for_a_sel
 
     assert response.status_code == 200
     body = response.json()
+    assert body["status"] == "submitted"
     assert body["reason"] == "dealer_signal"
-    assert body["fill_price"] == 12.0
+    assert body["fill_price"] is None
     assert body["sl_price"] is None
     assert body["tp_price"] is None
 
