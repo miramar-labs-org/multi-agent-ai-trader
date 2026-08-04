@@ -146,3 +146,33 @@ def test_fetch_floor_broker_events_for_date_returns_list_of_dicts(monkeypatch):
     result = db.fetch_floor_broker_events_for_date(date(2026, 8, 4))
 
     assert result == rows
+
+
+def test_fetch_analyst_picks_since_returns_list_of_dicts(monkeypatch):
+    rows = [{"id": 1, "symbol": "MGN", "rationale": "screener pick"}]
+    conn = FakeConnection(rows=rows)
+    _patch_pool(monkeypatch, conn)
+
+    result = db.fetch_analyst_picks_since(date(2026, 8, 1))
+
+    assert result == rows
+
+
+def test_fetch_dealer_decisions_since_returns_list_of_dicts(monkeypatch):
+    rows = [{"id": 1, "symbol": "MGN", "action": "BUY", "reasoning": "momentum"}]
+    conn = FakeConnection(rows=rows)
+    _patch_pool(monkeypatch, conn)
+
+    result = db.fetch_dealer_decisions_since(date(2026, 8, 1))
+
+    assert result == rows
+
+
+def test_fetch_floor_broker_events_since_returns_list_of_dicts(monkeypatch):
+    rows = [{"id": 1, "symbol": "MGN", "event_type": "buy_submitted"}]
+    conn = FakeConnection(rows=rows)
+    _patch_pool(monkeypatch, conn)
+
+    result = db.fetch_floor_broker_events_since(date(2026, 8, 1))
+
+    assert result == rows

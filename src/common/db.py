@@ -160,3 +160,36 @@ def fetch_floor_broker_events_for_date(for_date: date) -> list[dict]:
                 (for_date,),
             )
             return cur.fetchall()
+
+
+def fetch_analyst_picks_since(since_date: date) -> list[dict]:
+    _ensure_schema()
+    with _get_pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM analyst_picks WHERE generated_at::date >= %s ORDER BY generated_at",
+                (since_date,),
+            )
+            return cur.fetchall()
+
+
+def fetch_dealer_decisions_since(since_date: date) -> list[dict]:
+    _ensure_schema()
+    with _get_pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM dealer_decisions WHERE decided_at::date >= %s ORDER BY decided_at",
+                (since_date,),
+            )
+            return cur.fetchall()
+
+
+def fetch_floor_broker_events_since(since_date: date) -> list[dict]:
+    _ensure_schema()
+    with _get_pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM floor_broker_events WHERE occurred_at::date >= %s ORDER BY occurred_at",
+                (since_date,),
+            )
+            return cur.fetchall()

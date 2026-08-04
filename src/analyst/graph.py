@@ -1,5 +1,6 @@
 import json
 import time
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import TypedDict
 
@@ -27,6 +28,7 @@ class AnalystState(TypedDict):
     raw_candidates: list
     research_text: str
     indicator_text: str
+    track_record_text: str
     selection: dict | None
     stock_market_open: bool
 
@@ -88,6 +90,56 @@ def fetch_indicators(state: AnalystState, cfg) -> AnalystState:
     return {**state, "indicator_text": "\n".join(lines)}
 
 
+def fetch_track_record(state: AnalystState, cfg) -> AnalystState:
+    """Surfaces the Analyst's own recent pick history -- what it picked, why, what Dealer did
+    about it, and how Floor Broker's execution went -- as a qualitative sequence the LLM can use
+    to avoid blindly repeating a pattern that already lost. Deliberately NOT computed P&L: no
+    live per-trade P&L helper exists outside the offline backtest simulator, and Floor Broker's
+    recorded price is documented as informational only (skills/analyst-explain/SKILL.md) --
+    Alpaca's fills are ground truth for that, and wiring it up is a bigger feature deferred to a
+    later iteration. This node runs before write_portfolio() records this run's own picks, so
+    today's picks are never included even though the query has no explicit upper date bound --
+    that's expected, not a bug: a symbol picked THIS run has no track record until the NEXT run."""
+    if not cfg.analyst.enable_track_record:
+        log("⏭️ track record disabled via config — skipping")
+        return {**state, "track_record_text": ""}
+
+    since_date = (
+        datetime.now(pytz.timezone("US/Eastern")) - timedelta(days=cfg.analyst.track_record_days)
+    ).date()
+    picks = db.fetch_analyst_picks_since(since_date)
+    if not picks:
+        return {**state, "track_record_text": ""}
+
+    decisions_by_symbol = defaultdict(list)
+    for d in db.fetch_dealer_decisions_since(since_date):
+        decisions_by_symbol[d["symbol"]].append(d)
+
+    events_by_symbol = defaultdict(list)
+    for e in db.fetch_floor_broker_events_since(since_date):
+        events_by_symbol[e["symbol"]].append(e)
+
+    lines = []
+    for pick in picks:
+        symbol = pick["symbol"]
+        lines.append(
+            f"- {pick['generated_at'].date().isoformat()} picked {symbol} "
+            f"(budget ${pick.get('budget')}): {pick.get('rationale')}"
+        )
+        for d in decisions_by_symbol.get(symbol, []):
+            lines.append(
+                f"    Dealer {d['decided_at'].date().isoformat()}: {d['action']} -- {d.get('reasoning')}"
+            )
+        for e in events_by_symbol.get(symbol, []):
+            price_note = f" @ ${e['price']}" if e.get("price") is not None else ""
+            lines.append(
+                f"    Floor Broker {e['occurred_at'].date().isoformat()}: "
+                f"{e['event_type']}{price_note} -- {e.get('detail')}"
+            )
+
+    return {**state, "track_record_text": "\n".join(lines)}
+
+
 def llm_select(state: AnalystState, cfg) -> AnalystState:
     llm = ChatOpenAI(
         base_url=cfg.llm.base_url,
@@ -107,13 +159,20 @@ def llm_select(state: AnalystState, cfg) -> AnalystState:
         f"Give each pick a budget in USD (default to {cfg.analyst.default_budget} "
         "unless you have a specific reason to size a position differently), an indicators list "
         f"(default {DEFAULT_INDICATORS} unless a symbol warrants different indicators), "
-        "and a one-line rationale."
+        "and a one-line rationale. "
+        "You are also given your own recent track record below: past picks with your rationale "
+        "at the time, what the Dealer ultimately decided to do about each, and how execution "
+        "went. Use it to spot patterns -- if a rationale pattern has recently preceded a SELL, "
+        "no_fill, or error outcome, don't blindly repeat it; the track record may be empty (no "
+        "history yet, or the feature is disabled), in which case ignore it."
     )
     user_prompt = (
         f"Candidate symbols (from screener):\n{json.dumps(state['raw_candidates'])}\n\n"
         f"Technical indicators (top {cfg.analyst.indicator_fetch_limit} candidates by move size "
         f"only -- not every candidate has these):\n{state['indicator_text']}\n\n"
-        f"Market research:\n{state['research_text']}"
+        f"Market research:\n{state['research_text']}\n\n"
+        f"Your recent track record (last {cfg.analyst.track_record_days} days -- past picks, "
+        f"what the Dealer decided, and how execution went):\n{state['track_record_text']}"
     )
 
     log("🧠 asking LLM to select the tradeable universe")
@@ -195,6 +254,7 @@ def build_graph():
     graph.add_node("discover_candidates", lambda state: discover_candidates(state, cfg))
     graph.add_node("fetch_research", lambda state: fetch_research(state, cfg))
     graph.add_node("fetch_indicators", lambda state: fetch_indicators(state, cfg))
+    graph.add_node("fetch_track_record", lambda state: fetch_track_record(state, cfg))
     graph.add_node("llm_select", lambda state: llm_select(state, cfg))
     graph.add_node("validate_selection", lambda state: validate_selection(state, cfg))
     graph.add_node("write_portfolio", lambda state: write_portfolio(state, cfg))
@@ -203,7 +263,8 @@ def build_graph():
     graph.set_entry_point("discover_candidates")
     graph.add_edge("discover_candidates", "fetch_research")
     graph.add_edge("fetch_research", "fetch_indicators")
-    graph.add_edge("fetch_indicators", "llm_select")
+    graph.add_edge("fetch_indicators", "fetch_track_record")
+    graph.add_edge("fetch_track_record", "llm_select")
     graph.add_edge("llm_select", "validate_selection")
     graph.add_edge("validate_selection", "write_portfolio")
     graph.add_edge("write_portfolio", "crypto_eod_report")

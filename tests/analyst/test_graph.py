@@ -314,7 +314,12 @@ def test_llm_select_prompt_includes_indicator_text_and_research_text(monkeypatch
     monkeypatch.setattr(graph, "ChatOpenAI", lambda **kwargs: FakeLLM(captured))
     cfg = OmegaConf.create(
         {
-            "analyst": {"max_universe_size": 10, "default_budget": 5000, "indicator_fetch_limit": 15},
+            "analyst": {
+                "max_universe_size": 10,
+                "default_budget": 5000,
+                "indicator_fetch_limit": 15,
+                "track_record_days": 5,
+            },
             "llm": {"base_url": "http://x", "model": "m", "temperature": 0.1},
         }
     )
@@ -322,6 +327,7 @@ def test_llm_select_prompt_includes_indicator_text_and_research_text(monkeypatch
         "raw_candidates": [{"symbol": "MGN", "market": "stocks"}],
         "research_text": "MGN announces earnings beat",
         "indicator_text": "MGN:\nThe current RSI for MGN is 71.2",
+        "track_record_text": "",
         "selection": None,
     }
 
@@ -330,3 +336,104 @@ def test_llm_select_prompt_includes_indicator_text_and_research_text(monkeypatch
     user_content = captured["messages"][1].content
     assert "The current RSI for MGN is 71.2" in user_content
     assert "MGN announces earnings beat" in user_content
+
+
+def test_llm_select_prompt_includes_track_record_text(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(graph, "ChatOpenAI", lambda **kwargs: FakeLLM(captured))
+    cfg = OmegaConf.create(
+        {
+            "analyst": {
+                "max_universe_size": 10,
+                "default_budget": 5000,
+                "indicator_fetch_limit": 15,
+                "track_record_days": 5,
+            },
+            "llm": {"base_url": "http://x", "model": "m", "temperature": 0.1},
+        }
+    )
+    state = {
+        "raw_candidates": [{"symbol": "MGN", "market": "stocks"}],
+        "research_text": "",
+        "indicator_text": "",
+        "track_record_text": "- 2026-08-01 picked MGN (budget $100): momentum play",
+        "selection": None,
+    }
+
+    graph.llm_select(state, cfg)
+
+    user_content = captured["messages"][1].content
+    assert "- 2026-08-01 picked MGN (budget $100): momentum play" in user_content
+
+
+def _track_record_cfg(track_record_days, enable_track_record=True):
+    return OmegaConf.create(
+        {"analyst": {"track_record_days": track_record_days, "enable_track_record": enable_track_record}}
+    )
+
+
+def test_fetch_track_record_skipped_when_disabled_via_config(monkeypatch):
+    """The enable_track_record feature gate must short-circuit before any DB calls, not just
+    discard the result -- mirrors the enable_news/enable_indicators skip tests."""
+    calls = []
+    monkeypatch.setattr(graph.db, "fetch_analyst_picks_since", lambda since: calls.append(1) or [])
+    monkeypatch.setattr(graph.db, "fetch_dealer_decisions_since", lambda since: calls.append(1) or [])
+    monkeypatch.setattr(graph.db, "fetch_floor_broker_events_since", lambda since: calls.append(1) or [])
+    state = {"raw_candidates": [], "research_text": "", "indicator_text": "", "track_record_text": "", "selection": None}
+
+    result = graph.fetch_track_record(state, _track_record_cfg(track_record_days=5, enable_track_record=False))
+
+    assert result["track_record_text"] == ""
+    assert calls == []
+
+
+def test_fetch_track_record_returns_empty_when_no_prior_picks(monkeypatch):
+    monkeypatch.setattr(graph.db, "fetch_analyst_picks_since", lambda since: [])
+    calls = []
+    monkeypatch.setattr(graph.db, "fetch_dealer_decisions_since", lambda since: calls.append(1) or [])
+    monkeypatch.setattr(graph.db, "fetch_floor_broker_events_since", lambda since: calls.append(1) or [])
+    state = {"raw_candidates": [], "research_text": "", "indicator_text": "", "track_record_text": "", "selection": None}
+
+    result = graph.fetch_track_record(state, _track_record_cfg(track_record_days=5))
+
+    assert result["track_record_text"] == ""
+    assert calls == []
+
+
+def test_fetch_track_record_includes_pick_history_when_enabled(monkeypatch):
+    picks = [
+        {
+            "symbol": "MGN",
+            "generated_at": datetime(2026, 8, 1, 9, 30),
+            "budget": 100.0,
+            "rationale": "momentum play",
+        }
+    ]
+    decisions = [
+        {
+            "symbol": "MGN",
+            "decided_at": datetime(2026, 8, 1, 10, 0),
+            "action": "SELL",
+            "reasoning": "hit stop loss",
+        }
+    ]
+    events = [
+        {
+            "symbol": "MGN",
+            "occurred_at": datetime(2026, 8, 1, 10, 1),
+            "event_type": "sell_filled",
+            "price": 4.5,
+            "detail": "stop loss triggered",
+        }
+    ]
+    monkeypatch.setattr(graph.db, "fetch_analyst_picks_since", lambda since: picks)
+    monkeypatch.setattr(graph.db, "fetch_dealer_decisions_since", lambda since: decisions)
+    monkeypatch.setattr(graph.db, "fetch_floor_broker_events_since", lambda since: events)
+    state = {"raw_candidates": [], "research_text": "", "indicator_text": "", "track_record_text": "", "selection": None}
+
+    result = graph.fetch_track_record(state, _track_record_cfg(track_record_days=5))
+
+    assert "momentum play" in result["track_record_text"]
+    assert "hit stop loss" in result["track_record_text"]
+    assert "sell_filled" in result["track_record_text"]
+    assert "stop loss triggered" in result["track_record_text"]

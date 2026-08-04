@@ -30,6 +30,7 @@ def main():
                 "raw_candidates": [],
                 "research_text": "",
                 "indicator_text": "",
+                "track_record_text": "",
                 "selection": None,
                 "stock_market_open": stock_market_open,
             },

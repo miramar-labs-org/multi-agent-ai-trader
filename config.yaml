@@ -49,6 +49,10 @@ analyst:
                                # daily (spec.timeZone), ~30min before the 9:30 ET open
   enable_news: true           # feature gate: Alpaca News API + Yahoo RSS headlines as an Analyst input
   enable_indicators: true     # feature gate: TAAPI technical indicator data as an Analyst input
+  enable_track_record: true   # feature gate: Analyst's own recent pick history + Dealer/Floor
+                               # Broker outcomes as an Analyst input (read-only Postgres query)
+  track_record_days: 5        # lookback window in calendar days; excludes today by construction
+                               # -- this node runs before write_portfolio's DB write in the same run
   max_universe_size: 10
   default_budget: 5000
   screener_top_n: 20          # candidates pulled from Alpaca Screener before research/filtering
