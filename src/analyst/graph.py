@@ -1,4 +1,5 @@
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from typing import TypedDict
 
@@ -13,6 +14,7 @@ from src.common import slack
 from src.common.alpaca_client import trading_client
 from src.common.config import load_config
 from src.common.eod import fetch_fills, summarize_positions
+from src.common.indicators import fetch_indicators_bulk
 from src.common.logging import get_logger
 from src.common.portfolio_state import write_portfolio as _write_portfolio
 
@@ -24,6 +26,7 @@ DEFAULT_INDICATORS = ["rsi", "macd", "vwap", "bbands", "sma", "ema"]
 class AnalystState(TypedDict):
     raw_candidates: list
     research_text: str
+    indicator_text: str
     selection: dict | None
 
 
@@ -52,6 +55,32 @@ def fetch_research(state: AnalystState, cfg) -> AnalystState:
     return {**state, "research_text": research_text}
 
 
+def fetch_indicators(state: AnalystState, cfg) -> AnalystState:
+    """Fetches real TAAPI indicator values for the top candidates by move size, so llm_select
+    can reason about actual RSI/MACD/etc rather than news text alone. Bounded to
+    `indicator_fetch_limit` candidates -- TAAPI's free-tier rate limit is 1 request/15s
+    (cfg.taapi.min_request_interval_secs), and fetching every screened candidate would make the
+    daily CronJob run take far longer than warranted for candidates the LLM is unlikely to pick."""
+    ranked = sorted(
+        state["raw_candidates"],
+        key=lambda c: abs(c["change_pct"]) if c.get("change_pct") is not None else -1,
+        reverse=True,
+    )
+    top_candidates = ranked[: cfg.analyst.indicator_fetch_limit]
+
+    lines = []
+    for i, candidate in enumerate(top_candidates):
+        if i > 0:
+            time.sleep(cfg.taapi.min_request_interval_secs)
+        text = fetch_indicators_bulk(
+            cfg.indicators, candidate["symbol"], candidate["market"], DEFAULT_INDICATORS, log
+        )
+        if text:
+            lines.append(f"{candidate['symbol']}:\n{text}")
+
+    return {**state, "indicator_text": "\n".join(lines)}
+
+
 def llm_select(state: AnalystState, cfg) -> AnalystState:
     llm = ChatOpenAI(
         base_url=cfg.llm.base_url,
@@ -64,6 +93,8 @@ def llm_select(state: AnalystState, cfg) -> AnalystState:
         "You are the Analyst agent on an automated trading floor. "
         f"Pick at most {cfg.analyst.max_universe_size} symbols worth trading today, "
         "drawn from the candidate list and informed by the research text. "
+        "Where a candidate has technical indicator values provided, ground your reasoning in "
+        "those actual values rather than news sentiment alone. "
         "Each candidate object includes a `market` field (\"stocks\", or a crypto exchange name "
         "for a 24/7-traded crypto pair) -- set your pick's exchange field to exactly that value. "
         f"Give each pick a budget in USD (default to {cfg.analyst.default_budget} "
@@ -73,6 +104,8 @@ def llm_select(state: AnalystState, cfg) -> AnalystState:
     )
     user_prompt = (
         f"Candidate symbols (from screener):\n{json.dumps(state['raw_candidates'])}\n\n"
+        f"Technical indicators (top {cfg.analyst.indicator_fetch_limit} candidates by move size "
+        f"only -- not every candidate has these):\n{state['indicator_text']}\n\n"
         f"Market research:\n{state['research_text']}"
     )
 
@@ -142,6 +175,7 @@ def build_graph():
     graph = StateGraph(AnalystState)
     graph.add_node("discover_candidates", lambda state: discover_candidates(state, cfg))
     graph.add_node("fetch_research", lambda state: fetch_research(state, cfg))
+    graph.add_node("fetch_indicators", lambda state: fetch_indicators(state, cfg))
     graph.add_node("llm_select", lambda state: llm_select(state, cfg))
     graph.add_node("validate_selection", lambda state: validate_selection(state, cfg))
     graph.add_node("write_portfolio", lambda state: write_portfolio(state, cfg))
@@ -149,7 +183,8 @@ def build_graph():
 
     graph.set_entry_point("discover_candidates")
     graph.add_edge("discover_candidates", "fetch_research")
-    graph.add_edge("fetch_research", "llm_select")
+    graph.add_edge("fetch_research", "fetch_indicators")
+    graph.add_edge("fetch_indicators", "llm_select")
     graph.add_edge("llm_select", "validate_selection")
     graph.add_edge("validate_selection", "write_portfolio")
     graph.add_edge("write_portfolio", "crypto_eod_report")

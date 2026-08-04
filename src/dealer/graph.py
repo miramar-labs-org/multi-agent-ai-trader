@@ -8,7 +8,7 @@ from langgraph.graph import END, StateGraph
 from src.common import slack
 from src.common.config import load_config
 from src.common.logging import get_logger
-from src.dealer.indicators import fetch_indicators_bulk
+from src.common.indicators import fetch_indicators_bulk
 from src.dealer.schema import Signal
 
 log = get_logger("DEALER")

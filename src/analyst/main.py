@@ -13,7 +13,7 @@ def main():
     try:
         graph = build_graph()
         result = graph.invoke(
-            {"raw_candidates": [], "research_text": "", "selection": None},
+            {"raw_candidates": [], "research_text": "", "indicator_text": "", "selection": None},
             config={"tags": ["analyst"]},
         )
         selection = result.get("selection") or {}

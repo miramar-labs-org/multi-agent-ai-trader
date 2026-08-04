@@ -84,16 +84,28 @@ is meant to surface immediately, not retry-storm. Entrypoint: `python -m src.ana
 **Purpose:** once a day, decide *which symbols are worth trading today* and hand that list
 off to the Dealer.
 
-**Implementation:** a 5-node LangGraph state machine (`src/analyst/graph.py`) over an
+**Implementation:** a 6-node LangGraph state machine (`src/analyst/graph.py`) over an
 `AnalystState`:
 
 | Node | What it does |
 |---|---|
 | `discover_candidates` | when `cfg.trading.enable_stocks`, `sources.fetch_screener_candidates(screener_top_n=20)` — raw REST calls (not wrapped by `alpaca-py`) to Alpaca's `/v1beta1/screener/stocks/most-actives` and `/movers` endpoints, merged into a symbol→{volume, change_pct} dict, each tagged `market: "stocks"`. When `cfg.trading.enable_crypto`, also `sources.fetch_crypto_candidates(...)` — a fixed watchlist (`BTC/USD`, `ETH/USD`, `SOL/USD`; Alpaca's crypto screener has no most-actives equivalent) merged with `/v1beta1/screener/crypto/movers`, tagged `market: cfg.trading.crypto_taapi_exchange` |
 | `fetch_research` | `sources.fetch_news(news_days=2)` (Alpaca News API, HTML stripped via BeautifulSoup) + `sources.fetch_yahoo_rss_headlines(...)` (Yahoo Finance RSS), concatenated into plain text |
+| `fetch_indicators` | ranks `raw_candidates` by `abs(change_pct)` (missing values sort last) and calls `src.common.indicators.fetch_indicators_bulk` (shared with the Dealer) for the top `cfg.analyst.indicator_fetch_limit` (default 15) — one TAAPI `/bulk` POST per symbol covering `rsi, macd, vwap, bbands, sma, ema`, sleeping `cfg.taapi.min_request_interval_secs` between calls to respect TAAPI's free-tier 1-req/15s cap. At the default limit this adds ~3.75 minutes to the once-daily run — accepted as a fixed cost of a pre-market CronJob, unlike the Dealer's 10-minute poll cycle where the same rate limit is a tighter constraint. Not every candidate gets indicator data; only the top movers by size do |
 | `llm_select` | the actual LLM call — see below |
 | `validate_selection` | overrides each pick's `exchange` field with the `market` tag `discover_candidates` actually assigned that symbol (never trusts the LLM's own copy of `exchange`), and drops any pick whose symbol isn't in `raw_candidates` at all (a hallucination) |
 | `write_portfolio` | patches the `portfolio` ConfigMap via the `kubernetes` Python client |
+
+```mermaid
+flowchart TD
+    A[discover_candidates] --> B[fetch_research]
+    B --> C[fetch_indicators]
+    C --> D[llm_select]
+    D --> E[validate_selection]
+    E --> F[write_portfolio]
+    F --> G[crypto_eod_report]
+    G --> H([END])
+```
 
 **LLM call:**
 ```python
@@ -181,6 +193,13 @@ distinguishable from Slack alone.
 | `fetch_indicators` | fetches every indicator configured for the symbol (or all of `cfg.indicators` if the entry says `["ALL"]`) from **TAAPI.io** — a third-party technical-analysis API, unrelated to any Miramar platform service — in a single `/bulk` POST request (`indicators.py`), and builds a natural-language indicator text block |
 | `llm_call` | the decision LLM call — see below |
 | `call_floor_broker` | HTTP POST to Floor Broker if action != HOLD |
+
+```mermaid
+flowchart TD
+    A[fetch_indicators] --> B[llm_call]
+    B --> C[call_floor_broker]
+    C --> D([END])
+```
 
 **LLM call:** same pattern as Analyst — `ChatOpenAI(base_url=cfg.llm.base_url, ...).with_structured_output(Signal)`.
 System prompt: *"You are an expert technical trader in stocks. Based on the values of ALL
@@ -402,7 +421,7 @@ three components.
 | `langsmith` | `sampling_rate` | fraction of traces actually sent to LangSmith (0.5) — keeps Dealer's poll-driven trace volume under the free Developer plan's 5k traces/month limit |
 | `slack` | `enabled` | toggles posting interesting events (Morning Report, Crypto EOD Report, Dealer signals, Floor Broker executions, EOD Report, EOD's non-trading-day notice, Dealer's live market-closed notice, errors) to `#miramar-trading-floor` (requires `SLACK_WEBHOOK_URL`) — every one of these notices carries an Eastern-time timestamp; Dealer signal notices keep the LLM's full rationale on their own line, and a Floor Broker execution notice includes fill price/reason/SL/TP whenever `execution.py` supplies them; EOD Report/Crypto EOD Report fill lines each additionally carry the fill's own Eastern-time timestamp |
 | `floor_broker` | `base_url` | in-cluster Service DNS Dealer uses to reach Floor Broker |
-| `taapi` | `min_request_interval_secs` | seconds Dealer waits between symbols' TAAPI `/bulk` calls (15) — sized to the TAAPI Free plan's 1 request/15s cap; lower it if the account is on a paid plan |
+| `taapi` | `min_request_interval_secs` | seconds Dealer and Analyst (`fetch_indicators`) each wait between symbols' TAAPI `/bulk` calls (15) — sized to the TAAPI Free plan's 1 request/15s cap; lower it if the account is on a paid plan |
 | `trading` | `slP` / `tpP` | stop-loss/take-profit price multipliers on bracket orders (0.98/1.05 ≈ 2% stop, 5% target) |
 | `trading` | `pollsecs` | Dealer loop cadence (600s) |
 | `trading` | `buffer` | minutes to wait after market open before trading (15) |
@@ -413,6 +432,7 @@ three components.
 | `eod_report` | `schedule` | informational copy of the CronJob's own `spec.schedule` — not templated, must be kept in sync manually |
 | `analyst` | `schedule` | informational copy of the CronJob's own `spec.schedule` — not templated, must be kept in sync manually |
 | `analyst` | `max_universe_size`, `default_budget`, `screener_top_n`, `news_days`, `yahoo_rss_url` | Analyst's selection parameters |
+| `analyst` | `indicator_fetch_limit` | candidates (top-N by `abs(change_pct)`) that get a real TAAPI `/bulk` indicator fetch in `fetch_indicators` (default 15) — capped by the TAAPI free-tier 15s/request limit |
 | `indicators` | list of `{name, properties}` | TAAPI.io query-parameter catalog per indicator, shared by Dealer |
 
 ## Risk controls and failure handling

@@ -113,3 +113,98 @@ def test_crypto_eod_report_posts_only_crypto_positions_and_fills_for_the_prior_d
     assert posted["report_date"] == expected_date
     assert [f["symbol"] for f in posted["fills"]] == ["BTC/USD"]
     assert [p["symbol"] for p in posted["positions"]] == ["BTCUSD"]
+
+
+def _indicator_cfg(indicator_fetch_limit):
+    return OmegaConf.create(
+        {
+            "analyst": {"indicator_fetch_limit": indicator_fetch_limit},
+            "taapi": {"min_request_interval_secs": 15},
+            "indicators": [],
+        }
+    )
+
+
+def test_fetch_indicators_sorts_by_change_pct_and_respects_the_fetch_limit(monkeypatch):
+    """Only the top `indicator_fetch_limit` candidates by |change_pct| get a real TAAPI call --
+    fetching every screened candidate would blow past the 15s/request rate limit for candidates
+    the LLM is unlikely to pick anyway. A missing change_pct (e.g. the crypto watchlist) must
+    sort last, not crash the comparison."""
+    candidates = [
+        {"symbol": "A", "market": "stocks", "change_pct": 1.0},
+        {"symbol": "B", "market": "stocks", "change_pct": -5.0},
+        {"symbol": "C", "market": "stocks", "change_pct": 2.0},
+        {"symbol": "D", "market": "stocks"},
+    ]
+    calls = []
+    monkeypatch.setattr(
+        graph,
+        "fetch_indicators_bulk",
+        lambda indicators_cfg, symbol, exchange, names, log: calls.append(symbol) or f"{symbol}-text",
+    )
+    sleeps = []
+    monkeypatch.setattr(graph.time, "sleep", lambda s: sleeps.append(s))
+    state = {"raw_candidates": candidates, "research_text": "", "indicator_text": "", "selection": None}
+
+    result = graph.fetch_indicators(state, _indicator_cfg(indicator_fetch_limit=2))
+
+    assert calls == ["B", "C"]
+    assert sleeps == [15]
+    assert "B-text" in result["indicator_text"]
+    assert "C-text" in result["indicator_text"]
+    assert "A-text" not in result["indicator_text"]
+    assert "D-text" not in result["indicator_text"]
+
+
+def test_fetch_indicators_omits_candidates_with_no_indicator_data(monkeypatch):
+    candidates = [{"symbol": "A", "market": "stocks", "change_pct": 1.0}]
+    monkeypatch.setattr(graph, "fetch_indicators_bulk", lambda *a, **k: "")
+    monkeypatch.setattr(graph.time, "sleep", lambda s: None)
+    state = {"raw_candidates": candidates, "research_text": "", "indicator_text": "", "selection": None}
+
+    result = graph.fetch_indicators(state, _indicator_cfg(indicator_fetch_limit=5))
+
+    assert result["indicator_text"] == ""
+
+
+class FakeSelection:
+    def __init__(self, symbols):
+        self._symbols = symbols
+
+    def model_dump(self):
+        return {"symbols": self._symbols}
+
+
+class FakeLLM:
+    def __init__(self, captured):
+        self._captured = captured
+
+    def with_structured_output(self, schema):
+        return self
+
+    def invoke(self, messages):
+        self._captured["messages"] = messages
+        return FakeSelection([])
+
+
+def test_llm_select_prompt_includes_indicator_text_and_research_text(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(graph, "ChatOpenAI", lambda **kwargs: FakeLLM(captured))
+    cfg = OmegaConf.create(
+        {
+            "analyst": {"max_universe_size": 10, "default_budget": 5000, "indicator_fetch_limit": 15},
+            "llm": {"base_url": "http://x", "model": "m", "temperature": 0.1},
+        }
+    )
+    state = {
+        "raw_candidates": [{"symbol": "MGN", "market": "stocks"}],
+        "research_text": "MGN announces earnings beat",
+        "indicator_text": "MGN:\nThe current RSI for MGN is 71.2",
+        "selection": None,
+    }
+
+    graph.llm_select(state, cfg)
+
+    user_content = captured["messages"][1].content
+    assert "The current RSI for MGN is 71.2" in user_content
+    assert "MGN announces earnings beat" in user_content

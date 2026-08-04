@@ -37,6 +37,8 @@ analyst:
   screener_top_n: 20          # candidates pulled from Alpaca Screener before research/filtering
   news_days: 2
   yahoo_rss_url: "https://feeds.finance.yahoo.com/rss/2.0/headline"
+  indicator_fetch_limit: 15   # candidates (by |change_pct|) that get real TAAPI indicator data,
+                               # capped for TAAPI's 15s/request free-tier rate limit
 
 taapi:
   min_request_interval_secs: 15   # matches the TAAPI Free plan's 1 request/15s cap; lower if you upgrade (Basic ~3s, Pro/Expert ~1s)
