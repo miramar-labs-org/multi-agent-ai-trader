@@ -7,3 +7,5 @@ __pycache__/
 
 notebook.ipynb
 .ipynb_checkpoints/
+
+backtests/

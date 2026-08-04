@@ -342,6 +342,15 @@ Alpaca.
 Errors call `slack.notify_error("EOD", ...)` before re-raising, same convention as the other
 three components.
 
+## Backtesting harness (`src/backtest/`)
+
+**Not a k8s workload** — a local CLI tool: `python -m src.backtest.main`. Runs deterministic
+baseline strategies (buy-and-hold, simple RSI/MACD rules, multi-indicator, random, no-trade)
+against historical Alpaca bars, reports total return, drawdown, Sharpe, win rate, expectancy,
+and exposure per symbol, and writes a JSON artifact to the gitignored `backtests/` dir. It
+computes indicators locally rather than replaying the live LLM's actual historical decisions —
+see [`docs/backtesting.md`](backtesting.md) for the full design and documented assumptions.
+
 ## Shared code (`src/common/`)
 
 - **`alpaca_client.py`** — one shared `TradingClient(..., paper=True)` (hardcoded — this is

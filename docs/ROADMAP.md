@@ -33,8 +33,8 @@ All trading remains **paper-only**. SELL operations that reduce exposure should 
 | P1.2 | Exact model, prompt, and input version capture | P1 | Planned | P1.1 |
 | P1.3 | Shadow execution mode | P1 | Planned | P1.1 |
 | P1.4 | Forward evaluation and replay | P1 | Planned | P1.1, P1.3 |
-| P1.5 | Historical backtesting harness | P1 | Planned | P1.1 |
-| P1.6 | Deterministic baseline strategies | P1 | Planned | P1.4 or P1.5 |
+| P1.5 | Historical backtesting harness | P1 | Done (deterministic baselines only; see below) | P1.1 |
+| P1.6 | Deterministic baseline strategies | P1 | Done | P1.4 or P1.5 |
 | P1.7 | Resolve `size_hint` semantics | P1 | Planned | P1.1 |
 | P1.8 | Daily loss, trade-count, and aggregate exposure controls | P1 | Planned | P0.4, P1.1 |
 | P1.9 | Core operational metrics | P1 | Planned | P1.1 |
@@ -601,53 +601,32 @@ This is the most faithful evaluation path because it uses the exact data observe
 
 ## P1.5 — Historical backtesting harness
 
-Build a separate historical-data path for deterministic offline testing.
+**Done — deterministic baselines only.** Implemented in `src/backtest/`, documented in
+[`docs/backtesting.md`](backtesting.md). A local CLI tool (`python -m src.backtest.main`), not a
+k8s workload — it needed no durable event store (P1.1), since it computes indicators locally
+from bulk historical bars rather than replaying live-captured decisions.
 
-Treat this as distinct from forward replay because historical reconstruction of:
+The scope split explicitly follows this section's own framing: this covers only the
+"separate historical-data path for deterministic offline testing" half. True historical
+reconstruction of the live LLM's actual past decisions — contemporaneous news, screener
+membership, exact API data, LLM serving behavior — remains P1.4 (Forward evaluation and
+replay), gated on P1.1's durable event store, and is still Planned.
 
-- contemporaneous news;
-- screener membership;
-- exact API data;
-- LLM serving behavior
-
-may be incomplete.
-
-Backtest assumptions must explicitly document:
-
-- data source;
-- survivorship bias;
-- slippage;
-- spreads;
-- fees;
-- execution timing;
-- missing-data handling.
+Backtest assumptions are documented in `docs/backtesting.md`: data source, survivorship bias,
+slippage, spreads, fees, execution timing, missing-data handling.
 
 ---
 
 ## P1.6 — Deterministic baseline strategies
 
-Compare the agent system against:
+**Done**, alongside P1.5. `src/backtest/strategies.py` implements buy-and-hold, simple RSI rule,
+simple MACD rule, deterministic multi-indicator rule, random action baseline, and no-trade
+baseline, each run per-symbol against the harness's own historical data (not yet compared
+against SPY or an equal-weight candidate portfolio — those remain open extensions).
 
-- buy-and-hold SPY;
-- equal-weight candidate portfolio;
-- simple RSI rule;
-- simple MACD rule;
-- deterministic multi-indicator rule;
-- random action baseline;
-- no-trade baseline.
-
-Report at least:
-
-- total return;
-- benchmark-relative return;
-- maximum drawdown;
-- Sharpe or risk-adjusted return;
-- turnover;
-- win rate;
-- average gain and loss;
-- expectancy;
-- exposure;
-- trade count.
+`src/backtest/metrics.py` reports: total return, benchmark-relative return (vs. that symbol's
+own buy-and-hold run), maximum drawdown, Sharpe, win rate, average win/loss, expectancy,
+exposure, trade count. Turnover is not yet reported.
 
 No claim of trading edge should be made without these comparisons.
 
