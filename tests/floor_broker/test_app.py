@@ -118,6 +118,7 @@ def test_execute_normalizes_symbol_and_exchange_case(monkeypatch):
     [
         {"symbol": ""},
         {"symbol": "TOO/MANY/SLASHES"},
+        {"symbol": "TOO.MANY.DOTS"},
         {"symbol": "HAS SPACE"},
         {"exchange": ""},
         {"exchange": "has space"},
@@ -152,6 +153,8 @@ def test_execute_rejects_invalid_request_fields(overrides):
         {"slP": 0.99},
         {"tpP": 1.01},
         {"tpP": 1.99},
+        {"symbol": "DSX.WS"},
+        {"symbol": "BRK.B"},
     ],
     ids=lambda v: str(v),
 )

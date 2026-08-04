@@ -17,8 +17,12 @@ log = get_logger("FLOOR")
 # order. 20x config.yaml's analyst.default_budget (5000).
 MAX_BUDGET = 100_000.0
 
-# Alpaca tickers: letters/digits, with an optional single "/" for crypto pairs (e.g. "BTC/USD").
-_SYMBOL_RE = re.compile(r"^[A-Z0-9]{1,10}(/[A-Z0-9]{1,10})?$")
+# Alpaca tickers: letters/digits, with an optional single "/" for crypto pairs (e.g. "BTC/USD")
+# or "." for dual-class shares and warrants/units (e.g. "BRK.B", "DSX.WS") -- both come straight
+# from Alpaca's own screener/assets universe, so Floor Broker must accept whatever shape Alpaca
+# itself vends rather than second-guessing it; a genuinely bad symbol still gets a clean rejection
+# from Alpaca's own API (caught as an APIError) instead of a client-side ValueError here.
+_SYMBOL_RE = re.compile(r"^[A-Z0-9]{1,10}([./][A-Z0-9]{1,10})?$")
 # "stocks", or a TAAPI venue identifier (e.g. "binance") -- config-driven (cfg.trading.
 # crypto_taapi_exchange), so this validates shape, not a fixed enum of known venues.
 _EXCHANGE_RE = re.compile(r"^[a-z0-9_-]+$")
