@@ -348,8 +348,10 @@ nothing has filled yet, so no notification could have been missed by the restart
 up to 5 times with exponential backoff (5s, 10s, 20s, 40s) rather than giving up on the first
 `APIError` — a transient Alpaca outage at exactly boot time shouldn't permanently strand the pod
 with empty tracking dicts. `execution.is_state_reconciled()` stays `False` until an attempt
-succeeds, and `execution.buy()` refuses new BUYs (`status="rejected"`,
-`reason="state_not_reconciled"`) while it's `False`, since submitting a fresh order before
+succeeds, and `execution.buy()` refuses new BUYs (`status="skipped"`,
+`reason="state_not_reconciled"` -- `ExecuteResponse`'s status `Literal` doesn't have a distinct
+"rejected" value, so this reuses "skipped" like every other declined-BUY outcome) while it's
+`False`, since submitting a fresh order before
 Alpaca's live state has been reconciled risks losing track of it exactly like the gap this
 mechanism exists to close (SELL is unaffected — same asymmetry as the kill switch below). If all
 5 startup attempts fail, `main.poll_reconciliation()` keeps retrying `reconcile_tracked_state_once()`

@@ -720,7 +720,10 @@ def test_reconstruct_tracked_state_gives_up_after_max_attempts_and_stays_unrecon
     assert execution.is_state_reconciled() is False
 
 
-def test_buy_rejects_when_state_not_reconciled(monkeypatch):
+def test_buy_skips_when_state_not_reconciled(monkeypatch):
+    # status="skipped", not a distinct "rejected" -- ExecuteResponse's status Literal
+    # (src/floor_broker/app.py) doesn't permit "rejected"; see test_app.py for the
+    # end-to-end regression test covering that API-contract constraint directly.
     monkeypatch.setattr(execution, "_state_reconciled", False)
     client = FakeTradingClient()
     monkeypatch.setattr(execution, "trading_client", client)
@@ -728,7 +731,7 @@ def test_buy_rejects_when_state_not_reconciled(monkeypatch):
     result = execution.buy("MGN", "stocks", budget=100.0, slP=0.98, tpP=1.05)
 
     assert result == {
-        "status": "rejected",
+        "status": "skipped",
         "reason": "state_not_reconciled",
         "detail": "tracked state not yet reconciled with Alpaca after restart",
     }

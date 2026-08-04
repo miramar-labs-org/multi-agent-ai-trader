@@ -334,8 +334,12 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
     # refuse rather than race reconcile_tracked_state_once()/poll_reconciliation() in main.py.
     if not _state_reconciled:
         log(f"🛑  BUY {symbol} rejected -- tracked state not yet reconciled with Alpaca")
+        # "skipped", not a distinct "rejected" status -- ExecuteResponse's status Literal
+        # (src/floor_broker/app.py) only permits executed/submitted/skipped/error, and every
+        # other "chose not to submit this BUY" outcome in this function already uses "skipped";
+        # the `reason` field is what actually distinguishes this case downstream.
         return {
-            "status": "rejected",
+            "status": "skipped",
             "reason": "state_not_reconciled",
             "detail": "tracked state not yet reconciled with Alpaca after restart",
         }

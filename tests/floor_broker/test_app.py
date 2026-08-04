@@ -77,6 +77,22 @@ def test_execute_response_omits_optional_fields_when_skipped(monkeypatch):
     assert body["tp_price"] is None
 
 
+def test_execute_returns_200_not_500_for_a_buy_while_state_unreconciled(monkeypatch):
+    """Regression test: execution.buy()'s state_not_reconciled short-circuit must return a
+    status value ExecuteResponse's Literal actually permits (see app.py) -- exercises the real,
+    unmocked execution.buy() through the live /execute endpoint so a response-model mismatch
+    here (which previously surfaced as a 500, not a validation failure at the execution layer)
+    is caught the same way a real caller would hit it."""
+    monkeypatch.setattr(app_module.execution, "_state_reconciled", False)
+
+    response = _client().post("/execute", json=_payload("BUY"))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "skipped"
+    assert body["reason"] == "state_not_reconciled"
+
+
 def test_execute_normalizes_symbol_and_exchange_case(monkeypatch):
     """ROADMAP P0.3: symbol/exchange are normalized (stripped, cased) before reaching
     execution.buy() -- a lowercase symbol or upper-case "STOCKS" exchange from a caller must
