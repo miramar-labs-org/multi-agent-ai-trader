@@ -344,11 +344,26 @@ orders with no legs go into `_pending_fills`, brackets with at least one still-o
 `_tracked_brackets`. Only orders still open on Alpaca are restorable this way — by definition
 nothing has filled yet, so no notification could have been missed by the restart itself.
 
-**Limitation:** the one remaining gap is a fill that happens *during* the restart window itself —
-between the old pod dying and `reconstruct_tracked_state()` running on the new one. The underlying
-order/TP/SL still executes correctly on Alpaca's side (Alpaca owns the order, not Floor Broker)
-regardless, but the Slack notice for that specific fill is missed. This is a narrow window (pod
-restart time), not the full "no persistence at all" gap this section used to describe.
+`reconstruct_tracked_state()` retries the underlying `execution.reconcile_tracked_state_once()`
+up to 5 times with exponential backoff (5s, 10s, 20s, 40s) rather than giving up on the first
+`APIError` — a transient Alpaca outage at exactly boot time shouldn't permanently strand the pod
+with empty tracking dicts. `execution.is_state_reconciled()` stays `False` until an attempt
+succeeds, and `execution.buy()` refuses new BUYs (`status="rejected"`,
+`reason="state_not_reconciled"`) while it's `False`, since submitting a fresh order before
+Alpaca's live state has been reconciled risks losing track of it exactly like the gap this
+mechanism exists to close (SELL is unaffected — same asymmetry as the kill switch below). If all
+5 startup attempts fail, `main.poll_reconciliation()` keeps retrying `reconcile_tracked_state_once()`
+in the background every 60s until it succeeds, un-blocking BUY execution without needing a pod
+restart.
+
+**Limitation:** the one remaining gap is a fill that happens *during* the restart/reconciliation
+window itself — between the old pod dying and reconciliation succeeding on the new one. The
+underlying order/TP/SL still executes correctly on Alpaca's side (Alpaca owns the order, not
+Floor Broker) regardless, but the Slack notice for that specific fill is missed. Closing this
+fully would require persisting fill history outside process memory (e.g. the durable event store
+in ROADMAP P1.1) to reconcile against Alpaca's *closed* orders too, not just its open ones — out
+of scope here. This is a narrow window (pod restart/reconciliation time), not the full
+"no persistence at all" gap this section used to describe.
 
 **Runtime BUY kill switch (ROADMAP P0.5).** `src/common/kill_switch.py::buy_kill_switch_active()`
 reads the `buy-kill-switch` ConfigMap fresh (no caching) at the very top of `execution.buy()`,

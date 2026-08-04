@@ -1,4 +1,5 @@
 import json
+import time
 
 from alpaca.common.exceptions import APIError
 from alpaca.trading.enums import OrderClass, OrderSide, OrderStatus, OrderType, TimeInForce
@@ -21,6 +22,9 @@ MIN_CRYPTO_NOTIONAL = 10.0  # Alpaca rejects a crypto notional below this (code 
 ORDER_NOT_FOUND_CODE = 40410000  # Alpaca's code for "no order exists with that id"
 
 _TERMINAL_NO_FILL = {OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED}
+
+_RECONCILE_MAX_STARTUP_ATTEMPTS = 5
+_RECONCILE_BACKOFF_BASE_S = 5.0
 
 
 class InvalidOrderParameters(Exception):
@@ -49,6 +53,12 @@ _tracked_brackets: dict[str, str | dict] = {}
 # caveat as _tracked_brackets: an order that fills in the gap between the pod dying and
 # reconstruct_tracked_state() running on the new pod still produces no Slack notice for that fill.
 _pending_fills: dict[str, dict] = {}
+
+# False from process start until reconcile_tracked_state_once() has succeeded at least once.
+# buy() refuses new BUYs while this is False (see below) -- submitting a fresh order before
+# Alpaca's live open-order state has been reconciled into _pending_fills/_tracked_brackets risks
+# losing track of it exactly like the restart gap this whole mechanism exists to close.
+_state_reconciled = False
 
 
 def _is_order_not_found(exc: APIError) -> bool:
@@ -152,23 +162,33 @@ def _bracket_poll_failures(symbol: str) -> int:
     return entry["poll_failures"] if isinstance(entry, dict) else 0
 
 
-def reconstruct_tracked_state() -> None:
-    """Rebuilds _pending_fills and _tracked_brackets from Alpaca's own open-orders state on
-    startup -- both dicts are in-memory only, so a Floor Broker restart otherwise loses track of
-    every order/bracket that was still open at the moment it went down, silently dropping their
-    eventual fill notifications.
+def is_state_reconciled() -> bool:
+    return _state_reconciled
+
+
+def reconcile_tracked_state_once() -> bool:
+    """Rebuilds _pending_fills and _tracked_brackets from Alpaca's own open-orders state -- both
+    dicts are in-memory only, so a Floor Broker restart otherwise loses track of every order/
+    bracket that was still open at the moment it went down, silently dropping their eventual fill
+    notifications. Returns True and marks state reconciled on success; False (never raises) on
+    any APIError, leaving existing tracked state and is_state_reconciled() untouched so a later
+    retry can still succeed.
 
     GetOrdersRequest(status="open") queries at the order-*family* level (per Alpaca's own
     semantics, distinct from an individual leg's OrderStatus) -- a bracket whose entry already
     filled but whose TP/SL legs are still live is still "open" here, so nested=True correctly
     surfaces it as a parent with its legs attached, the same shape check_bracket_fills expects.
-    Only orders still open on Alpaca are restored -- by definition nothing has filled yet, so no
-    notification could have been missed by the restart."""
+    Only orders still open on Alpaca are restored -- by definition nothing has filled yet here, so
+    no notification could have been missed by this reconciliation itself. An order that fills in
+    the gap between the pod dying and this running is a separate, narrower gap this cannot close
+    -- Alpaca no longer reports it as "open" once filled -- the trade itself is still correct at
+    Alpaca, only its Slack fill notice is missed."""
+    global _state_reconciled
     try:
         open_orders = trading_client.get_orders(GetOrdersRequest(status="open", nested=True))
     except APIError as exc:
-        log(f"💥  failed to reconstruct tracked orders from Alpaca after restart: {exc}")
-        return
+        log(f"💥  failed to fetch open orders from Alpaca while reconciling tracked state: {exc}")
+        return False
 
     restored_pending = 0
     restored_brackets = 0
@@ -189,6 +209,30 @@ def reconstruct_tracked_state() -> None:
             restored_pending += 1
 
     log(f"🔄  reconstructed {restored_pending} pending order(s) and {restored_brackets} bracket(s) from Alpaca")
+    _state_reconciled = True
+    return True
+
+
+def reconstruct_tracked_state(
+    max_attempts: int = _RECONCILE_MAX_STARTUP_ATTEMPTS, backoff_base_s: float = _RECONCILE_BACKOFF_BASE_S
+) -> None:
+    """Runs once at Floor Broker startup, before poll threads start. Retries
+    reconcile_tracked_state_once() with exponential backoff -- a transient Alpaca outage at
+    exactly boot time shouldn't permanently strand the service with empty tracking dicts from a
+    single failed attempt. If every attempt fails, is_state_reconciled() stays False -- buy()
+    refuses new BUYs (see below) until main.poll_reconciliation() succeeds in the background."""
+    for attempt in range(1, max_attempts + 1):
+        if reconcile_tracked_state_once():
+            return
+        if attempt < max_attempts:
+            backoff = backoff_base_s * (2 ** (attempt - 1))
+            log(f"🔄  reconciliation attempt {attempt}/{max_attempts} failed, retrying in {backoff:.0f}s")
+            time.sleep(backoff)
+
+    log(
+        f"🚨  exhausted {max_attempts} startup reconciliation attempts -- "
+        "BUY execution will be rejected until state reconciles; retrying in background"
+    )
 
 
 def get_open_position(symbol: str) -> float:
@@ -285,6 +329,17 @@ def bracket_buy_with_SLTP(
 
 
 def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> dict:
+    # A restart's tracked state isn't reconciled with Alpaca yet -- submitting a fresh BUY before
+    # that finishes risks the new order never being tracked if the pod dies again in the gap, so
+    # refuse rather than race reconcile_tracked_state_once()/poll_reconciliation() in main.py.
+    if not _state_reconciled:
+        log(f"🛑  BUY {symbol} rejected -- tracked state not yet reconciled with Alpaca")
+        return {
+            "status": "rejected",
+            "reason": "state_not_reconciled",
+            "detail": "tracked state not yet reconciled with Alpaca after restart",
+        }
+
     # ROADMAP P0.5: an operator-controlled runtime switch, checked fresh on every BUY (never
     # cached) so a kubectl patch takes effect on the very next request without a redeploy. SELL
     # is deliberately untouched -- the switch only ever blocks new exposure, never an exit.

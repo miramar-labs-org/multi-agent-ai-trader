@@ -34,6 +34,15 @@ def _kill_switch_inactive(monkeypatch):
     monkeypatch.setattr(execution.kill_switch, "buy_kill_switch_active", lambda: False)
 
 
+@pytest.fixture(autouse=True)
+def _state_reconciled_by_default(monkeypatch):
+    """buy() refuses to submit while tracked state hasn't been reconciled with Alpaca (see
+    reconcile_tracked_state_once()) -- default every test in this file to reconciled=True so
+    existing BUY-path tests are unaffected; tests that care about this gate override it
+    explicitly."""
+    monkeypatch.setattr(execution, "_state_reconciled", True)
+
+
 class FakeTradingClient:
     """Stands in for alpaca-py's TradingClient. `submit_order` raises the given rejection(s)
     in order, then succeeds -- lets tests replay real Alpaca rejection payloads without any
@@ -613,11 +622,12 @@ class FakeReconstructTradingClient:
         return self._open_orders
 
 
-def test_reconstruct_tracked_state_restores_a_still_open_pending_order(monkeypatch):
+def test_reconcile_tracked_state_once_restores_a_still_open_pending_order(monkeypatch):
     order = FakeOrder("order-1", "BTC/USD", OrderSide.BUY, OrderStatus.NEW, filled_avg_price=None, legs=None)
     monkeypatch.setattr(execution, "trading_client", FakeReconstructTradingClient([order]))
+    monkeypatch.setattr(execution, "_state_reconciled", False)
 
-    execution.reconstruct_tracked_state()
+    assert execution.reconcile_tracked_state_once() is True
 
     assert execution._pending_fills["order-1"] == {
         "symbol": "BTC/USD",
@@ -626,39 +636,100 @@ def test_reconstruct_tracked_state_restores_a_still_open_pending_order(monkeypat
         "sl_price": None,
         "tp_price": None,
     }
+    assert execution.is_state_reconciled() is True
 
 
-def test_reconstruct_tracked_state_restores_a_bracket_with_a_still_open_leg(monkeypatch):
+def test_reconcile_tracked_state_once_restores_a_bracket_with_a_still_open_leg(monkeypatch):
     legs = [FakeLeg("tp-leg-1", OrderStatus.NEW, OrderType.LIMIT), FakeLeg("sl-leg-1", OrderStatus.NEW, OrderType.STOP)]
     order = FakeOrder("parent-1", "MGN", OrderSide.BUY, OrderStatus.FILLED, filled_avg_price="10.05", legs=legs)
     monkeypatch.setattr(execution, "trading_client", FakeReconstructTradingClient([order]))
 
-    execution.reconstruct_tracked_state()
+    assert execution.reconcile_tracked_state_once() is True
 
     assert execution._tracked_brackets["MGN"] == "parent-1"
     assert "parent-1" not in execution._pending_fills
 
 
-def test_reconstruct_tracked_state_skips_a_bracket_whose_legs_are_all_terminal(monkeypatch):
+def test_reconcile_tracked_state_once_skips_a_bracket_whose_legs_are_all_terminal(monkeypatch):
     """Shouldn't happen given the status="open" family-level query, but must not crash or
     mistrack if it ever does."""
     legs = [FakeLeg("tp-leg-1", OrderStatus.CANCELED, OrderType.LIMIT), FakeLeg("sl-leg-1", OrderStatus.CANCELED, OrderType.STOP)]
     order = FakeOrder("parent-1", "MGN", OrderSide.BUY, OrderStatus.FILLED, filled_avg_price="10.05", legs=legs)
     monkeypatch.setattr(execution, "trading_client", FakeReconstructTradingClient([order]))
 
-    execution.reconstruct_tracked_state()
+    assert execution.reconcile_tracked_state_once() is True
 
     assert "MGN" not in execution._tracked_brackets
 
 
-def test_reconstruct_tracked_state_handles_api_error_without_raising(monkeypatch):
+def test_reconcile_tracked_state_once_handles_api_error_without_raising(monkeypatch):
     class FailingClient:
         def get_orders(self, request):
             raise APIError("unreachable")
 
     monkeypatch.setattr(execution, "trading_client", FailingClient())
+    monkeypatch.setattr(execution, "_state_reconciled", False)
 
-    execution.reconstruct_tracked_state()
+    assert execution.reconcile_tracked_state_once() is False
 
     assert execution._pending_fills == {}
     assert execution._tracked_brackets == {}
+    assert execution.is_state_reconciled() is False
+
+
+class FakeFlakyReconstructTradingClient:
+    """Raises APIError on the first `fail_times` calls to get_orders(), then returns
+    `open_orders` -- lets tests exercise reconstruct_tracked_state()'s retry-with-backoff loop
+    without a live Alpaca outage."""
+
+    def __init__(self, open_orders, fail_times):
+        self._open_orders = open_orders
+        self._fail_times = fail_times
+        self.calls = 0
+
+    def get_orders(self, request):
+        self.calls += 1
+        if self.calls <= self._fail_times:
+            raise APIError("unreachable")
+        return self._open_orders
+
+
+def test_reconstruct_tracked_state_retries_with_backoff_until_success(monkeypatch):
+    client = FakeFlakyReconstructTradingClient(open_orders=[], fail_times=2)
+    monkeypatch.setattr(execution, "trading_client", client)
+    monkeypatch.setattr(execution, "_state_reconciled", False)
+    sleeps = []
+    monkeypatch.setattr(execution.time, "sleep", lambda s: sleeps.append(s))
+
+    execution.reconstruct_tracked_state(max_attempts=5, backoff_base_s=1)
+
+    assert client.calls == 3
+    assert sleeps == [1, 2]
+    assert execution.is_state_reconciled() is True
+
+
+def test_reconstruct_tracked_state_gives_up_after_max_attempts_and_stays_unreconciled(monkeypatch):
+    client = FakeFlakyReconstructTradingClient(open_orders=[], fail_times=99)
+    monkeypatch.setattr(execution, "trading_client", client)
+    monkeypatch.setattr(execution, "_state_reconciled", False)
+    monkeypatch.setattr(execution.time, "sleep", lambda s: None)
+
+    execution.reconstruct_tracked_state(max_attempts=3, backoff_base_s=1)
+
+    assert client.calls == 3
+    assert execution.is_state_reconciled() is False
+
+
+def test_buy_rejects_when_state_not_reconciled(monkeypatch):
+    monkeypatch.setattr(execution, "_state_reconciled", False)
+    client = FakeTradingClient()
+    monkeypatch.setattr(execution, "trading_client", client)
+
+    result = execution.buy("MGN", "stocks", budget=100.0, slP=0.98, tpP=1.05)
+
+    assert result == {
+        "status": "rejected",
+        "reason": "state_not_reconciled",
+        "detail": "tracked state not yet reconciled with Alpaca after restart",
+    }
+    assert client.submitted == []

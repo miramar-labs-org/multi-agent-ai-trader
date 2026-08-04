@@ -12,6 +12,7 @@ log = get_logger("FLOOR")
 BRACKET_FILL_POLL_INTERVAL_S = 30
 KILL_SWITCH_POLL_INTERVAL_S = 30
 PENDING_FILL_POLL_INTERVAL_S = 30
+RECONCILIATION_RETRY_INTERVAL_S = 60
 
 
 def poll_bracket_fills():
@@ -102,8 +103,22 @@ def poll_kill_switch():
         time.sleep(KILL_SWITCH_POLL_INTERVAL_S)
 
 
+def poll_reconciliation():
+    """Runs only while startup's bounded reconstruct_tracked_state() retries were all exhausted --
+    exits on its own as soon as reconciliation succeeds. Exists so a transient Alpaca outage that
+    spans all of startup's retries doesn't leave BUY execution rejected for the pod's entire
+    lifetime; keeps retrying reconcile_tracked_state_once() until Alpaca recovers."""
+    while not execution.is_state_reconciled():
+        time.sleep(RECONCILIATION_RETRY_INTERVAL_S)
+        try:
+            execution.reconcile_tracked_state_once()
+        except Exception as exc:
+            log(f"💥 background reconciliation attempt failed: {exc}")
+
+
 def main():
     execution.reconstruct_tracked_state()
+    threading.Thread(target=poll_reconciliation, daemon=True).start()
     threading.Thread(target=poll_bracket_fills, daemon=True).start()
     threading.Thread(target=poll_pending_fills, daemon=True).start()
     threading.Thread(target=poll_kill_switch, daemon=True).start()

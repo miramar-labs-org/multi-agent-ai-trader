@@ -165,6 +165,34 @@ def test_poll_pending_fills_survives_an_exception_and_reaches_the_next_sleep(mon
         fb_main.poll_pending_fills()
 
 
+def test_poll_reconciliation_exits_once_state_is_reconciled(monkeypatch):
+    """poll_reconciliation() only exists to retry reconciliation after startup's bounded attempts
+    were all exhausted -- once execution.is_state_reconciled() flips True (whether from this loop
+    or elsewhere), the loop must exit rather than keep polling forever."""
+    states = iter([False, False, True])
+    monkeypatch.setattr(fb_main.execution, "is_state_reconciled", lambda: next(states))
+    attempts = []
+    monkeypatch.setattr(fb_main.execution, "reconcile_tracked_state_once", lambda: attempts.append(1))
+    monkeypatch.setattr(fb_main.time, "sleep", lambda s: None)
+
+    fb_main.poll_reconciliation()
+
+    assert len(attempts) == 2
+
+
+def test_poll_reconciliation_survives_an_exception_and_keeps_retrying(monkeypatch):
+    states = iter([False, False, True])
+    monkeypatch.setattr(fb_main.execution, "is_state_reconciled", lambda: next(states))
+
+    def _raise():
+        raise RuntimeError("alpaca unavailable")
+
+    monkeypatch.setattr(fb_main.execution, "reconcile_tracked_state_once", _raise)
+    monkeypatch.setattr(fb_main.time, "sleep", lambda s: None)
+
+    fb_main.poll_reconciliation()
+
+
 def _stop_after(n):
     """Lets poll_kill_switch() run for exactly `n` iterations (n calls to time.sleep()) before
     breaking out via _StopLoop, so a multi-iteration transition sequence can be tested without an
