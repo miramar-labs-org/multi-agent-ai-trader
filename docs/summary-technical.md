@@ -44,7 +44,8 @@ src/
 ├── eod_report/         main.py                                        CronJob
 ├── backtest/            offline CLI, not a k8s workload — see backtesting.md
 └── common/                config.py, alpaca_client.py, portfolio_state.py,
-                           kill_switch.py, logging.py, slack.py, langsmith.py, eod.py
+                           kill_switch.py, logging.py, slack.py, langsmith.py, eod.py,
+                           market_calendar.py, indicators.py
 k8s/            manifests deploy.yaml applies (2 CronJobs, 2 Deployments, 1 Service, RBAC)
 config.yaml      single OmegaConf source of truth, loaded via common/config.py::load_config()
 ```
@@ -103,9 +104,9 @@ Entrypoint: `python -m src.dealer.main`, `apps/v1 Deployment` `replicas: 1`,
 
 ```python
 while True:
-    if market_is_open(cfg):                 # Alpaca clock + 15-min post-open buffer
-        portfolio = read_portfolio()         # fresh ConfigMap read every cycle, no caching
-        for symbol in portfolio.symbols:
+    if market_is_open(cfg, log):             # Alpaca clock + 15-min post-open buffer
+        portfolio = merge_held_positions(read_portfolio(), cfg)  # fresh ConfigMap read every cycle
+        for entry in portfolio.get("symbols", []):
             try:
                 graph.invoke(DealerState(...))
             except Exception:
@@ -125,7 +126,8 @@ requests.post(f"{cfg.floor_broker.base_url}/execute", json={
 }, timeout=30)
 ```
 
-HOLD signals never leave the pod. `cfg.floor_broker.base_url` is in-cluster Service DNS
+Every signal — including HOLD — posts to Slack via `notify_dealer_signal`; only the Floor Broker
+HTTP call is withheld on a HOLD. `cfg.floor_broker.base_url` is in-cluster Service DNS
 (`http://floor-broker.multi-agent-ai-trader.svc.cluster.local:8000`) — a k8s primitive, not a
 Miramar platform endpoint.
 
@@ -164,8 +166,8 @@ decline path, since only the real endpoint catches a response-model mismatch.
 ever reached (symbol/exchange regex, budget/slP/tpP bounds). Order logic:
 - `buy(symbol, exchange, budget, slP, tpP)` — refuses if a position or open order already
   exists for the symbol (no pyramiding). Stocks get a bracket order
-  (`OrderClass.BRACKET`, SL = `ask_price * slP`, TP = `ask_price * tpP`); crypto (`/` in the
-  symbol) gets a plain notional market order instead, skipped rather than clamped if the
+  (`OrderClass.BRACKET`, SL = `ask_price * slP`, TP = `ask_price * tpP`); crypto (`exchange !=
+  "stocks"`) gets a plain notional market order instead, skipped rather than clamped if the
   rounded notional falls below Alpaca's $10 minimum.
 - `sell(symbol)` — sells the full open quantity at market; on Alpaca's "conflicting orders"
   rejection, cancels the blockers and resubmits against the re-fetched quantity.
@@ -191,8 +193,8 @@ notice is missed — closing that needs durable fill-history persistence (ROADMA
 scope today.
 
 **Kill switch.** `src/common/kill_switch.py::buy_kill_switch_active()` reads the
-`buy-kill-switch` ConfigMap fresh (no caching) at the very top of `buy()`, before any
-position/order lookup:
+`buy-kill-switch` ConfigMap fresh (no caching) near the top of `buy()` — after the
+state-reconciliation check, but before any position/order lookup:
 ```sh
 kubectl patch configmap buy-kill-switch -n multi-agent-ai-trader --type merge -p '{"data":{"active":"true"}}'
 ```

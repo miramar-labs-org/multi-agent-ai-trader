@@ -35,9 +35,10 @@ the Analyst/Dealer/Floor Broker code paths. In particular:
 
 | Service    | Role                                                                                      |
 | ---------- | ------------------------------------------------------------------------------------------ |
-| Alpaca     | Trading API (paper) — Floor Broker's only external call, order placement/cancellation. See the [paper trading dashboard](https://app.alpaca.markets/paper/dashboard/overview) link in the top-level README. |
-| TAAPI.io   | Technical indicators consumed by the Analyst agent — unrelated to any Miramar platform service. |
+| Alpaca     | Trading API (paper) — order placement/cancellation (Floor Broker), plus screener/news/historical-data calls (Analyst, `src/backtest/`). See the [paper trading dashboard](https://app.alpaca.markets/paper/dashboard/overview) link in the top-level README. |
+| TAAPI.io   | Technical indicators — consumed by both the Analyst agent (once daily, top movers) and the Dealer agent (every poll cycle, per watchlist symbol). Unrelated to any Miramar platform service. |
 | LangSmith  | Tracing/observability for both LangGraph agents — this is the tracing layer actually in use, not MLflow. |
+| Slack      | Every consequential event (picks, signals, executions, fills, EOD recaps, errors, kill-switch/market-closed notices) from all four services is posted via `src/common/slack.py`'s webhook POST — unrelated to any Miramar platform service. |
 
 See [architecture.md](architecture.md) for where each of these fits into the
 agent data flow.

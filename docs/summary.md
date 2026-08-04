@@ -24,12 +24,13 @@ problem in one doesn't take down the others.
 
 ### 1. The Analyst — picks today's watchlist
 
-Runs once a day, early, before the market opens (6:00am UTC). Its job: decide which symbols
-are even worth Dealer's attention today.
+Runs once a day, early, before the market opens (8:55am Eastern — 35 minutes before the
+9:30am bell). Its job: decide which symbols are even worth Dealer's attention today.
 
 - It pulls a list of candidate stocks from Alpaca's "most active" and "biggest movers"
   screeners (top movers by volume and % change), and — if crypto is enabled — a small fixed
-  crypto watchlist (BTC, ETH, SOL).
+  crypto watchlist (BTC, ETH, SOL). On a day the stock market is closed (weekend/holiday), it
+  skips the stock screeners but still runs the crypto side, since crypto trades 24/7.
 - It reads recent news headlines and RSS feeds for those candidates.
 - For the biggest movers among those candidates, it pulls real technical indicator readings
   (RSI, MACD, VWAP, Bollinger Bands, SMA, EMA) from a third-party indicator service.
@@ -40,12 +41,18 @@ are even worth Dealer's attention today.
   read.
 - Right after publishing, it posts a "Morning Market Report" to Slack — the day's picks,
   budgets, and rationale, plus the account's current cash/equity — so a human can see the plan
-  before the market even opens.
+  before the market even opens. If the stock market is closed that day, the report says so up
+  front, and notes that crypto trading continues 24/7 (when crypto is enabled).
 - If crypto is enabled, it also posts a separate crypto end-of-day recap covering the prior
   full day's crypto activity, since crypto trades 24/7 and has no natural market-close moment
   of its own.
 
-**What it does NOT do:** it never places an order. It only decides the watchlist.
+**What it does NOT do:** it never places an order. It only decides the watchlist. It also
+doesn't follow a fixed rule (like "buy on RSI < 30") — the picks are entirely up to the AI
+model's judgment, informed by the news and indicator data above. A separate, offline backtesting
+tool (`docs/backtesting.md`) does implement fixed rule-based strategies, but only to give the
+AI's live picks something deterministic to be compared against — it doesn't influence live
+trading.
 
 ### 2. The Dealer — decides buy/hold/sell, all day
 
@@ -57,9 +64,9 @@ For every symbol on today's watchlist, each cycle:
 - Pulls that symbol's current technical indicator readings from the indicator service.
 - Hands those numbers to the AI model with the instruction: "you're an expert technical
   trader — based on all these indicators, should we BUY, SELL, or HOLD?"
-- If the answer is BUY or SELL, it forwards that decision (symbol, budget, stop-loss/take-profit
-  percentages) to the Floor Broker to actually execute. A HOLD decision goes nowhere — it's
-  just logged.
+- Every decision — including HOLD — is posted to Slack so a human can see what the Dealer
+  decided. But only a BUY or SELL is actually forwarded (symbol, budget, stop-loss/take-profit
+  percentages) to the Floor Broker to execute; a HOLD stops there and nothing gets traded.
 
 If a position from before this system existed (or opened outside the daily watchlist) shows
 up in the account, the Dealer folds it into its checks too — but treats it as something to
@@ -122,9 +129,11 @@ deliberately simple:
   goes back to the Dealer's logs and Slack — it isn't stored anywhere further.
 - **Everything → Slack:** every consequential event (morning picks, a BUY/SELL/HOLD decision,
   an execution, a bracket TP/SL fill, the EOD recap, a market-closed notice, any error) gets a
-  Slack message, timestamped in Eastern time. Slack is effectively the human-readable audit
-  trail for the whole system today — there's no other durable log of trading decisions beyond
-  raw application logs and AI-tracing data.
+  Slack message. A BUY/SELL/HOLD decision, an execution/fill, and an error each carry their own
+  Eastern-time timestamp; the morning picks and EOD recaps don't carry a top-level timestamp
+  (each fill listed inside an EOD recap does carry its own). Slack is effectively the
+  human-readable audit trail for the whole system today — there's no other durable log of
+  trading decisions beyond raw application logs and AI-tracing data.
 
 ## Where the "brain" comes from
 

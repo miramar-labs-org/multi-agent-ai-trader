@@ -78,10 +78,10 @@ service that can be replaced/restarted without losing any state (it holds none).
 ## Agent 1 — Analyst (`src/analyst/`)
 
 **Workload:** `batch/v1 CronJob`, schedule `55 8 * * *` with `timeZone: America/New_York`
-(08:55 ET, ~30min before the 9:30 ET open — the ~5min gap covers the run's own compile time,
-dominated by the TAAPI indicator-fetch throttle), `concurrencyPolicy: Forbid` (no overlapping
-runs), `backoffLimit: 1` — a failed research run is meant to surface immediately, not
-retry-storm. Entrypoint: `python -m src.analyst.main`.
+(08:55 ET, 35min before the 9:30 ET open; the run itself takes ~5min, dominated by the TAAPI
+indicator-fetch throttle, so the Morning Report typically posts ~09:00 ET — ~30min before the
+open), `concurrencyPolicy: Forbid` (no overlapping runs), `backoffLimit: 1` — a failed research
+run is meant to surface immediately, not retry-storm. Entrypoint: `python -m src.analyst.main`.
 
 Runs every scheduled day regardless of whether the stock market is open — `main.py` checks
 `src/common/market_calendar.py::is_stock_market_open()` (same Alpaca calendar API EOD Report
@@ -102,7 +102,7 @@ off to the Dealer.
 |---|---|
 | `discover_candidates` | when `cfg.trading.enable_stocks` **and** `state["stock_market_open"]` (set once in `main.py`, see above), `sources.fetch_screener_candidates(screener_top_n=20)` — raw REST calls (not wrapped by `alpaca-py`) to Alpaca's `/v1beta1/screener/stocks/most-actives` and `/movers` endpoints, merged into a symbol→{volume, change_pct} dict, each tagged `market: "stocks"`. When `cfg.trading.enable_crypto`, also `sources.fetch_crypto_candidates(...)` — a fixed watchlist (`BTC/USD`, `ETH/USD`, `SOL/USD`; Alpaca's crypto screener has no most-actives equivalent) merged with `/v1beta1/screener/crypto/movers`, tagged `market: cfg.trading.crypto_taapi_exchange`. Crypto discovery is **not** gated on the stock-market-open flag — it always runs when enabled |
 | `fetch_research` | `sources.fetch_news(news_days=2)` (Alpaca News API, HTML stripped via BeautifulSoup) + `sources.fetch_yahoo_rss_headlines(...)` (Yahoo Finance RSS), concatenated into plain text |
-| `fetch_indicators` | ranks `raw_candidates` by `abs(change_pct)` (missing values sort last) and calls `src.common.indicators.fetch_indicators_bulk` (shared with the Dealer) for the top `cfg.analyst.indicator_fetch_limit` (default 15) — one TAAPI `/bulk` POST per symbol covering `rsi, macd, vwap, bbands, sma, ema`, sleeping `cfg.taapi.min_request_interval_secs` between calls to respect TAAPI's free-tier 1-req/15s cap. At the default limit this adds ~3.75 minutes to the once-daily run — accepted as a fixed cost of a pre-market CronJob, unlike the Dealer's 10-minute poll cycle where the same rate limit is a tighter constraint. Not every candidate gets indicator data; only the top movers by size do |
+| `fetch_indicators` | ranks `raw_candidates` by `abs(change_pct)` (missing values sort last) and calls `src.common.indicators.fetch_indicators_bulk` (shared with the Dealer) for the top `cfg.analyst.indicator_fetch_limit` (default 15) — one TAAPI `/bulk` POST per symbol covering `rsi, macd, vwap, bbands, sma, ema`, sleeping `cfg.taapi.min_request_interval_secs` between calls to respect TAAPI's free-tier 1-req/15s cap. At the default limit this adds ~3.5 minutes to the once-daily run — accepted as a fixed cost of a pre-market CronJob, unlike the Dealer's 10-minute poll cycle where the same rate limit is a tighter constraint. Not every candidate gets indicator data; only the top movers by size do |
 | `llm_select` | the actual LLM call — see below |
 | `validate_selection` | overrides each pick's `exchange` field with the `market` tag `discover_candidates` actually assigned that symbol (never trusts the LLM's own copy of `exchange`), and drops any pick whose symbol isn't in `raw_candidates` at all (a hallucination) |
 | `write_portfolio` | patches the `portfolio` ConfigMap via the `kubernetes` Python client |
@@ -216,7 +216,10 @@ flowchart TD
 
 **LLM call:** same pattern as Analyst — `ChatOpenAI(base_url=cfg.llm.base_url, ...).with_structured_output(Signal)`.
 System prompt: *"You are an expert technical trader in stocks. Based on the values of ALL
-of the indicators below, decide if you should BUY, SELL, or HOLD."* The `Signal` model
+of the indicators below, decide if you should BUY, SELL, or HOLD. size_hint must be a decimal
+fraction between 0.0 and 1.0 representing the portion of the symbol's budget to deploy on a BUY
+(e.g. 0.5 = half the budget, 1.0 = the full budget) — never a dollar amount or share count."*
+The `Signal` model
 (`src/dealer/schema.py`) is `{symbol, action: BUY|HOLD|SELL, reasoning, size_hint}` —
 `size_hint` (a 0–1 fraction) is captured in the schema but **not currently consumed**;
 `call_floor_broker` forwards the symbol's configured `budget` unmodified regardless of
@@ -281,7 +284,7 @@ pollers below send directly.
   where a BUY actually fills, not the bid/ask mid. TP/SL prices are rounded to 4 decimals for
   stocks under $1.00 and 2 decimals otherwise (`_round_to_tick`) — sub-$1 stocks are quoted in
   $0.0001 increments (SEC Rule 612), so 2dp rounding can land TP/SL on the same cent as
-  `base_price` and get rejected. For crypto symbols (`/` in the ticker), submits a plain
+  `base_price` and get rejected. For crypto (`exchange != "stocks"`), submits a plain
   notional market buy instead (`TimeInForce.GTC`) — bracket orders aren't used for crypto.
   The notional amount is rounded to 2 decimals before submitting — Alpaca rejects a crypto
   notional with finer precision than that (`code 42210000`). If the rounded notional is below
@@ -312,8 +315,10 @@ order_id]` (stocks only — crypto has no bracket legs), and `sell()` removes th
 immediately before submitting an explicit sell (so a manual/Dealer-driven SELL doesn't also get
 reported as a TP/SL fill once the bracket's legs are cancelled as a side effect).
 
-`src/floor_broker/main.py` starts two daemon background threads alongside uvicorn's HTTP server
-in the same process:
+`src/floor_broker/main.py` starts four daemon background threads alongside uvicorn's HTTP server
+in the same process — `poll_reconciliation()` (restart recovery, see below) and
+`poll_kill_switch()` (see the kill switch section below) are the other two; the two fill-watchers
+are:
 - **`poll_pending_fills()`** — every `PENDING_FILL_POLL_INTERVAL_S` (30s) calls
   `execution.check_pending_fills()`, which re-fetches each tracked order by id and, once
   `filled_avg_price` is populated, returns a `kind="fill"` event (dropping the entry once it
@@ -386,8 +391,8 @@ before any position/order lookup. If active, the BUY is skipped
 completely untouched, so SELL always remains available even with the switch on. A missing
 ConfigMap (e.g. before the deploy workflow's seed step has ever run) fails open — treated as
 inactive rather than blocking every BUY on a setup gap — but any other k8s API error propagates.
-`src/floor_broker/main.py::poll_kill_switch()` runs alongside `poll_bracket_fills()` as a second
-daemon thread, checking the switch every `KILL_SWITCH_POLL_INTERVAL_S` (30s) purely to post a
+`src/floor_broker/main.py::poll_kill_switch()` is one of the four daemon threads described above,
+checking the switch every `KILL_SWITCH_POLL_INTERVAL_S` (30s) purely to post a
 Slack notice (`slack.notify_buy_kill_switch`) on a state *transition* — `/execute` itself already
 re-checks the switch fresh on every request, so this thread never gates trading, only reports on
 it. The first poll after a pod start only discovers the switch's current state and never counts
@@ -409,7 +414,8 @@ kubectl get configmap buy-kill-switch -n multi-agent-ai-trader -o jsonpath='{.da
 
 **Workload:** `batch/v1 CronJob`, schedule `30 21 * * *` (21:30 UTC **daily** — after the 4pm ET
 close in both EDT and EST), `concurrencyPolicy: Forbid`, `backoffLimit: 1`. No ServiceAccount —
-like Floor Broker, it never touches the k8s API. Entrypoint: `python -m src.eod_report.main`. The
+unlike Floor Broker (which has one, scoped to reading the kill-switch ConfigMap — see below), EOD
+Report never touches the k8s API at all. Entrypoint: `python -m src.eod_report.main`. The
 schedule runs every day rather than `1-5` (Mon-Fri) specifically so `main()`'s own
 Alpaca-calendar check (below) gets a chance to fire and post a Slack notice on weekends/holidays
 — previously the cron schedule itself silently excluded weekends, and a weekday holiday made
@@ -493,7 +499,8 @@ see [`docs/backtesting.md`](backtesting.md) for the full design and documented a
 
 ## Data flow — one full cycle
 
-1. **08:55 America/New_York** — Analyst CronJob pod starts (~30min before the 9:30 ET open).
+1. **08:55 America/New_York** — Analyst CronJob pod starts (35min before the 9:30 ET open; the
+   ~5min run typically finishes and posts the Morning Report ~09:00 ET, ~30min before the open).
    `main.py` checks the Alpaca calendar once; if the stock market is closed today, the run
    continues anyway (crypto still trades 24/7) rather than exiting early.
 2. Discover ≤20 screener candidates (Alpaca `most-actives`/`movers`, skipped if the stock
@@ -525,7 +532,7 @@ see [`docs/backtesting.md`](backtesting.md) for the full design and documented a
 | `llm` | `base_url`, `model`, `temperature` | shared OpenAI-compatible endpoint for **both** Analyst and Dealer LLM calls — see [platform-services.md](platform-services.md) for current wiring status |
 | `langsmith` | `enabled`, `project` | toggles LangGraph/LangChain tracing to LangSmith (requires `LANGCHAIN_API_KEY`) |
 | `langsmith` | `sampling_rate` | fraction of traces actually sent to LangSmith (0.5) — keeps Dealer's poll-driven trace volume under the free Developer plan's 5k traces/month limit |
-| `slack` | `enabled` | toggles posting interesting events (Morning Report, Crypto EOD Report, Dealer signals, Floor Broker executions, EOD Report, EOD's non-trading-day notice, Dealer's live market-closed notice, errors) to `#miramar-trading-floor` (requires `SLACK_WEBHOOK_URL`) — every one of these notices carries an Eastern-time timestamp; Dealer signal notices keep the LLM's full rationale on their own line, and a Floor Broker execution notice includes fill price/reason/SL/TP whenever `execution.py` supplies them; EOD Report/Crypto EOD Report fill lines each additionally carry the fill's own Eastern-time timestamp |
+| `slack` | `enabled` | toggles posting interesting events (Morning Report, Crypto EOD Report, Dealer signals, Floor Broker executions, EOD Report, EOD's non-trading-day notice, Dealer's live market-closed notice, errors) to `#miramar-trading-floor` (requires `SLACK_WEBHOOK_URL`) — Dealer signals, Floor Broker executions, EOD's non-trading-day notice, and errors each carry a message-level Eastern-time timestamp; Morning Report, EOD Report, Crypto EOD Report, and Dealer's live market-closed notice do not. Dealer signal notices keep the LLM's full rationale on their own line, and a Floor Broker execution notice includes fill price/reason/SL/TP whenever `execution.py` supplies them; EOD Report/Crypto EOD Report fill lines each carry the fill's own Eastern-time timestamp even though the message as a whole doesn't |
 | `floor_broker` | `base_url` | in-cluster Service DNS Dealer uses to reach Floor Broker |
 | `taapi` | `min_request_interval_secs` | seconds Dealer and Analyst (`fetch_indicators`) each wait between symbols' TAAPI `/bulk` calls (15) — sized to the TAAPI Free plan's 1 request/15s cap; lower it if the account is on a paid plan |
 | `trading` | `slP` / `tpP` | stop-loss/take-profit price multipliers on bracket orders (0.98/1.05 ≈ 2% stop, 5% target) |
@@ -581,8 +588,10 @@ All credentials live in one k8s Secret, `mlabs-api-keys` (documented, not create
 `k8s/secrets.example.yaml` — deploy fails fast if it's missing): `TAAPI_API_KEY`,
 `ALPACA_PAPER_API_KEY`, `ALPACA_PAPER_API_SECRET`, `LANGCHAIN_API_KEY`, `SLACK_WEBHOOK_URL`.
 Analyst and Dealer get it via `envFrom.secretRef` for both k8s-API access (via their shared
-ServiceAccount) and these external API keys; Floor Broker and EOD Report get the same secret for
-their Alpaca keys and `SLACK_WEBHOOK_URL` — neither has a ServiceAccount/k8s API access at all.
+ServiceAccount) and these external API keys. Floor Broker also has a ServiceAccount
+(`multi-agent-ai-trader-configmap-reader`, scoped to reading the `buy-kill-switch` ConfigMap)
+plus the secret for its Alpaca keys and `SLACK_WEBHOOK_URL`. EOD Report gets the same secret but
+has no ServiceAccount/k8s API access at all.
 
 ## `notebook.ipynb`
 
