@@ -196,10 +196,10 @@ def test_crypto_eod_report_posts_only_crypto_positions_and_fills_for_the_prior_d
     assert [p["symbol"] for p in posted["positions"]] == ["BTCUSD"]
 
 
-def _indicator_cfg(indicator_fetch_limit):
+def _indicator_cfg(indicator_fetch_limit, enable_indicators=True):
     return OmegaConf.create(
         {
-            "analyst": {"indicator_fetch_limit": indicator_fetch_limit},
+            "analyst": {"indicator_fetch_limit": indicator_fetch_limit, "enable_indicators": enable_indicators},
             "taapi": {"min_request_interval_secs": 15},
             "indicators": [],
         }
@@ -246,6 +246,47 @@ def test_fetch_indicators_omits_candidates_with_no_indicator_data(monkeypatch):
     result = graph.fetch_indicators(state, _indicator_cfg(indicator_fetch_limit=5))
 
     assert result["indicator_text"] == ""
+
+
+def test_fetch_indicators_skipped_when_disabled_via_config(monkeypatch):
+    """The enable_indicators feature gate must short-circuit before any TAAPI calls, not just
+    filter the result -- fetch_indicators_bulk being called at all would still burn the rate limit."""
+    candidates = [{"symbol": "A", "market": "stocks", "change_pct": 1.0}]
+    calls = []
+    monkeypatch.setattr(graph, "fetch_indicators_bulk", lambda *a, **k: calls.append(1) or "text")
+    state = {"raw_candidates": candidates, "research_text": "", "indicator_text": "", "selection": None}
+
+    result = graph.fetch_indicators(state, _indicator_cfg(indicator_fetch_limit=5, enable_indicators=False))
+
+    assert result["indicator_text"] == ""
+    assert calls == []
+
+
+def test_fetch_research_includes_news_and_headlines_when_enabled(monkeypatch):
+    monkeypatch.setattr(graph.sources, "fetch_news", lambda days: "MGN announces earnings beat")
+    monkeypatch.setattr(graph.sources, "fetch_yahoo_rss_headlines", lambda url: "Market rallies on Fed news")
+    cfg = OmegaConf.create({"analyst": {"news_days": 2, "yahoo_rss_url": "http://x", "enable_news": True}})
+    state = {"raw_candidates": [], "research_text": "", "indicator_text": "", "selection": None}
+
+    result = graph.fetch_research(state, cfg)
+
+    assert "MGN announces earnings beat" in result["research_text"]
+    assert "Market rallies on Fed news" in result["research_text"]
+
+
+def test_fetch_research_skipped_when_disabled_via_config(monkeypatch):
+    """The enable_news feature gate must short-circuit before any network calls, not just discard
+    the result."""
+    calls = []
+    monkeypatch.setattr(graph.sources, "fetch_news", lambda days: calls.append(1) or "news")
+    monkeypatch.setattr(graph.sources, "fetch_yahoo_rss_headlines", lambda url: calls.append(1) or "headlines")
+    cfg = OmegaConf.create({"analyst": {"news_days": 2, "yahoo_rss_url": "http://x", "enable_news": False}})
+    state = {"raw_candidates": [], "research_text": "", "indicator_text": "", "selection": None}
+
+    result = graph.fetch_research(state, cfg)
+
+    assert result["research_text"] == ""
+    assert calls == []
 
 
 class FakeSelection:

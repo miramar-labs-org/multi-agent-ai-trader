@@ -47,6 +47,8 @@ eod_report:
 analyst:
   schedule: "55 8 * * *"      # informational copy of the CronJob's own spec.schedule — 08:55 America/New_York
                                # daily (spec.timeZone), ~30min before the 9:30 ET open
+  enable_news: true           # feature gate: Alpaca News API + Yahoo RSS headlines as an Analyst input
+  enable_indicators: true     # feature gate: TAAPI technical indicator data as an Analyst input
   max_universe_size: 10
   default_budget: 5000
   screener_top_n: 20          # candidates pulled from Alpaca Screener before research/filtering

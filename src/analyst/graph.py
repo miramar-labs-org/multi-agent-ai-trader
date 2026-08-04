@@ -50,6 +50,9 @@ def discover_candidates(state: AnalystState, cfg) -> AnalystState:
 
 
 def fetch_research(state: AnalystState, cfg) -> AnalystState:
+    if not cfg.analyst.enable_news:
+        log("⏭️ news feeds disabled via config — skipping")
+        return {**state, "research_text": ""}
     news = sources.fetch_news(cfg.analyst.news_days)
     headlines = sources.fetch_yahoo_rss_headlines(cfg.analyst.yahoo_rss_url)
     research_text = f"{news}\n{headlines}"
@@ -62,6 +65,9 @@ def fetch_indicators(state: AnalystState, cfg) -> AnalystState:
     `indicator_fetch_limit` candidates -- TAAPI's free-tier rate limit is 1 request/15s
     (cfg.taapi.min_request_interval_secs), and fetching every screened candidate would make the
     daily CronJob run take far longer than warranted for candidates the LLM is unlikely to pick."""
+    if not cfg.analyst.enable_indicators:
+        log("⏭️ indicators disabled via config — skipping")
+        return {**state, "indicator_text": ""}
     ranked = sorted(
         state["raw_candidates"],
         key=lambda c: abs(c["change_pct"]) if c.get("change_pct") is not None else -1,
