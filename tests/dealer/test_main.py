@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 
+import pytz
 from omegaconf import OmegaConf
 
 from src.dealer import main as dealer_main
@@ -80,6 +81,8 @@ def test_market_closed_notice_fires_again_after_reopening(monkeypatch):
 def test_market_open_does_not_post_closed_notice(monkeypatch):
     monkeypatch.setattr(dealer_main, "_last_market_open", False)
     monkeypatch.setattr(dealer_main, "trading_client", FakeTradingClient(is_open=True))
+    eastern = pytz.timezone("US/Eastern")
+    monkeypatch.setattr(dealer_main, "_now_et", lambda: eastern.localize(datetime(2026, 8, 3, 10, 0)))
     posted = {}
     monkeypatch.setattr(dealer_main.slack, "notify_stock_market_closed", lambda next_open: posted.update(next_open=next_open))
 

@@ -18,9 +18,13 @@ _last_market_open = None  # edge-detects open/closed transitions so Slack gets o
                           # transition, not a repeat every poll cycle while the market stays closed
 
 
+def _now_et() -> datetime:
+    return datetime.now(pytz.timezone("US/Eastern"))
+
+
 def is_after_open_buffer(buffer_minutes: int) -> bool:
     eastern = pytz.timezone("US/Eastern")
-    now_et = datetime.now(eastern)
+    now_et = _now_et()
 
     market_open_naive = datetime.combine(now_et.date(), dtime(9, 30))
     market_open_et = eastern.localize(market_open_naive)
