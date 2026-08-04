@@ -16,14 +16,16 @@ def _api_error(payload: dict) -> APIError:
 
 @pytest.fixture(autouse=True)
 def _clear_tracked_brackets():
-    """_tracked_brackets and _pending_fills are module-level state shared across every test in
-    this file -- clear them before and after each test so tests can't leak tracking into one
-    another."""
+    """_tracked_brackets, _pending_fills, and _crypto_stops are module-level state shared across
+    every test in this file -- clear them before and after each test so tests can't leak tracking
+    into one another."""
     execution._tracked_brackets.clear()
     execution._pending_fills.clear()
+    execution._crypto_stops.clear()
     yield
     execution._tracked_brackets.clear()
     execution._pending_fills.clear()
+    execution._crypto_stops.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -43,14 +45,27 @@ def _state_reconciled_by_default(monkeypatch):
     monkeypatch.setattr(execution, "_state_reconciled", True)
 
 
+class FakeAccount:
+    """Stands in for alpaca-py's TradeAccount. Defaults to flat daily P&L (equity ==
+    last_equity) so the daily profit/loss halt in buy() is a no-op unless a test overrides it."""
+
+    def __init__(self, equity="100000.0", last_equity="100000.0"):
+        self.equity = equity
+        self.last_equity = last_equity
+
+
 class FakeTradingClient:
     """Stands in for alpaca-py's TradingClient. `submit_order` raises the given rejection(s)
     in order, then succeeds -- lets tests replay real Alpaca rejection payloads without any
     network access."""
 
-    def __init__(self, rejections=()):
+    def __init__(self, rejections=(), account=None):
         self._rejections = list(rejections)
         self.submitted = []
+        self._account = account or FakeAccount()
+
+    def get_account(self):
+        return self._account
 
     def get_open_position(self, symbol):
         raise APIError("no position")
@@ -310,6 +325,8 @@ def test_stock_buy_returns_reason_sl_tp_and_tracks_the_bracket_and_pending_fill(
         "reason": "opening_position",
         "sl_price": pytest.approx(9.8, abs=0.01),
         "tp_price": pytest.approx(10.5, abs=0.01),
+        "crypto_slP": None,
+        "crypto_tpP": None,
     }
 
 
@@ -324,6 +341,21 @@ def test_crypto_buy_has_no_sl_tp_price_and_is_not_tracked_as_a_bracket(monkeypat
     assert result["sl_price"] is None
     assert result["tp_price"] is None
     assert "BTC/USD" not in execution._tracked_brackets
+
+
+def test_crypto_buy_stores_strategy_crypto_slp_tpp_for_the_pending_fill(monkeypatch):
+    """Crypto has no fill price known at submission time (a plain notional market order), so the
+    strategy.crypto_slP/crypto_tpP multipliers -- not yet a concrete sl_price/tp_price -- must be
+    stashed on the pending-fill entry for check_pending_fills() to apply once the fill lands."""
+    fake_client = FakeTradingClient()
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    result = execution.buy("BTC/USD", "binance", 100.0, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "submitted"
+    pending = execution._pending_fills["order-123"]
+    assert pending["crypto_slP"] == execution.cfg.strategy.crypto_slP
+    assert pending["crypto_tpP"] == execution.cfg.strategy.crypto_tpP
 
 
 def test_sell_returns_dealer_signal_reason_and_untracks_bracket_and_tracks_pending_fill(monkeypatch):
@@ -351,6 +383,94 @@ def test_sell_returns_dealer_signal_reason_and_untracks_bracket_and_tracks_pendi
         "sl_price": None,
         "tp_price": None,
     }
+
+
+def test_sell_accepts_a_reason_override_and_clears_tracked_crypto_stop(monkeypatch):
+    """check_crypto_stops() calls sell(symbol, reason=...) so the eventual fill notice says
+    stop_loss/take_profit rather than the default dealer_signal -- and the triggering sell must
+    itself clear the symbol's _crypto_stops entry so the poller can't double-sell it."""
+    class FakeSellClient:
+        def get_open_position(self, symbol):
+            return type("Position", (), {"qty": "1"})()
+
+        def submit_order(self, req):
+            return type("Order", (), {"id": "sell-order-1"})()
+
+    monkeypatch.setattr(execution, "trading_client", FakeSellClient())
+    execution._crypto_stops["BTC/USD"] = (98.0, 103.0)
+
+    result = execution.sell("BTC/USD", reason="stop_loss")
+
+    assert result["status"] == "submitted"
+    assert result["reason"] == "stop_loss"
+    assert execution._pending_fills["sell-order-1"]["reason"] == "stop_loss"
+    assert "BTC/USD" not in execution._crypto_stops
+
+
+def test_check_crypto_stops_sells_when_bid_drops_to_or_below_stop_loss(monkeypatch):
+    execution._crypto_stops["BTC/USD"] = (98.0, 103.0)
+    monkeypatch.setattr(execution, "get_current_bid_price", lambda symbol: 98.0)
+
+    class FakeSellClient:
+        def get_open_position(self, symbol):
+            return type("Position", (), {"qty": "1"})()
+
+        def submit_order(self, req):
+            return type("Order", (), {"id": "sell-order-1"})()
+
+    monkeypatch.setattr(execution, "trading_client", FakeSellClient())
+
+    events = execution.check_crypto_stops()
+
+    assert len(events) == 1
+    assert events[0]["symbol"] == "BTC/USD"
+    assert events[0]["reason"] == "stop_loss"
+    assert events[0]["bid_price"] == 98.0
+    assert events[0]["sell_result"]["status"] == "submitted"
+    assert "BTC/USD" not in execution._crypto_stops
+
+
+def test_check_crypto_stops_sells_when_bid_rises_to_or_above_take_profit(monkeypatch):
+    execution._crypto_stops["BTC/USD"] = (98.0, 103.0)
+    monkeypatch.setattr(execution, "get_current_bid_price", lambda symbol: 103.0)
+
+    class FakeSellClient:
+        def get_open_position(self, symbol):
+            return type("Position", (), {"qty": "1"})()
+
+        def submit_order(self, req):
+            return type("Order", (), {"id": "sell-order-1"})()
+
+    monkeypatch.setattr(execution, "trading_client", FakeSellClient())
+
+    events = execution.check_crypto_stops()
+
+    assert events[0]["reason"] == "take_profit"
+    assert "BTC/USD" not in execution._crypto_stops
+
+
+def test_check_crypto_stops_keeps_tracking_when_bid_is_within_bounds(monkeypatch):
+    execution._crypto_stops["BTC/USD"] = (98.0, 103.0)
+    monkeypatch.setattr(execution, "get_current_bid_price", lambda symbol: 100.0)
+
+    events = execution.check_crypto_stops()
+
+    assert events == []
+    assert execution._crypto_stops["BTC/USD"] == (98.0, 103.0)
+
+
+def test_check_crypto_stops_keeps_tracking_symbol_on_transient_price_fetch_error(monkeypatch):
+    execution._crypto_stops["BTC/USD"] = (98.0, 103.0)
+
+    def _raise(symbol):
+        raise APIError("unreachable")
+
+    monkeypatch.setattr(execution, "get_current_bid_price", _raise)
+
+    events = execution.check_crypto_stops()
+
+    assert events == []
+    assert execution._crypto_stops["BTC/USD"] == (98.0, 103.0)
 
 
 def test_check_bracket_fills_reports_take_profit_leg_filled(monkeypatch):
@@ -447,6 +567,58 @@ def test_sell_still_permitted_when_kill_switch_active(monkeypatch):
     assert result["status"] == "submitted"
 
 
+def test_buy_skips_when_daily_profit_target_reached(monkeypatch):
+    account = FakeAccount(equity="101000.0", last_equity="100000.0")  # +$1000, == strategy.daily_profit_target_usd
+    fake_client = FakeTradingClient(account=account)
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    result = execution.buy("MGN", "stocks", 5000.0, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "daily_profit_target_reached"
+    assert fake_client.submitted == []
+
+
+def test_buy_skips_when_daily_loss_limit_reached(monkeypatch):
+    account = FakeAccount(equity="99500.0", last_equity="100000.0")  # -$500, == strategy.daily_loss_limit_usd
+    fake_client = FakeTradingClient(account=account)
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    result = execution.buy("MGN", "stocks", 5000.0, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "daily_loss_limit_reached"
+    assert fake_client.submitted == []
+
+
+def test_buy_proceeds_when_daily_pnl_is_within_bounds(monkeypatch):
+    account = FakeAccount(equity="100200.0", last_equity="100000.0")  # +$200, under target
+    fake_client = FakeTradingClient(account=account)
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+    monkeypatch.setattr(execution, "get_current_ask_price", lambda symbol: 10.0)
+
+    result = execution.buy("MGN", "stocks", 5000.0, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "submitted"
+
+
+def test_sell_still_permitted_when_daily_loss_limit_reached(monkeypatch):
+    """The halt only ever blocks new BUY exposure -- SELL must be completely unaffected,
+    matching the existing kill-switch precedent."""
+    class FakeSellClient:
+        def get_open_position(self, symbol):
+            return type("Position", (), {"qty": "5"})()
+
+        def submit_order(self, req):
+            return type("Order", (), {"id": "sell-order-1"})()
+
+    monkeypatch.setattr(execution, "trading_client", FakeSellClient())
+
+    result = execution.sell("MGN")
+
+    assert result["status"] == "submitted"
+
+
 def test_check_bracket_fills_untracks_symbol_on_confirmed_not_found(monkeypatch):
     """A cancelled/expired parent order can eventually 404 -- treat a *confirmed* not-found as
     nothing left to watch rather than retrying forever."""
@@ -519,6 +691,44 @@ def test_check_pending_fills_reports_a_filled_order(monkeypatch):
         }
     ]
     assert "order-1" not in execution._pending_fills
+
+
+def test_check_pending_fills_starts_tracking_a_crypto_stop_on_buy_fill(monkeypatch):
+    execution._pending_fills["order-1"] = {
+        "symbol": "BTC/USD",
+        "action": "BUY",
+        "reason": "opening_position",
+        "sl_price": None,
+        "tp_price": None,
+        "crypto_slP": 0.98,
+        "crypto_tpP": 1.03,
+    }
+    fake_client = FakePendingFillTradingClient({"order-1": FakePendingOrder(filled_avg_price="100.0")})
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    execution.check_pending_fills()
+
+    assert execution._crypto_stops["BTC/USD"] == pytest.approx((98.0, 103.0))
+
+
+def test_check_pending_fills_does_not_track_a_crypto_stop_for_a_stock_fill(monkeypatch):
+    """A stock BUY's pending-fill entry has crypto_slP/crypto_tpP left at None (see buy()) --
+    must not be mistaken for a crypto fill."""
+    execution._pending_fills["order-1"] = {
+        "symbol": "MGN",
+        "action": "BUY",
+        "reason": "opening_position",
+        "sl_price": 9.8,
+        "tp_price": 10.5,
+        "crypto_slP": None,
+        "crypto_tpP": None,
+    }
+    fake_client = FakePendingFillTradingClient({"order-1": FakePendingOrder(filled_avg_price="10.05")})
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    execution.check_pending_fills()
+
+    assert execution._crypto_stops == {}
 
 
 def test_check_pending_fills_keeps_tracking_an_unfilled_order(monkeypatch):

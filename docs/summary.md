@@ -88,15 +88,25 @@ already been made. Its job is purely mechanical order execution and safety check
   already exists for that symbol, it refuses the buy rather than pyramiding into it.
 - **Buying crypto:** places a plain market order for a dollar amount instead (crypto doesn't
   use bracket orders here). If the dollar amount would fall under Alpaca's $10 minimum order
-  size, it skips the trade rather than silently rounding it up past the intended budget.
+  size, it skips the trade rather than silently rounding it up past the intended budget. Since
+  Alpaca doesn't support bracket orders for crypto at all, the Floor Broker fakes one: once the
+  buy fills, it remembers a stop-loss and take-profit price for that coin (also from config) and
+  checks the live price against them on the same 30-second cadence described below, selling
+  automatically if either is crossed.
 - **Selling:** sells the full position at market. If Alpaca briefly rejects the sell because of
   a conflicting order, it clears the blocker and retries automatically rather than giving up.
 - **Watching orders fill:** buys and sells are submitted and acknowledged immediately rather than
-  waiting around for a fill, so two background checks each run every 30 seconds — one watching
-  for the original buy/sell itself filling, the other watching for stop-loss or take-profit legs
-  that filled on their own (which can happen hours after the original buy, with no direct
-  request/response to hang a notification off of) — and post a Slack notice for each one as it's
+  waiting around for a fill, so background checks each run every 30 seconds — one watching for
+  the original buy/sell itself filling, one watching for stop-loss or take-profit legs that
+  filled on their own (which can happen hours after the original buy, with no direct
+  request/response to hang a notification off of), and one watching tracked crypto positions
+  against their stop-loss/take-profit prices — and post a Slack notice for each one as it's
   detected.
+- **Daily profit/loss circuit breaker:** before any new buy, it checks today's account profit or
+  loss so far. Once the day's gain hits the configured profit target, or the day's loss hits the
+  configured loss limit, it stops opening new positions until the next day — existing positions
+  can still be sold at any time, it just won't add new risk once the day's goal (or floor) is
+  reached.
 
 Every buy and sell — along with every stop-loss/take-profit fill — gets posted to Slack with
 the fill price and reason, so there's a running, human-readable trail of everything the system
@@ -150,6 +160,12 @@ its output reliably machine-usable.
   someone deliberately changing the source code.
 - **Every stock buy is bracketed** — a stop-loss and take-profit are placed at the same time
   as the entry, so there's never an unprotected open stock position by construction.
+- **Every crypto buy gets a stop-loss/take-profit too** — Alpaca doesn't support real bracket
+  orders for crypto, so the Floor Broker fakes one in software: it remembers the target prices
+  after the buy fills and sells automatically if either is crossed on its 30-second price check.
+- **Daily profit/loss circuit breaker** — a configurable dollar profit target and loss limit;
+  once either is hit for the day, no new buys go out until the next day (existing positions can
+  still be sold any time).
 - **No pyramiding** — the Floor Broker refuses a new buy on a symbol that already has an open
   position or a pending order.
 - **Opening-bell buffer** — the Dealer waits 15 minutes after the open before making its first

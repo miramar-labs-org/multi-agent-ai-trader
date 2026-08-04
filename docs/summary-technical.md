@@ -163,20 +163,39 @@ through the actual `/execute` endpoint (not just a mocked `execution.*` unit tes
 decline path, since only the real endpoint catches a response-model mismatch.
 
 `src/floor_broker/execution.py` — request validation happens in `app.py` before this file is
-ever reached (symbol/exchange regex, budget/slP/tpP bounds). Order logic:
-- `buy(symbol, exchange, budget, slP, tpP)` — refuses if a position or open order already
-  exists for the symbol (no pyramiding). Stocks get a bracket order
-  (`OrderClass.BRACKET`, SL = `ask_price * slP`, TP = `ask_price * tpP`); crypto (`exchange !=
-  "stocks"`) gets a plain notional market order instead, skipped rather than clamped if the
-  rounded notional falls below Alpaca's $10 minimum.
-- `sell(symbol)` — sells the full open quantity at market; on Alpaca's "conflicting orders"
-  rejection, cancels the blockers and resubmits against the re-fetched quantity.
+ever reached (symbol/exchange regex, budget/slP/tpP bounds); `cfg = load_config()` is loaded at
+module level for the `strategy:` fields below. Order logic:
+- `buy(symbol, exchange, budget, slP, tpP)` — after the kill switch and daily halt checks
+  (below), refuses if a position or open order already exists for the symbol (no pyramiding).
+  Stocks get a bracket order (`OrderClass.BRACKET`, SL = `ask_price * slP`, TP =
+  `ask_price * tpP`); crypto (`exchange != "stocks"`) gets a plain notional market order
+  instead, skipped rather than clamped if the rounded notional falls below Alpaca's $10 minimum.
+- `sell(symbol, reason="dealer_signal")` — sells the full open quantity at market; on Alpaca's
+  "conflicting orders" rejection, cancels the blockers and resubmits against the re-fetched
+  quantity.
 - Both submit and return immediately (`status="submitted"`) — they don't block for a fill.
   `order_id` goes into a module-level in-memory dict, `_pending_fills`; a stock bracket's parent
   order id goes into `_tracked_brackets`. Two daemon threads in `main.py`
   (`poll_pending_fills()`, `poll_bracket_fills()`, 30s each) later resolve these to actual fills
   or terminal non-fills and post the outcome to Slack — the eventual fill is never visible
   through the original `/execute` request/response.
+
+**Daily profit/loss halt (`strategy.daily_profit_target_usd`/`daily_loss_limit_usd`).** Checked
+in `buy()` right after the kill switch: `daily_pnl = account.equity - account.last_equity`
+(Alpaca's `TradeAccount` already tracks this, no custom bookkeeping). Once `daily_pnl` reaches
+the profit target or breaches the loss limit, the BUY is skipped
+(`reason="daily_profit_target_reached"`/`"daily_loss_limit_reached"`); `sell()` is unaffected.
+No dedicated poller — the normal per-BUY Slack notice already reports the skip reason.
+
+**Crypto synthetic stop-loss/take-profit (`strategy.crypto_slP`/`crypto_tpP`).** Alpaca's
+bracket orders are equity-only, so crypto has no server-side SL/TP. `check_pending_fills()`
+computes `sl_price`/`tp_price` off the real fill price on a crypto BUY fill and stores them in a
+third in-memory dict, `_crypto_stops`. `check_crypto_stops()` runs inside the *existing*
+`poll_bracket_fills()` thread (no new thread), fetching the current bid per tracked symbol and
+calling `sell(symbol, reason="stop_loss"|"take_profit")` once it's crossed; `sell()` pops the
+symbol from `_crypto_stops` so the poller never double-sells. Same in-memory,
+restart-drops-tracking tradeoff as `_pending_fills`/`_tracked_brackets`. See `docs/strategy.md`
+for the full design log.
 
 **Restart recovery.** `_pending_fills`/`_tracked_brackets` are in-memory, so a pod restart would
 otherwise silently lose track of every still-open order. `reconstruct_tracked_state()` runs

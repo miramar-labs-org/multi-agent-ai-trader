@@ -269,8 +269,11 @@ rather than raised; unexpected exceptions become a 500.
 fields (all `None` unless `execution.buy()`/`sell()` populate them — see below), so Dealer can
 forward a stable reason code (and, for stock BUYs, the pre-computed bracket prices) to Slack
 instead of only the request it sent. `reason` is one of `opening_position` (a BUY), `dealer_signal`
-(an explicit SELL from the Dealer's LLM decision), or `take_profit`/`stop_loss` (an asynchronous
-bracket-leg fill detected by the poller below). As of ROADMAP P0.14, `/execute` itself never
+(an explicit SELL from the Dealer's LLM decision), `take_profit`/`stop_loss` (an asynchronous
+bracket-leg fill for stocks, or a synthetic crypto stop/target trigger — see below — both detected
+by the pollers below), or a skipped-BUY reason (`buy_kill_switch_active`, `state_not_reconciled`,
+`budget_below_minimum`, `daily_profit_target_reached`, `daily_loss_limit_reached` — see the daily
+halt section below). As of ROADMAP P0.14, `/execute` itself never
 returns `fill_price` — BUY/SELL orders are submitted and the response comes back immediately with
 `status="submitted"`; the actual fill (`opening_position`/`dealer_signal`) and bracket-leg fills
 (`take_profit`/`stop_loss`) are both reported later, asynchronously, only via the Slack posts the
@@ -409,6 +412,37 @@ kubectl patch configmap buy-kill-switch -n multi-agent-ai-trader --type merge -p
 # Check current state:
 kubectl get configmap buy-kill-switch -n multi-agent-ai-trader -o jsonpath='{.data.active}'
 ```
+
+**Daily profit/loss halt (`strategy.daily_profit_target_usd`/`daily_loss_limit_usd`, see
+`docs/strategy.md`).** A second, config-driven BUY gate in `execution.buy()`, checked right after
+the kill switch: it fetches `trading_client.get_account()` and computes
+`daily_pnl = equity - last_equity` — Alpaca's own `TradeAccount` model already tracks this, so no
+custom day-boundary bookkeeping is needed. If `daily_pnl` has reached the configured profit
+target or breached the configured loss limit, the BUY is skipped
+(`status="skipped", reason="daily_profit_target_reached"` or `"daily_loss_limit_reached"`) without
+submitting an order. Only `halt_behavior: block_new_buys` is implemented — `sell()` is completely
+untouched, same SELL-always-available asymmetry as the kill switch above. There's no dedicated
+poller or Slack transition notice for this one (unlike the kill switch): every skipped BUY already
+gets reported through the normal `slack.notify_floor_broker_result` call in
+`src/dealer/graph.py::call_floor_broker`, which is enough to observe the halt taking effect.
+
+**Crypto synthetic stop-loss/take-profit (`strategy.crypto_slP`/`crypto_tpP`, see
+`docs/strategy.md`).** Alpaca's bracket orders are equity-only
+(`alpaca.trading.enums.OrderClass`'s docstring: "Crypto trading: simple (or \"\")"), so a crypto
+BUY (see above) has no server-side SL/TP at all. `check_pending_fills()` closes that gap: once a
+crypto BUY's fill price is observed, it computes `sl_price = fill_price * crypto_slP` and
+`tp_price = fill_price * crypto_tpP` and stores them in a third module-level, in-memory dict,
+`_crypto_stops: dict[symbol, (sl_price, tp_price)]` — same restart-drops-tracking tradeoff as
+`_tracked_brackets`/`_pending_fills` above, deliberately not given ConfigMap persistence.
+`execution.check_crypto_stops()` is polled from the *existing* `poll_bracket_fills()` daemon
+thread (no new thread) on the same `BRACKET_FILL_POLL_INTERVAL_S` (30s) cadence: for each tracked
+symbol it fetches the current bid via `alpaca_client.get_current_bid_price()` (the price an
+immediate market SELL would realize) and, once it crosses either level, calls
+`execution.sell(symbol, reason="stop_loss"|"take_profit")` and drops the entry. A transient
+bid-fetch failure just skips that symbol for the round — it stays tracked and is checked again on
+the next poll, same transient-vs-terminal philosophy as the order-status polling above. `sell()`
+also pops any tracked symbol from `_crypto_stops` on an explicit/Dealer-driven SELL, so the poller
+never double-sells.
 
 ## EOD Report (`src/eod_report/`)
 

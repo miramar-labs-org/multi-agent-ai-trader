@@ -20,7 +20,11 @@ def poll_bracket_fills():
     asynchronously on Alpaca's side -- outside of any /execute request/response cycle, so this is
     the only place those fills ever get observed and reported. Also reports a bracket that goes
     terminal with no fill at all (both legs canceled/expired/rejected) -- that's a silent gap
-    otherwise, since no /execute response ever covers it."""
+    otherwise, since no /execute response ever covers it.
+
+    Also checks tracked crypto synthetic stop-loss/take-profit levels on the same cadence --
+    crypto has no server-side bracket equivalent (Alpaca's bracket orders are equity-only), so
+    this poller is the only place a crypto exit is ever triggered."""
     while True:
         try:
             for event in execution.check_bracket_fills():
@@ -43,6 +47,15 @@ def poll_bracket_fills():
                         "no_fill",
                         f"bracket legs closed with no fill ({statuses}): {event['order_id']}",
                     )
+            for event in execution.check_crypto_stops():
+                log(f"🎯 synthetic {event['reason']} triggered for {event['symbol']} @ {event['bid_price']}")
+                slack.notify_floor_broker_result(
+                    event["symbol"],
+                    "SELL",
+                    event["sell_result"]["status"],
+                    f"synthetic {event['reason']} triggered @ {event['bid_price']}: {event['sell_result']['detail']}",
+                    reason=event["reason"],
+                )
         except Exception as exc:
             log(f"💥 bracket-fill poll failed: {exc}")
         time.sleep(BRACKET_FILL_POLL_INTERVAL_S)

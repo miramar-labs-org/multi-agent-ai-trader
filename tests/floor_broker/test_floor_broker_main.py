@@ -51,6 +51,7 @@ def test_poll_bracket_fills_posts_no_fill_notice_for_a_terminal_event(monkeypatc
 
 def test_poll_bracket_fills_posts_nothing_when_no_events(monkeypatch):
     monkeypatch.setattr(fb_main.execution, "check_bracket_fills", lambda: [])
+    monkeypatch.setattr(fb_main.execution, "check_crypto_stops", lambda: [])
     posted = []
     monkeypatch.setattr(fb_main.slack, "notify_floor_broker_result", lambda *a, **k: posted.append((a, k)))
     monkeypatch.setattr(fb_main.time, "sleep", lambda s: (_ for _ in ()).throw(_StopLoop))
@@ -69,6 +70,54 @@ def test_poll_bracket_fills_survives_an_exception_and_reaches_the_next_sleep(mon
         raise RuntimeError("alpaca unavailable")
 
     monkeypatch.setattr(fb_main.execution, "check_bracket_fills", _raise)
+    monkeypatch.setattr(fb_main.time, "sleep", lambda s: (_ for _ in ()).throw(_StopLoop))
+
+    with pytest.raises(_StopLoop):
+        fb_main.poll_bracket_fills()
+
+
+def test_poll_bracket_fills_posts_slack_notification_for_a_crypto_stop_event(monkeypatch):
+    """check_crypto_stops() runs on the same poll cadence as check_bracket_fills() (no dedicated
+    thread) -- a triggered synthetic stop-loss/take-profit must be reported the same way a bracket
+    fill is."""
+    monkeypatch.setattr(fb_main.execution, "check_bracket_fills", lambda: [])
+    monkeypatch.setattr(
+        fb_main.execution,
+        "check_crypto_stops",
+        lambda: [
+            {
+                "symbol": "BTC/USD",
+                "reason": "stop_loss",
+                "bid_price": 49000.0,
+                "sell_result": {"status": "submitted", "detail": "market sell submitted"},
+            }
+        ],
+    )
+    posted = []
+    monkeypatch.setattr(fb_main.slack, "notify_floor_broker_result", lambda *a, **k: posted.append((a, k)))
+    monkeypatch.setattr(fb_main.time, "sleep", lambda s: (_ for _ in ()).throw(_StopLoop))
+
+    with pytest.raises(_StopLoop):
+        fb_main.poll_bracket_fills()
+
+    assert len(posted) == 1
+    args, kwargs = posted[0]
+    assert args[0] == "BTC/USD"
+    assert args[1] == "SELL"
+    assert args[2] == "submitted"
+    assert kwargs["reason"] == "stop_loss"
+    assert "49000.0" in args[3]
+
+
+def test_poll_bracket_fills_survives_a_crypto_stop_check_exception(monkeypatch):
+    """A transient error from check_crypto_stops() (e.g. a failed price fetch that wasn't already
+    swallowed inside it) must not kill the shared poll_bracket_fills thread."""
+    monkeypatch.setattr(fb_main.execution, "check_bracket_fills", lambda: [])
+
+    def _raise():
+        raise RuntimeError("alpaca unavailable")
+
+    monkeypatch.setattr(fb_main.execution, "check_crypto_stops", _raise)
     monkeypatch.setattr(fb_main.time, "sleep", lambda s: (_ for _ in ()).throw(_StopLoop))
 
     with pytest.raises(_StopLoop):

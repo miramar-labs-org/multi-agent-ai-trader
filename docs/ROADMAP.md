@@ -19,9 +19,9 @@ All trading remains **paper-only**. SELL operations that reduce exposure should 
 | P0.1 | Skip crypto orders below minimum notional | P0 | Done | — |
 | P0.2 | Validate merged-position budget semantics | P0 | Done | P0.1 |
 | P0.3 | Constrained Floor Broker request schema | P0 | Partial (see below) | — |
-| P0.4 | Centralized Floor Broker risk policy | P0 | Planned | P0.3 |
+| P0.4 | Centralized Floor Broker risk policy | P0 | Partial (narrower mechanism built; see below) | P0.3 |
 | P0.5 | Runtime BUY kill switch | P0 | Done (required behavior only; see below) | P0.4 |
-| P0.6 | Serialize risk check and order submission | P0 | Planned | P0.4 |
+| P0.6 | Serialize risk check and order submission | P0 | Planned (see below) | P0.4 |
 | P0.7 | Idempotent execution and Alpaca client order IDs | P0 | Planned | P0.3 |
 | P0.8 | Single-quote stock sizing | P0 | Done | — |
 | P0.9 | Quantity and bracket-price invariant checks | P0 | Done | P0.8 |
@@ -37,7 +37,7 @@ All trading remains **paper-only**. SELL operations that reduce exposure should 
 | P1.5 | Historical backtesting harness | P1 | Done (deterministic baselines only; see below) | P1.1 |
 | P1.6 | Deterministic baseline strategies | P1 | Done | P1.4 or P1.5 |
 | P1.7 | Resolve `size_hint` semantics | P1 | Planned | P1.1 |
-| P1.8 | Daily loss, trade-count, and aggregate exposure controls | P1 | Planned | P0.4, P1.1 |
+| P1.8 | Daily loss, trade-count, and aggregate exposure controls | P1 | Partial (daily P&L halt only; see below) | P0.4, P1.1 |
 | P1.9 | Core operational metrics | P1 | Planned | P1.1 |
 | P2.1 | Full Prometheus and Grafana observability | P2 | Planned | P1.9 |
 | P2.2 | Automatic circuit breakers | P2 | Planned | P1.8, P1.9 |
@@ -156,6 +156,17 @@ Reject unknown fields unless forward compatibility requires otherwise.
 
 ## P0.4 — Centralized Floor Broker risk policy
 
+**Partial — a narrower mechanism was built instead of this item's full spec.** Rather
+than a dedicated `src/floor_broker/risk.py` module with exposure-notional caps
+(`max_order_notional`/`max_symbol_exposure`/`max_total_exposure`/`max_open_positions`/
+`min_buying_power_reserve`), `/configure-strategy` (`skills/configure-strategy/SKILL.md`)
+and a `strategy:` config block cover only what that wizard asks about: a daily
+profit/loss halt and crypto synthetic stop-loss/take-profit, both enforced inline in
+`src/floor_broker/execution.py::buy()`/`check_pending_fills()`/`check_crypto_stops()` —
+see `docs/strategy.md` for the full design log. This was an explicit scope decision
+(narrower ask, narrower build) — the exposure-cap/notional-limit design below remains
+valid future work if that fuller scope is ever wanted; it has not been implemented.
+
 ### Problem
 
 The Dealer proposes trades, but the Floor Broker must be the final authority on whether a BUY is permissible.
@@ -264,6 +275,14 @@ Optional follow-up behavior:
 ---
 
 ## P0.6 — Serialize risk check and order submission
+
+**Still planned, not built.** The daily-halt/crypto-stop mechanism built for P0.4/P1.8
+(see those sections) has no account-wide lock — like the rest of `execution.py`, it
+reads state and acts on it without serializing against concurrent requests. This was a
+deliberate scope decision (the user explicitly asked for "nothing more complex" than a
+configurable strategy) rather than an oversight; it carries the same
+concurrent-request race this item describes and remains applicable if/when it's
+prioritized.
 
 ### Problem
 
@@ -792,6 +811,16 @@ Document whether `size_hint=0` means HOLD, a skipped BUY, or a valid zero-alloca
 ---
 
 ## P1.8 — Daily loss, trade-count, and aggregate exposure controls
+
+**Partial — only the daily-loss half was built, and via a narrower mechanism than
+described below.** `strategy.daily_profit_target_usd`/`daily_loss_limit_usd`
+(`config.yaml`, enforced in `src/floor_broker/execution.py::buy()`) block new BUYs once
+today's Alpaca account `equity - last_equity` crosses either bound — no
+`risk.py` module, no durable local event log, just a live Alpaca account-state read on
+every BUY. Trade-count limits, failed-submission-rate limits, per-asset-class aggregate
+exposure limits, and cooldown-after-rejection are not implemented. See
+`docs/strategy.md` for the design log and `docs/ROADMAP.md`'s P0.4 note above for the
+same scope decision.
 
 Extend `risk.py` with:
 

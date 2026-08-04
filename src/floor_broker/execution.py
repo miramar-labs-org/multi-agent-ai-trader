@@ -12,10 +12,13 @@ from alpaca.trading.requests import (
 )
 
 from src.common import kill_switch
-from src.common.alpaca_client import get_current_ask_price, trading_client
+from src.common.alpaca_client import get_current_ask_price, get_current_bid_price, trading_client
+from src.common.config import load_config
 from src.common.logging import get_logger
 
 log = get_logger("FLOOR")
+
+cfg = load_config()
 
 MIN_CRYPTO_NOTIONAL = 10.0  # Alpaca rejects a crypto notional below this (code 40310000)
 
@@ -53,6 +56,14 @@ _tracked_brackets: dict[str, str | dict] = {}
 # caveat as _tracked_brackets: an order that fills in the gap between the pod dying and
 # reconstruct_tracked_state() running on the new pod still produces no Slack notice for that fill.
 _pending_fills: dict[str, dict] = {}
+
+# Synthetic stop-loss/take-profit for open crypto positions, keyed by symbol, value (sl_price,
+# tp_price). Alpaca's bracket/OCO orders are equity-only (alpaca.trading.enums.OrderClass:
+# "Crypto trading: simple (or \"\")"), so crypto has no server-side SL/TP at all -- this dict plus
+# check_crypto_stops() below is the entire mechanism. In-memory only, same restart caveat as
+# _tracked_brackets/_pending_fills: a Floor Broker restart drops tracking for any crypto position
+# still open at the time, silently losing its stop/target until the next manual Dealer SELL.
+_crypto_stops: dict[str, tuple[float, float]] = {}
 
 # False from process start until reconcile_tracked_state_once() has succeeded at least once.
 # buy() refuses new BUYs while this is False (see below) -- submitting a fresh order before
@@ -96,7 +107,11 @@ def check_pending_fills() -> list[dict]:
         ctx.pop("poll_failures", None)
 
         if order.filled_avg_price is not None:
-            events.append({**ctx, "kind": "fill", "order_id": order_id, "fill_price": float(order.filled_avg_price)})
+            fill_price = float(order.filled_avg_price)
+            if ctx.get("crypto_slP") is not None:
+                _crypto_stops[ctx["symbol"]] = (fill_price * ctx["crypto_slP"], fill_price * ctx["crypto_tpP"])
+                log(f"🎯  tracking synthetic stop/target for {ctx['symbol']}: {_crypto_stops[ctx['symbol']]}")
+            events.append({**ctx, "kind": "fill", "order_id": order_id, "fill_price": fill_price})
             _pending_fills.pop(order_id, None)
         elif order.status in _TERMINAL_NO_FILL:
             events.append({**ctx, "kind": "terminal", "order_id": order_id, "order_status": order.status.value})
@@ -160,6 +175,27 @@ def check_bracket_fills() -> list[dict]:
 def _bracket_poll_failures(symbol: str) -> int:
     entry = _tracked_brackets.get(symbol)
     return entry["poll_failures"] if isinstance(entry, dict) else 0
+
+
+def check_crypto_stops() -> list[dict]:
+    """Polls every tracked crypto position's synthetic stop-loss/take-profit against its current
+    bid (the price an immediate market SELL would realize). A transient price-fetch failure just
+    skips that symbol this round -- it stays tracked and gets checked again on the next poll."""
+    events = []
+    for symbol, (sl_price, tp_price) in list(_crypto_stops.items()):
+        try:
+            bid = get_current_bid_price(symbol)
+        except APIError as exc:
+            log(f"💥  failed to fetch bid for tracked crypto stop {symbol}: {exc}")
+            continue
+
+        if bid <= sl_price or bid >= tp_price:
+            reason = "stop_loss" if bid <= sl_price else "take_profit"
+            _crypto_stops.pop(symbol, None)
+            result = sell(symbol, reason=reason)
+            events.append({"symbol": symbol, "reason": reason, "bid_price": bid, "sell_result": result})
+
+    return events
 
 
 def is_state_reconciled() -> bool:
@@ -351,6 +387,27 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
         log(f"🛑  BUY kill switch active -- skipping BUY {symbol}")
         return {"status": "skipped", "reason": "buy_kill_switch_active", "detail": "BUY kill switch is active"}
 
+    # strategy.daily_profit_target_usd/daily_loss_limit_usd (set by /configure-strategy) -- Alpaca's
+    # own account.equity/last_equity already handles the trading-day boundary, so no custom
+    # bookkeeping is needed. Only blocks new BUYs (halt_behavior: block_new_buys); SELL is
+    # unaffected, same as the kill switch above.
+    account = trading_client.get_account()
+    daily_pnl = float(account.equity) - float(account.last_equity)
+    if daily_pnl >= cfg.strategy.daily_profit_target_usd:
+        log(f"🛑  daily profit target reached (${daily_pnl:.2f}) -- skipping BUY {symbol}")
+        return {
+            "status": "skipped",
+            "reason": "daily_profit_target_reached",
+            "detail": f"daily P&L ${daily_pnl:.2f} >= target ${cfg.strategy.daily_profit_target_usd}",
+        }
+    if daily_pnl <= -cfg.strategy.daily_loss_limit_usd:
+        log(f"🛑  daily loss limit reached (${daily_pnl:.2f}) -- skipping BUY {symbol}")
+        return {
+            "status": "skipped",
+            "reason": "daily_loss_limit_reached",
+            "detail": f"daily P&L ${daily_pnl:.2f} <= -limit ${cfg.strategy.daily_loss_limit_usd}",
+        }
+
     op = get_open_position(symbol)
 
     oo = trading_client.get_orders(GetOrdersRequest(status="open"))
@@ -423,9 +480,15 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
         _tracked_brackets[symbol] = order.id
         sl_price = req.stop_loss.stop_price
         tp_price = req.take_profit.limit_price
+        crypto_slP = crypto_tpP = None
     else:
         sl_price = None
         tp_price = None
+        # No fill price is known yet for a notional market order -- store the strategy.crypto_slP/
+        # crypto_tpP multipliers here so check_pending_fills() can compute the actual sl_price/
+        # tp_price once the fill (and its real fill_price) is observed.
+        crypto_slP = cfg.strategy.crypto_slP
+        crypto_tpP = cfg.strategy.crypto_tpP
 
     _pending_fills[order.id] = {
         "symbol": symbol,
@@ -433,6 +496,8 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
         "reason": "opening_position",
         "sl_price": sl_price,
         "tp_price": tp_price,
+        "crypto_slP": crypto_slP,
+        "crypto_tpP": crypto_tpP,
     }
 
     return {
@@ -445,7 +510,7 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
     }
 
 
-def sell(symbol: str) -> dict:
+def sell(symbol: str, reason: str = "dealer_signal") -> dict:
     qty = get_open_position(symbol)
 
     if qty <= 0:
@@ -456,16 +521,19 @@ def sell(symbol: str) -> dict:
 
     # An explicit SELL closes the position, which also cancels any still-open TP/SL bracket legs
     # on Alpaca's side -- stop watching for a bracket fill on this symbol immediately rather than
-    # waiting for check_bracket_fills() to notice the legs went terminal with no fill.
+    # waiting for check_bracket_fills() to notice the legs went terminal with no fill. Same idea
+    # for a tracked synthetic crypto stop/target -- a manual/Dealer-driven SELL already closes the
+    # position, so check_crypto_stops() must not also try to sell it.
     _tracked_brackets.pop(symbol, None)
+    _crypto_stops.pop(symbol, None)
 
     try:
         order = trading_client.submit_order(req)
         log(f"✅  sell order submitted: {order.id}")
-        _pending_fills[order.id] = {"symbol": symbol, "action": "SELL", "reason": "dealer_signal", "sl_price": None, "tp_price": None}
+        _pending_fills[order.id] = {"symbol": symbol, "action": "SELL", "reason": reason, "sl_price": None, "tp_price": None}
         return {
             "status": "submitted",
-            "reason": "dealer_signal",
+            "reason": reason,
             "detail": f"sell order submitted: {order.id}",
             "order_id": order.id,
         }
@@ -495,10 +563,10 @@ def sell(symbol: str) -> dict:
             log("🔄  retrying after clean-up ...")
             order = trading_client.submit_order(req)
             log(f"✅  sell order submitted: {order.id}")
-            _pending_fills[order.id] = {"symbol": symbol, "action": "SELL", "reason": "dealer_signal", "sl_price": None, "tp_price": None}
+            _pending_fills[order.id] = {"symbol": symbol, "action": "SELL", "reason": reason, "sl_price": None, "tp_price": None}
             return {
                 "status": "submitted",
-                "reason": "dealer_signal",
+                "reason": reason,
                 "detail": f"sell order submitted: {order.id}",
                 "order_id": order.id,
             }
