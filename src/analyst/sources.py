@@ -6,6 +6,7 @@ from alpaca.data.historical.news import NewsClient
 from alpaca.data.requests import NewsRequest
 from bs4 import BeautifulSoup
 
+from src.common.alpaca_client import get_current_ask_price
 from src.common.logging import get_logger
 
 log = get_logger("ANALYST")
@@ -65,15 +66,24 @@ def fetch_screener_candidates(top_n: int, min_price: float = 0.0) -> list[dict]:
                 entry["price"] = item["price"]
 
     # Only "movers" items carry a price -- "most-actives" doesn't, so a candidate sourced only from
-    # most-actives has no price to filter on and passes through. Below-min-price candidates that do
-    # have a known price are dropped here (rather than left for Floor Broker to discover) since
-    # sub-$1 stocks can violate execution.py's SL/TP bracket invariants (see bracket_buy_with_SLTP's
-    # $0.02 floor/ceiling clamp) and are cheap to filter out before they ever reach the LLM.
+    # most-actives needs an explicit quote lookup before it can be judged against min_price; letting
+    # it through unpriced previously let sub-$1 symbols (e.g. a warrant) reach the LLM undetected.
+    # Below-min-price candidates are dropped here (rather than left for Floor Broker to discover)
+    # since sub-$1 stocks can violate execution.py's SL/TP bracket invariants (see
+    # bracket_buy_with_SLTP's $0.02 floor/ceiling clamp) and are cheap to filter out before they
+    # ever reach the LLM.
     all_candidates = list(by_symbol.values())
-    candidates = [c for c in all_candidates if c.get("price") is None or c["price"] >= min_price]
+    for c in all_candidates:
+        if c.get("price") is None:
+            try:
+                c["price"] = get_current_ask_price(c["symbol"])
+            except Exception as exc:
+                log(f"⚠️ failed to fetch a reference price for {c['symbol']}: {exc}")
+
+    candidates = [c for c in all_candidates if c.get("price") is not None and c["price"] >= min_price]
     dropped = len(all_candidates) - len(candidates)
     if dropped:
-        log(f"📉 dropped {dropped} screener candidate(s) below ${min_price:.2f} min price")
+        log(f"📉 dropped {dropped} screener candidate(s) below ${min_price:.2f} min price (or price unavailable)")
     log(f"📈 fetched {len(candidates)} screener candidates")
     return candidates
 
