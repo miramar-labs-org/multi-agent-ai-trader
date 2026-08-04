@@ -34,8 +34,18 @@ Runs once a day, early, before the market opens (8:55am Eastern — 35 minutes b
 - It reads recent news headlines and RSS feeds for those candidates.
 - For the biggest movers among those candidates, it pulls real technical indicator readings
   (RSI, MACD, VWAP, Bollinger Bands, SMA, EMA) from a third-party indicator service.
-- It hands all of that — news + real indicator numbers — to the AI model and asks it to pick
-  up to 10 symbols worth trading today, with a dollar budget and a written rationale for each.
+- It also reads back its own recent pick history — what it picked, why, what the Dealer decided
+  to do about each pick, and how the trade actually went — from a running log of past days. The
+  idea is to let it notice "I keep picking this pattern and it keeps losing" rather than judging
+  every day in isolation with no memory of yesterday. This is qualitative only for now (a plain
+  written history, not a computed profit/loss number) — see
+  [What this system is not (yet)](#what-this-system-is-not-yet) for why.
+- It hands all of that — news + real indicator numbers + its own recent track record — to the AI
+  model and asks it to pick up to 10 symbols worth trading today, with a dollar budget and a
+  written rationale for each.
+- Each of these inputs — news, indicators, and its own track record — can be switched off
+  independently in config. That's a safety switch: if one input turns out to be feeding the AI
+  bad information, it can be disabled on its own without touching the others.
 - It double-checks the AI's picks against the actual candidate list (so the AI can't invent a
   symbol that was never a real candidate), then publishes the day's watchlist for the Dealer to
   read.
@@ -147,7 +157,11 @@ agents hand off to each other. The handoff itself is deliberately simple:
   execution events are also written to a shared Postgres instance (`src/common/db.py`),
   fire-and-forget so a DB outage can never block a trading decision. This backs the
   `/analyst-explain` skill, which reads the actual logged Dealer reasoning back out to explain
-  a trading day rather than relying on Slack scrollback or raw logs.
+  a trading day rather than relying on Slack scrollback or raw logs — and, as of the track-record
+  feedback loop above, the Analyst itself also reads it back each morning as part of its own
+  decision-making, not just for after-the-fact human explanations. `/analyst-explain` can also
+  post its narrative to Slack, but only when explicitly asked to share it — it stays chat-only
+  by default.
 
 ## Where the "brain" comes from
 
@@ -186,9 +200,11 @@ its output reliably machine-usable.
 
 ## What this system is not (yet)
 
-- It does not remember whether its own past picks were actually good or bad — there's no
-  scoring or feedback loop from yesterday's trades into today's decisions yet. That's a planned
-  future improvement, not built.
+- It does not score whether its own past picks were actually good or bad in dollar terms. The
+  Analyst now reads back a plain-English history of its own recent picks and outcomes (see
+  "The Analyst" above), but that's a qualitative recap, not a computed win/loss or profit-and-loss
+  number — no live per-trade P&L tracking exists yet outside the offline backtesting tool, so
+  there's nothing to compute that scoring from.
 - It does not backtest the AI's actual historical decision-making. There is a separate,
   already-built backtesting tool (see [backtesting.md](backtesting.md)) that checks simple,
   rule-based strategies (buy-and-hold, plain RSI/MACD rules, etc.) against historical prices as
