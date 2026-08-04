@@ -490,9 +490,10 @@ their Alpaca keys and `SLACK_WEBHOOK_URL` — neither has a ServiceAccount/k8s A
 ## `notebook.ipynb`
 
 Unlike other Miramar KFP projects, this notebook is **not** a pipeline definition — it is a
-single markdown cell serving only as the target of the README's "Open in JupyterLab" badge,
-for ad-hoc interactive exploration. There is no KFP involvement anywhere in this project (see
-[platform-services.md](platform-services.md)).
+single markdown cell, gitignored and untracked (`af6b54d`), used only for local ad-hoc
+interactive exploration. The README's "Open in JupyterLab" badge that used to link to it was
+removed since nothing in this project's actual workflow depends on notebooks. There is no KFP
+involvement anywhere in this project (see [platform-services.md](platform-services.md)).
 
 ## Provenance
 

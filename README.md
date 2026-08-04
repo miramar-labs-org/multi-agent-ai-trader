@@ -1,7 +1,8 @@
 # multi-agent-ai-trader
 
-[![Open in JupyterLab](https://img.shields.io/badge/Open%20in-JupyterLab-F37626?logo=jupyter&logoColor=white)](http://localhost:8888/lab/tree/git-miramar-labs-org/projects/multi-agent-ai-trader/notebook.ipynb)
 [![Test and Lint](https://github.com/miramar-labs-org/multi-agent-ai-trader/actions/workflows/test-lint.yaml/badge.svg)](https://github.com/miramar-labs-org/multi-agent-ai-trader/actions/workflows/test-lint.yaml)
+[![Build and Push](https://github.com/miramar-labs-org/multi-agent-ai-trader/actions/workflows/build-push.yaml/badge.svg)](https://github.com/miramar-labs-org/multi-agent-ai-trader/actions/workflows/build-push.yaml)
+[![License: BSL 1.1](https://img.shields.io/badge/license-BSL%201.1-blue)](LICENSE)
 
 Multi-agent AI trading system (Analyst, Dealer, Floor Broker) trading on Alpaca, powered by a locally-hosted LLM on the DGX via k3s
 
