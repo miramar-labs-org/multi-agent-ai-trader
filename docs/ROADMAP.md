@@ -443,6 +443,7 @@ Initial reason codes:
 - `insufficient_qty`;
 - `risk_limit_exceeded`;
 - `buy_kill_switch_active`;
+- `state_not_reconciled`;
 - `invalid_order_parameters`;
 - `alpaca_rejected`;
 - `alpaca_unavailable`;
@@ -458,11 +459,19 @@ Initial reason codes:
 | Existing state conflicts with requested BUY | 409 |
 | Request violates domain or risk policy | 422 |
 | BUY kill switch active | 423 |
+| Tracked state not yet reconciled with Alpaca after restart | 503, `retryable=true` |
 | Alpaca timeout, connectivity failure, or temporary unavailability | 503 |
 | Malformed or unrecognized upstream response | 502 |
 | Unexpected internal failure | 500 |
 
 Known Alpaca business rejections should preserve the upstream error code and use `retryable=false` unless explicitly known to be transient.
+
+`state_not_reconciled` (added by the async fill-watcher's restart-recovery mechanism, see
+`docs/architecture.md`) is `status="skipped"`/HTTP 200 for now, matching every other declined-BUY
+outcome under the current, pre-P0.10 contract -- not a deliberate design choice, just consistent
+with what already exists until this section's full contract lands. It's a valid 503 candidate
+above (the request may succeed later unchanged, unlike e.g. an invalid order), not 423 (it's not
+an operator-controlled lock like the kill switch) or a domain-specific 409/422.
 
 ### Acceptance criteria
 
