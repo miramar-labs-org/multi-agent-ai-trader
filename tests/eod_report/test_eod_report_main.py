@@ -19,12 +19,8 @@ class FakePosition:
 
 
 class FakeTradingClient:
-    def __init__(self, calendar, activities=None):
-        self._calendar = calendar
+    def __init__(self, activities=None):
         self._activities = activities or []
-
-    def get_calendar(self, request):
-        return self._calendar
 
     def get_account(self):
         return FakeAccount()
@@ -47,8 +43,7 @@ def _silence_slack(monkeypatch):
 def test_market_closed_posts_notification_and_skips_report(monkeypatch):
     """Regression: previously main() only logged locally on a closed market and returned -- a
     weekend/holiday CronJob run produced zero visible signal that anything happened at all."""
-    fake_client = FakeTradingClient(calendar=[])
-    monkeypatch.setattr(main, "trading_client", fake_client)
+    monkeypatch.setattr(main, "is_stock_market_open", lambda day: False)
     calls = _silence_slack(monkeypatch)
 
     main.main()
@@ -58,9 +53,10 @@ def test_market_closed_posts_notification_and_skips_report(monkeypatch):
 
 
 def test_open_market_sends_full_eod_report(monkeypatch):
-    fake_client = FakeTradingClient(calendar=["some trading day"], activities=[])
+    fake_client = FakeTradingClient(activities=[])
     monkeypatch.setattr(main, "trading_client", fake_client)
     monkeypatch.setattr(eod, "trading_client", fake_client)
+    monkeypatch.setattr(main, "is_stock_market_open", lambda day: True)
     calls = _silence_slack(monkeypatch)
 
     main.main()
@@ -79,8 +75,9 @@ def test_alpaca_failure_notifies_error_and_reraises(monkeypatch):
         def get_account(self):
             raise RuntimeError("alpaca unavailable")
 
-    fake_client = FailingTradingClient(calendar=["some trading day"])
+    fake_client = FailingTradingClient()
     monkeypatch.setattr(main, "trading_client", fake_client)
+    monkeypatch.setattr(main, "is_stock_market_open", lambda day: True)
     calls = _silence_slack(monkeypatch)
 
     try:

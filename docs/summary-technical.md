@@ -11,7 +11,7 @@ Four independent Python services, each its own Docker image and k8s workload on 
 k3s cluster, coordinated with no queue and no database:
 
 ```
-06:00 UTC CronJob          continuous Deployment           Deployment+Service
+08:55 ET CronJob           continuous Deployment           Deployment+Service
 ┌───────────┐  writes   ┌───────────────┐  ConfigMap  ┌────────────────┐
 │  Analyst  │ ────────► │ "portfolio"   │ ◄────read── │     Dealer     │
 │ screener  │           │  ConfigMap    │   every     │ indicators→LLM │
@@ -54,14 +54,20 @@ Every `main.py` is its container's entrypoint (`python -m src.<service>.main`). 
 
 ## Analyst — picks the watchlist
 
-Entrypoint: `python -m src.analyst.main`, `batch/v1 CronJob` `0 6 * * *`,
-`concurrencyPolicy: Forbid` (no racing runs against the shared ConfigMap).
+Entrypoint: `python -m src.analyst.main`, `batch/v1 CronJob` `55 8 * * *` (`timeZone:
+America/New_York`), `concurrencyPolicy: Forbid` (no racing runs against the shared ConfigMap).
 
 `src/analyst/graph.py` is a LangGraph state machine (`discover_candidates → fetch_research →
 fetch_indicators → llm_select → validate_selection → write_portfolio → crypto_eod_report`):
 
 - `discover_candidates` — Alpaca screener REST calls (most-actives/movers) merged into a
-  symbol→{volume, change_pct} dict, tagged with a `market` field.
+  symbol→{volume, change_pct} dict, tagged with a `market` field. Gated on
+  `state["stock_market_open"]` (computed once in `main.py` via
+  `src/common/market_calendar.py::is_stock_market_open`) — on a closed stock-market day the
+  stock branch is skipped, but crypto discovery is unconditional (crypto trades 24/7), so
+  Analyst still runs and picks crypto symbols. `write_portfolio` passes the same flag to
+  `slack.notify_morning_report(..., stock_market_open=..., crypto_enabled=...)`, which prepends
+  a "stock market is closed" banner (mentioning that crypto trading continues, if enabled).
 - `fetch_research` — Alpaca News API + Yahoo RSS, plain text, no vector store or RAG.
 - `fetch_indicators` — top-N by `abs(change_pct)` get a real TAAPI `/bulk` fetch
   (`src.common.indicators.fetch_indicators_bulk`, shared with Dealer).

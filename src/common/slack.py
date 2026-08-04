@@ -38,12 +38,26 @@ def _post(text: str) -> None:
         log(f"⚠️ Slack post failed: {exc}")
 
 
-def notify_morning_report(report_date: str, account: dict, symbols: list[dict]) -> None:
-    lines = [
-        f"🌅 *Morning Market Report — {report_date}*",
+def notify_morning_report(
+    report_date: str,
+    account: dict,
+    symbols: list[dict],
+    *,
+    stock_market_open: bool = True,
+    crypto_enabled: bool = False,
+) -> None:
+    lines = [f"🌅 *Morning Market Report — {report_date}*"]
+
+    if not stock_market_open:
+        note = "🔒 Stock market is closed today"
+        if crypto_enabled:
+            note += " — crypto trading continues 24/7"
+        lines.append(note)
+
+    lines.append(
         f"Equity ${account['equity']:,.2f} | Cash ${account['cash']:,.2f}"
-        f" | Buying Power ${account['buying_power']:,.2f}",
-    ]
+        f" | Buying Power ${account['buying_power']:,.2f}"
+    )
 
     if symbols:
         lines.append(f"\n*Today's picks ({len(symbols)}):*")

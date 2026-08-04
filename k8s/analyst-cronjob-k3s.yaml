@@ -4,7 +4,12 @@ metadata:
   name: analyst
   namespace: multi-agent-ai-trader
 spec:
-  schedule: "0 6 * * *"  # daily 06:00 UTC, before US market open — matches config.yaml's analyst.schedule
+  # 08:55 America/New_York -- lands the Morning Report ~30min before the 9:30 ET open (5min
+  # buffer for the ~5min compile time, dominated by the TAAPI indicator-fetch throttle). timeZone
+  # (not a fixed UTC offset) keeps this correct across DST without manual adjustment.
+  # Matches config.yaml's analyst.schedule -- keep both in sync.
+  schedule: "55 8 * * *"
+  timeZone: "America/New_York"
   concurrencyPolicy: Forbid
   jobTemplate:
     spec:

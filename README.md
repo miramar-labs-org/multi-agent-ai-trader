@@ -105,7 +105,7 @@ Broker rollouts plus a Floor Broker `/healthz` smoke test before finishing.
 
 ```sh
 kubectl get pods -n multi-agent-ai-trader
-# Force an immediate Analyst run instead of waiting for the daily 06:00 UTC schedule:
+# Force an immediate Analyst run instead of waiting for the daily 08:55 America/New_York schedule:
 kubectl create job --from=cronjob/analyst analyst-test -n multi-agent-ai-trader
 kubectl logs -n multi-agent-ai-trader job/analyst-test
 ```

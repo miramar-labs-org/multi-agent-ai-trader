@@ -31,7 +31,8 @@ eod_report:
                             # market close; runs every day so closed days get a Slack notice, not silence
 
 analyst:
-  schedule: "0 6 * * *"       # daily 06:00 UTC, before US market open
+  schedule: "55 8 * * *"      # informational copy of the CronJob's own spec.schedule — 08:55 America/New_York
+                               # daily (spec.timeZone), ~30min before the 9:30 ET open
   max_universe_size: 10
   default_budget: 5000
   screener_top_n: 20          # candidates pulled from Alpaca Screener before research/filtering

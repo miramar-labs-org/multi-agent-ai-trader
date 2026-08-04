@@ -28,12 +28,13 @@ class AnalystState(TypedDict):
     research_text: str
     indicator_text: str
     selection: dict | None
+    stock_market_open: bool
 
 
 def discover_candidates(state: AnalystState, cfg) -> AnalystState:
     candidates = []
 
-    if cfg.trading.enable_stocks:
+    if cfg.trading.enable_stocks and state["stock_market_open"]:
         stock_candidates = sources.fetch_screener_candidates(cfg.analyst.screener_top_n)
         for c in stock_candidates:
             c["market"] = "stocks"
@@ -151,14 +152,20 @@ def write_portfolio(state: AnalystState, cfg) -> AnalystState:
         "buying_power": float(account.buying_power),
     }
     report_date = datetime.now(pytz.timezone("US/Eastern")).date().isoformat()
-    slack.notify_morning_report(report_date, account_summary, payload["symbols"])
+    slack.notify_morning_report(
+        report_date,
+        account_summary,
+        payload["symbols"],
+        stock_market_open=state["stock_market_open"],
+        crypto_enabled=cfg.trading.enable_crypto,
+    )
     return state
 
 
 def crypto_eod_report(state: AnalystState, cfg) -> AnalystState:
     """Crypto trades 24/7, so it has no market close to hang an EOD report off of -- instead this
     rides along with the Analyst's morning run and covers the prior full ET calendar day, right
-    before today's new picks go out in notify_morning_report()."""
+    after today's new picks go out in write_portfolio()'s notify_morning_report()."""
     if not cfg.trading.enable_crypto:
         return state
 

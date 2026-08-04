@@ -1,12 +1,12 @@
 from datetime import datetime
 
 import pytz
-from alpaca.trading.requests import GetCalendarRequest
 
 from src.common import slack
 from src.common.alpaca_client import trading_client
 from src.common.eod import fetch_fills, summarize_positions
 from src.common.logging import get_logger
+from src.common.market_calendar import is_stock_market_open
 
 log = get_logger("EOD")
 
@@ -15,8 +15,7 @@ def main():
     eastern = pytz.timezone("US/Eastern")
     today = datetime.now(eastern).date()
 
-    calendar = trading_client.get_calendar(GetCalendarRequest(start=today, end=today))
-    if not calendar:
+    if not is_stock_market_open(today):
         log(f"📅 {today} was not a trading day — skipping EOD report.")
         # The CronJob runs daily (not just Mon-Fri) so a closed market still gets a Slack
         # notification -- a silent return here previously left weekends/holidays with zero

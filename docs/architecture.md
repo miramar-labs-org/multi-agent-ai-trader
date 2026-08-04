@@ -7,7 +7,7 @@ single-process script (`gpt-trader.py`) onto three independently-scaled k8s work
 communicate via a shared ConfigMap and plain HTTP, rather than a monolithic loop.
 
 ```
-                         06:00 UTC daily (k8s CronJob)
+                    08:55 America/New_York daily (k8s CronJob)
                          ┌─────────────────────────┐
                          │         Analyst          │
                          │  screener → news → LLM   │
@@ -77,9 +77,20 @@ service that can be replaced/restarted without losing any state (it holds none).
 
 ## Agent 1 — Analyst (`src/analyst/`)
 
-**Workload:** `batch/v1 CronJob`, schedule `0 6 * * *` (06:00 UTC, before US market open),
-`concurrencyPolicy: Forbid` (no overlapping runs), `backoffLimit: 1` — a failed research run
-is meant to surface immediately, not retry-storm. Entrypoint: `python -m src.analyst.main`.
+**Workload:** `batch/v1 CronJob`, schedule `55 8 * * *` with `timeZone: America/New_York`
+(08:55 ET, ~30min before the 9:30 ET open — the ~5min gap covers the run's own compile time,
+dominated by the TAAPI indicator-fetch throttle), `concurrencyPolicy: Forbid` (no overlapping
+runs), `backoffLimit: 1` — a failed research run is meant to surface immediately, not
+retry-storm. Entrypoint: `python -m src.analyst.main`.
+
+Runs every scheduled day regardless of whether the stock market is open — `main.py` checks
+`src/common/market_calendar.py::is_stock_market_open()` (same Alpaca calendar API EOD Report
+uses) once and threads the result into `AnalystState["stock_market_open"]`. On a closed day,
+`discover_candidates` skips only the stock screener branch; crypto discovery is unconditional
+(crypto trades 24/7), so Analyst still produces crypto picks. `write_portfolio` passes the flag
+to `slack.notify_morning_report(...)`, which prepends a banner noting the stock market is
+closed (and that crypto trading continues, when crypto is enabled) — unlike EOD Report, Analyst
+never skips its entire run on a closed day.
 
 **Purpose:** once a day, decide *which symbols are worth trading today* and hand that list
 off to the Dealer.
@@ -89,7 +100,7 @@ off to the Dealer.
 
 | Node | What it does |
 |---|---|
-| `discover_candidates` | when `cfg.trading.enable_stocks`, `sources.fetch_screener_candidates(screener_top_n=20)` — raw REST calls (not wrapped by `alpaca-py`) to Alpaca's `/v1beta1/screener/stocks/most-actives` and `/movers` endpoints, merged into a symbol→{volume, change_pct} dict, each tagged `market: "stocks"`. When `cfg.trading.enable_crypto`, also `sources.fetch_crypto_candidates(...)` — a fixed watchlist (`BTC/USD`, `ETH/USD`, `SOL/USD`; Alpaca's crypto screener has no most-actives equivalent) merged with `/v1beta1/screener/crypto/movers`, tagged `market: cfg.trading.crypto_taapi_exchange` |
+| `discover_candidates` | when `cfg.trading.enable_stocks` **and** `state["stock_market_open"]` (set once in `main.py`, see above), `sources.fetch_screener_candidates(screener_top_n=20)` — raw REST calls (not wrapped by `alpaca-py`) to Alpaca's `/v1beta1/screener/stocks/most-actives` and `/movers` endpoints, merged into a symbol→{volume, change_pct} dict, each tagged `market: "stocks"`. When `cfg.trading.enable_crypto`, also `sources.fetch_crypto_candidates(...)` — a fixed watchlist (`BTC/USD`, `ETH/USD`, `SOL/USD`; Alpaca's crypto screener has no most-actives equivalent) merged with `/v1beta1/screener/crypto/movers`, tagged `market: cfg.trading.crypto_taapi_exchange`. Crypto discovery is **not** gated on the stock-market-open flag — it always runs when enabled |
 | `fetch_research` | `sources.fetch_news(news_days=2)` (Alpaca News API, HTML stripped via BeautifulSoup) + `sources.fetch_yahoo_rss_headlines(...)` (Yahoo Finance RSS), concatenated into plain text |
 | `fetch_indicators` | ranks `raw_candidates` by `abs(change_pct)` (missing values sort last) and calls `src.common.indicators.fetch_indicators_bulk` (shared with the Dealer) for the top `cfg.analyst.indicator_fetch_limit` (default 15) — one TAAPI `/bulk` POST per symbol covering `rsi, macd, vwap, bbands, sma, ema`, sleeping `cfg.taapi.min_request_interval_secs` between calls to respect TAAPI's free-tier 1-req/15s cap. At the default limit this adds ~3.75 minutes to the once-daily run — accepted as a fixed cost of a pre-market CronJob, unlike the Dealer's 10-minute poll cycle where the same rate limit is a tighter constraint. Not every candidate gets indicator data; only the top movers by size do |
 | `llm_select` | the actual LLM call — see below |
@@ -130,7 +141,7 @@ own copy is never trusted as-is.
 **Output — the `portfolio` ConfigMap** (namespace `multi-agent-ai-trader`):
 ```json
 {
-  "generated_at": "2026-08-01T06:00:03Z",
+  "generated_at": "2026-08-01T12:55:03Z",
   "symbols": [
     {"symbol": "NVDA", "exchange": "stocks", "budget": 5000, "indicators": ["rsi","macd","vwap","bbands","sma","ema"], "rationale": "..."}
   ]
@@ -150,7 +161,8 @@ Right after that, a `crypto_eod_report` graph node (gated on `cfg.trading.enable
 second, crypto-only "Crypto EOD Report" to Slack covering the **prior full ET calendar day's**
 crypto fills/positions (`slack.notify_crypto_eod_report`). Crypto trades 24/7, so it has no market
 close to hang a report off of the way stocks do — rather than a separate always-on schedule, it
-piggybacks on the Analyst's existing daily 06:00 UTC run, right before the new day's picks. Uses
+piggybacks on the Analyst's existing daily 08:55 America/New_York run, right after the new
+day's picks go out (`write_portfolio` runs before `crypto_eod_report` in the graph). Uses
 the same `src.common.eod.fetch_fills`/`summarize_positions` helpers as the stock EOD Report below,
 filtered to crypto (`"/" in symbol`, the same convention `alpaca_client.get_current_ask_price`
 already uses to distinguish crypto tickers).
@@ -481,11 +493,14 @@ see [`docs/backtesting.md`](backtesting.md) for the full design and documented a
 
 ## Data flow — one full cycle
 
-1. **06:00 UTC** — Analyst CronJob pod starts.
-2. Discover ≤20 screener candidates (Alpaca `most-actives`/`movers`) → fetch 2 days of news +
-   Yahoo RSS headlines → LLM picks ≤10 symbols with budgets/indicators/rationale → written to
-   the `portfolio` ConfigMap → a "Morning Market Report" (picks + account balance) is posted to
-   Slack, still before market open → if `enable_crypto`, a crypto-only "Crypto EOD Report"
+1. **08:55 America/New_York** — Analyst CronJob pod starts (~30min before the 9:30 ET open).
+   `main.py` checks the Alpaca calendar once; if the stock market is closed today, the run
+   continues anyway (crypto still trades 24/7) rather than exiting early.
+2. Discover ≤20 screener candidates (Alpaca `most-actives`/`movers`, skipped if the stock
+   market is closed today) → fetch 2 days of news + Yahoo RSS headlines → LLM picks ≤10 symbols
+   with budgets/indicators/rationale → written to the `portfolio` ConfigMap → a "Morning Market
+   Report" (picks + account balance, prefixed with a closed-market banner if applicable) is
+   posted to Slack, before market open → if `enable_crypto`, a crypto-only "Crypto EOD Report"
    covering the prior full ET day's crypto fills/positions is posted right after.
 3. **Every 600s while the market is open** — Dealer reads the ConfigMap fresh, and for each
    symbol: fetches its configured indicators from TAAPI.io in one `/bulk` request (throttled
@@ -496,7 +511,7 @@ see [`docs/backtesting.md`](backtesting.md) for the full design and documented a
 5. Floor Broker's `{"status": "submitted"|"skipped"|"error"}` response is logged by Dealer and
    not persisted further — the eventual fill (`"executed"`, with `fill_price`) is reported later,
    asynchronously, via its own Slack post from `poll_pending_fills()` (ROADMAP P0.14).
-6. Repeat step 3 until market close; the cycle restarts fresh at 06:00 UTC the next day using
+6. Repeat step 3 until market close; the cycle restarts fresh at 08:55 America/New_York the next day using
    whatever portfolio the Analyst produces (or the prior day's, if the Analyst hasn't run yet
    or failed — the Dealer has no fallback logic here, it just reads whatever ConfigMap exists).
 7. **21:30 UTC daily** — independently of the above cycle, the EOD Report CronJob queries

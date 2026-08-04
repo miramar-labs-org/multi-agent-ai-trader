@@ -5,6 +5,38 @@ from src.common import slack
 _TIMESTAMP_RE = r"\d{2}:\d{2}:\d{2} (AM|PM)"
 
 
+def test_notify_morning_report_omits_closed_market_banner_when_market_is_open(monkeypatch):
+    posted = {}
+    monkeypatch.setattr(slack, "_post", lambda text: posted.update(text=text))
+
+    slack.notify_morning_report("2026-08-04", _account(), [])
+
+    assert "closed" not in posted["text"].lower()
+
+
+def test_notify_morning_report_mentions_closed_market_and_crypto_continuing(monkeypatch):
+    posted = {}
+    monkeypatch.setattr(slack, "_post", lambda text: posted.update(text=text))
+
+    slack.notify_morning_report("2026-08-04", _account(), [], stock_market_open=False, crypto_enabled=True)
+
+    text = posted["text"]
+    assert "stock market is closed" in text.lower()
+    assert "crypto" in text.lower()
+    assert "24/7" in text
+
+
+def test_notify_morning_report_closed_market_omits_crypto_mention_when_crypto_disabled(monkeypatch):
+    posted = {}
+    monkeypatch.setattr(slack, "_post", lambda text: posted.update(text=text))
+
+    slack.notify_morning_report("2026-08-04", _account(), [], stock_market_open=False, crypto_enabled=False)
+
+    text = posted["text"]
+    assert "stock market is closed" in text.lower()
+    assert "crypto" not in text.lower()
+
+
 def test_notify_dealer_signal_includes_timestamp(monkeypatch):
     posted = {}
     monkeypatch.setattr(slack, "_post", lambda text: posted.update(text=text))

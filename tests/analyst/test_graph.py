@@ -17,6 +17,87 @@ def _cfg(enable_crypto: bool):
     return OmegaConf.create({"trading": {"enable_crypto": enable_crypto}})
 
 
+def test_discover_candidates_skips_stocks_when_market_closed(monkeypatch):
+    """Crypto trades 24/7 and must still be discovered on a day the stock market is closed --
+    only the stock screener branch is gated on stock_market_open."""
+    monkeypatch.setattr(graph.sources, "fetch_screener_candidates", lambda n: [{"symbol": "MGN"}])
+    monkeypatch.setattr(graph.sources, "fetch_crypto_candidates", lambda n: [{"symbol": "BTC/USD"}])
+    cfg = OmegaConf.create(
+        {
+            "trading": {"enable_stocks": True, "enable_crypto": True, "crypto_taapi_exchange": "binance"},
+            "analyst": {"screener_top_n": 20},
+        }
+    )
+    state = {
+        "raw_candidates": [],
+        "research_text": "",
+        "indicator_text": "",
+        "selection": None,
+        "stock_market_open": False,
+    }
+
+    result = graph.discover_candidates(state, cfg)
+
+    symbols = [c["symbol"] for c in result["raw_candidates"]]
+    assert symbols == ["BTC/USD"]
+
+
+def test_discover_candidates_includes_stocks_when_market_open(monkeypatch):
+    monkeypatch.setattr(graph.sources, "fetch_screener_candidates", lambda n: [{"symbol": "MGN"}])
+    monkeypatch.setattr(graph.sources, "fetch_crypto_candidates", lambda n: [])
+    cfg = OmegaConf.create(
+        {
+            "trading": {"enable_stocks": True, "enable_crypto": False, "crypto_taapi_exchange": "binance"},
+            "analyst": {"screener_top_n": 20},
+        }
+    )
+    state = {
+        "raw_candidates": [],
+        "research_text": "",
+        "indicator_text": "",
+        "selection": None,
+        "stock_market_open": True,
+    }
+
+    result = graph.discover_candidates(state, cfg)
+
+    assert [c["symbol"] for c in result["raw_candidates"]] == ["MGN"]
+
+
+class FakeAccountForPortfolio:
+    def __init__(self):
+        self.equity = "1000.00"
+        self.cash = "500.00"
+        self.buying_power = "2000.00"
+
+
+class FakeAccountClient:
+    def get_account(self):
+        return FakeAccountForPortfolio()
+
+
+def test_write_portfolio_passes_market_status_to_slack(monkeypatch):
+    monkeypatch.setattr(graph, "_write_portfolio", lambda payload: None)
+    monkeypatch.setattr(graph, "trading_client", FakeAccountClient())
+    captured = {}
+    monkeypatch.setattr(
+        graph.slack, "notify_morning_report", lambda *a, **k: captured.update(args=a, kwargs=k)
+    )
+    state = {
+        "raw_candidates": [],
+        "research_text": "",
+        "indicator_text": "",
+        "selection": {"symbols": []},
+        "stock_market_open": False,
+    }
+    cfg = OmegaConf.create({"trading": {"enable_crypto": True}})
+
+    graph.write_portfolio(state, cfg)
+
+    assert captured["kwargs"]["stock_market_open"] is False
+    assert captured["kwargs"]["crypto_enabled"] is True
+
+
 def test_validate_selection_overrides_llm_exchange_with_known_market():
     """The LLM sometimes echoes back the wrong exchange for a pick -- validate_selection must
     trust discover_candidates()'s own `market` tag, not the LLM's copy of the field."""
