@@ -4,7 +4,10 @@ name: Test and Lint
 # runner, matching build-push/deploy/undeploy — installs its own throwaway venv from
 # requirements-dev.txt (which pins the same ruff version used locally) rather than relying on
 # any tool already on the runner's PATH, so this job is reproducible independent of how the
-# runner host happens to be provisioned.
+# runner host happens to be provisioned. `python3-venv` itself is baked into the shared
+# mlabs-runner image (miramar-platform-gcp/mlabs-runner/Dockerfile) rather than apt-installed
+# here on every run -- that used to require sudo/root, modify the runner host, and add avoidable
+# runtime on every job (see docs/ROADMAP.md's P0.12 entry).
 #
 # ruff format --check is intentionally NOT run here yet — there is pre-existing formatting
 # drift across the repo that hasn't been cleaned up (see docs/architecture.md), so enforcing it
@@ -32,8 +35,6 @@ jobs:
 
       - name: Set up virtualenv
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq python3.11-venv
           python3.11 -m venv .venv-ci
           .venv-ci/bin/pip install --upgrade pip
           .venv-ci/bin/pip install -r requirements-dev.txt

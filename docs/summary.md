@@ -84,10 +84,12 @@ already been made. Its job is purely mechanical order execution and safety check
   size, it skips the trade rather than silently rounding it up past the intended budget.
 - **Selling:** sells the full position at market. If Alpaca briefly rejects the sell because of
   a conflicting order, it clears the blocker and retries automatically rather than giving up.
-- **Watching brackets fill:** a background check runs every 30 seconds looking for stop-loss or
-  take-profit legs that filled on their own (which can happen hours after the original buy, with
-  no direct request/response to hang a notification off of), and posts a Slack notice for each
-  one as it's detected.
+- **Watching orders fill:** buys and sells are submitted and acknowledged immediately rather than
+  waiting around for a fill, so two background checks each run every 30 seconds — one watching
+  for the original buy/sell itself filling, the other watching for stop-loss or take-profit legs
+  that filled on their own (which can happen hours after the original buy, with no direct
+  request/response to hang a notification off of) — and post a Slack notice for each one as it's
+  detected.
 
 Every buy and sell — along with every stop-loss/take-profit fill — gets posted to Slack with
 the fill price and reason, so there's a running, human-readable trail of everything the system

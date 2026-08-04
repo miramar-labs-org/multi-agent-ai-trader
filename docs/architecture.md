@@ -84,7 +84,7 @@ is meant to surface immediately, not retry-storm. Entrypoint: `python -m src.ana
 **Purpose:** once a day, decide *which symbols are worth trading today* and hand that list
 off to the Dealer.
 
-**Implementation:** a 6-node LangGraph state machine (`src/analyst/graph.py`) over an
+**Implementation:** a 7-node LangGraph state machine (`src/analyst/graph.py`) over an
 `AnalystState`:
 
 | Node | What it does |
@@ -95,6 +95,7 @@ off to the Dealer.
 | `llm_select` | the actual LLM call — see below |
 | `validate_selection` | overrides each pick's `exchange` field with the `market` tag `discover_candidates` actually assigned that symbol (never trusts the LLM's own copy of `exchange`), and drops any pick whose symbol isn't in `raw_candidates` at all (a hallucination) |
 | `write_portfolio` | patches the `portfolio` ConfigMap via the `kubernetes` Python client |
+| `crypto_eod_report` | gated on `cfg.trading.enable_crypto` — posts a crypto-only "Crypto EOD Report" to Slack covering the prior full ET day's crypto fills/positions; see below |
 
 ```mermaid
 flowchart TD
@@ -251,11 +252,14 @@ rather than raised; unexpected exceptions become a 500.
 
 `ExecuteResponse` also carries optional `reason`, `order_id`, `fill_price`, `sl_price`, `tp_price`
 fields (all `None` unless `execution.buy()`/`sell()` populate them — see below), so Dealer can
-forward the actual fill price and a stable reason code to Slack instead of only the request it
-sent. `reason` is one of `opening_position` (a BUY), `dealer_signal` (an explicit SELL from the
-Dealer's LLM decision), or `take_profit`/`stop_loss` (an asynchronous bracket-leg fill detected
-by the poller below — these never come back on the `/execute` HTTP response itself, only via the
-Slack post the poller sends directly).
+forward a stable reason code (and, for stock BUYs, the pre-computed bracket prices) to Slack
+instead of only the request it sent. `reason` is one of `opening_position` (a BUY), `dealer_signal`
+(an explicit SELL from the Dealer's LLM decision), or `take_profit`/`stop_loss` (an asynchronous
+bracket-leg fill detected by the poller below). As of ROADMAP P0.14, `/execute` itself never
+returns `fill_price` — BUY/SELL orders are submitted and the response comes back immediately with
+`status="submitted"`; the actual fill (`opening_position`/`dealer_signal`) and bracket-leg fills
+(`take_profit`/`stop_loss`) are both reported later, asynchronously, only via the Slack posts the
+pollers below send directly.
 
 **Order logic** (`src/floor_broker/execution.py`):
 - **`buy()`** — safety gate first: if an open position or open order already exists for the
@@ -279,39 +283,50 @@ Slack post the poller sends directly).
   it cancels the blocking orders (ignoring 404s), *re-fetches* the now-current open quantity
   (it can change once blockers clear), and resubmits.
 
-Both `buy()` and `sell()` call `_wait_for_fill(order_id)` after submission — a short bounded poll
-(`get_order_by_id`, up to `FILL_POLL_ATTEMPTS=5` tries, `FILL_POLL_INTERVAL_S=1.0` apart, ~5s
-total) that returns the order's `filled_avg_price` if it confirms filled in that window, or
-`None` otherwise (the caller/response simply omits `fill_price` — this is not treated as an
-error, since a market order not yet reflected as filled within 5s is normal, not exceptional).
+**Asynchronous order submission (ROADMAP P0.14).** Both `buy()` and `sell()` submit the order to
+Alpaca and return immediately with `status="submitted"` — they no longer block waiting to learn
+whether the order filled. `buy()` registers `order_id` in a module-level, in-memory dict,
+`_pending_fills: dict[order_id, context]` (symbol, action, reason, and — for stock BUYs — the
+pre-computed `sl_price`/`tp_price`); `sell()` does the same, minus the SL/TP prices. The
+`poll_pending_fills()` daemon thread (below) later resolves each entry to a fill (or drops it on
+a terminal non-fill status) and posts the actual fill price to Slack once known.
 
 **Async TP/SL fill detection.** A stock BUY's stop-loss/take-profit legs are a bracket
 (`OrderClass.BRACKET`, OCO) — whichever leg fills first, Alpaca auto-cancels the other, and
 neither fill is visible through the original `/execute` request/response cycle since it can
 happen minutes or hours later. To surface these as Slack notices, `buy()` registers the parent
-bracket order id in a module-level, in-memory dict, `_tracked_brackets: dict[symbol, order_id]`
-(stocks only — crypto has no bracket legs), and `sell()` removes the symbol from it immediately
-before submitting an explicit sell (so a manual/Dealer-driven SELL doesn't also get reported as
-a TP/SL fill once the bracket's legs are cancelled as a side effect).
+bracket order id in a second module-level, in-memory dict, `_tracked_brackets: dict[symbol,
+order_id]` (stocks only — crypto has no bracket legs), and `sell()` removes the symbol from it
+immediately before submitting an explicit sell (so a manual/Dealer-driven SELL doesn't also get
+reported as a TP/SL fill once the bracket's legs are cancelled as a side effect).
 
-`src/floor_broker/main.py` starts a daemon background thread, `poll_bracket_fills()`, alongside
-uvicorn's HTTP server in the same process. Every `BRACKET_FILL_POLL_INTERVAL_S` (30s) it calls
-`execution.check_bracket_fills()`, which re-fetches each tracked bracket order
-(`get_order_by_id(..., filter=GetOrderByIdRequest(nested=True))` for the `legs`), classifies a
-terminal leg by `OrderType` (`LIMIT` → `take_profit`, `STOP` → `stop_loss`) and `OrderStatus`
-(`FILLED` vs. `CANCELED`/`EXPIRED`/`REJECTED`), untracks the symbol once either leg reaches a
-terminal state, and returns one event dict per resolved fill. `main.py` posts each event to
-Slack via `slack.notify_floor_broker_result(..., reason=event["reason"],
-fill_price=event["fill_price"])`. The loop catches and logs any exception per iteration so one
-bad poll (e.g. a transient Alpaca API error) never kills the thread.
+`src/floor_broker/main.py` starts two daemon background threads alongside uvicorn's HTTP server
+in the same process:
+- **`poll_pending_fills()`** — every `PENDING_FILL_POLL_INTERVAL_S` (30s) calls
+  `execution.check_pending_fills()`, which re-fetches each tracked order by id and, once
+  `filled_avg_price` is populated, returns a fill event (dropping the entry once it does, or once
+  the order reaches a terminal non-fill status like `CANCELED`/`REJECTED`/`EXPIRED`). `main.py`
+  posts each event to Slack via `slack.notify_floor_broker_result(..., status="executed",
+  reason=event["reason"], fill_price=event["fill_price"])`.
+- **`poll_bracket_fills()`** — every `BRACKET_FILL_POLL_INTERVAL_S` (30s) calls
+  `execution.check_bracket_fills()`, which re-fetches each tracked bracket order
+  (`get_order_by_id(..., filter=GetOrderByIdRequest(nested=True))` for the `legs`), classifies a
+  terminal leg by `OrderType` (`LIMIT` → `take_profit`, `STOP` → `stop_loss`) and `OrderStatus`
+  (`FILLED` vs. `CANCELED`/`EXPIRED`/`REJECTED`), untracks the symbol once either leg reaches a
+  terminal state, and returns one event dict per resolved fill. `main.py` posts each event to
+  Slack the same way.
 
-**Limitation:** `_tracked_brackets` is in-memory and single-process, with no persistence across
-pod restarts — matches this repo's existing `_last_market_open`-style edge-detection pattern in
-Dealer. If Floor Broker restarts while a bracket is still open, that symbol drops out of
-tracking; the underlying TP/SL order still executes correctly on Alpaca's side (Alpaca owns the
-bracket, not Floor Broker), but the Slack notice for that particular fill is silently missed.
-Accepted tradeoff — Floor Broker already holds no other durable state (see the workload note
-above), and adding persistence here for one notification path isn't worth a new dependency.
+Both loops catch and log any exception per iteration so one bad poll (e.g. a transient Alpaca API
+error) never kills either thread.
+
+**Limitation:** `_tracked_brackets` and `_pending_fills` are both in-memory and single-process,
+with no persistence across pod restarts — matches this repo's existing `_last_market_open`-style
+edge-detection pattern in Dealer. If Floor Broker restarts while an order is still pending or a
+bracket still open, that entry drops out of tracking; the underlying order/TP/SL still executes
+correctly on Alpaca's side (Alpaca owns the order, not Floor Broker), but the Slack notice for
+that particular fill is silently missed. Accepted tradeoff — Floor Broker already holds no other
+durable state (see the workload note above), and adding persistence here for one notification
+path isn't worth a new dependency.
 
 **Runtime BUY kill switch (ROADMAP P0.5).** `src/common/kill_switch.py::buy_kill_switch_active()`
 reads the `buy-kill-switch` ConfigMap fresh (no caching) at the very top of `execution.buy()`,
@@ -439,8 +454,9 @@ see [`docs/backtesting.md`](backtesting.md) for the full design and documented a
    asks the LLM for BUY/HOLD/SELL, and (if not HOLD) POSTs to Floor Broker.
 4. Floor Broker fetches a live quote, runs the position/order safety check, and submits a
    bracket order (stocks) or notional market order (crypto) to Alpaca's paper account.
-5. Floor Broker's `{"status": "executed"|"skipped"|"error"}` response is logged by Dealer and
-   not persisted further.
+5. Floor Broker's `{"status": "submitted"|"skipped"|"error"}` response is logged by Dealer and
+   not persisted further — the eventual fill (`"executed"`, with `fill_price`) is reported later,
+   asynchronously, via its own Slack post from `poll_pending_fills()` (ROADMAP P0.14).
 6. Repeat step 3 until market close; the cycle restarts fresh at 06:00 UTC the next day using
    whatever portfolio the Analyst produces (or the prior day's, if the Analyst hasn't run yet
    or failed — the Dealer has no fallback logic here, it just reads whatever ConfigMap exists).

@@ -10,7 +10,7 @@ Trades are paper-only — see the [Alpaca paper trading dashboard](https://app.a
 
 ## What this is
 
-Three independently-deployed Kubernetes workloads that together run a daily equities
+Four independently-deployed Kubernetes workloads that together run a daily equities
 trading loop against Alpaca's **paper** trading account:
 
 - **Analyst** — a `CronJob` that runs once a day before market open, screens for candidate
@@ -172,17 +172,19 @@ context, and parse the response into a strict structured-output schema (via Lang
 `.with_structured_output()` — no hand-rolled JSON parsing). Both are implemented as small
 [LangGraph](https://langchain-ai.github.io/langgraph/) state machines:
 
-- **Analyst** (5 nodes): discover screener candidates (stocks and/or a fixed crypto watchlist,
-  per `trading.enable_stocks`/`enable_crypto`) → fetch news/RSS research → LLM picks up to 10
-  symbols with a budget and rationale each → validate each pick's exchange against the actual
-  candidate it came from (dropping any hallucinated symbol) → write the `portfolio` ConfigMap.
+- **Analyst** (7 nodes): discover screener candidates (stocks and/or a fixed crypto watchlist,
+  per `trading.enable_stocks`/`enable_crypto`) → fetch news/RSS research → fetch real TAAPI
+  indicators for the top candidates by move size → LLM picks up to 10 symbols with a budget
+  and rationale each → validate each pick's exchange against the actual candidate it came from
+  (dropping any hallucinated symbol) → write the `portfolio` ConfigMap → if crypto is enabled,
+  post a crypto-only EOD report to Slack.
 - **Dealer** (3 nodes, per symbol per poll): fetch technical indicators → LLM decides
   BUY/HOLD/SELL → if not HOLD, dispatch to Floor Broker over HTTP.
 
 Both LLM calls go through `langchain_openai.ChatOpenAI` against a single OpenAI-compatible
-`base_url` shared by the whole system (`config.yaml`'s `llm.base_url`) — this is intended to
-point at a vLLM endpoint serving a locally-hosted model on the DGX, so no external LLM API
-key is required for trading decisions themselves.
+`base_url` shared by the whole system (`config.yaml`'s `llm.base_url`) — this points at a
+locally-hosted model served by Ollama on the DGX (see `docs/models.md` for the Ollama-vs-vLLM
+decision), so no external LLM API key is required for trading decisions themselves.
 
 Floor Broker has no decision logic of its own — by the time it receives a request, the
 BUY/SELL call has already been made; it only handles order placement, safety checks
@@ -194,11 +196,11 @@ BUY/SELL call has already been made; it only handles order placement, safety che
 |---|---|---|
 | [Alpaca Trading API](https://docs.alpaca.markets/) | Floor Broker | The only component that places/cancels orders — bracket orders for stocks, notional market orders for crypto. Paper account only, hardcoded (not a config toggle). |
 | [Alpaca Market Data / Screener / News API](https://docs.alpaca.markets/) | Analyst, Dealer | Screener `most-actives`/`movers` endpoints and News API for Analyst's daily candidate research; live bid/ask quotes for Floor Broker's order sizing. |
-| [TAAPI.io](https://taapi.io/) | Dealer | Technical indicators (RSI, MACD, VWAP, Bollinger Bands, SMA, EMA) per watchlist symbol — a third-party service, unrelated to any Miramar platform component. |
+| [TAAPI.io](https://taapi.io/) | Analyst, Dealer | Technical indicators (RSI, MACD, VWAP, Bollinger Bands, SMA, EMA) — Analyst for its top candidates by move size (`fetch_indicators`, capped by `analyst.indicator_fetch_limit`), Dealer for every watchlist symbol each poll. A third-party service, unrelated to any Miramar platform component. |
 | Yahoo Finance RSS | Analyst | Supplementary headline research alongside Alpaca's News API. |
 | [LangSmith](https://www.langchain.com/langsmith) | Analyst, Dealer | Tracing for both LangGraph agent runs (optional, `config.yaml`'s `langsmith.enabled`). This is the tracing layer actually in use — not MLflow, despite MLflow appearing in the platform endpoint table below. |
 | [Slack](https://api.slack.com/messaging/webhooks) | Analyst, Dealer, Floor Broker, EOD Report | Incoming-webhook notifications for interesting events (morning report, BUY/SELL/HOLD signals, executions, EOD summary, errors) to `#miramar-trading-floor` — optional, `config.yaml`'s `slack.enabled`. |
-| OpenAI-compatible LLM endpoint (vLLM, planned) | Analyst, Dealer | Both agents' BUY/HOLD/SELL and symbol-selection decisions. Currently a placeholder in `config.yaml` pending a deployed vLLM serving endpoint. |
+| OpenAI-compatible LLM endpoint (Ollama on DGX) | Analyst, Dealer | Both agents' BUY/HOLD/SELL and symbol-selection decisions, served locally via Ollama (`config.yaml`'s `llm.base_url`/`llm.model`) — see `docs/models.md` for the Ollama-vs-vLLM decision. |
 
 ## Quick links
 

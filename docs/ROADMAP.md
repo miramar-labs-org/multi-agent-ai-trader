@@ -551,6 +551,16 @@ this hasn't caused a divergence, but it's a real gap between what CI tests and w
 production. The correct fix is baking Python 3.12 into the shared `mlabs-runner` image — an
 org-wide asset used by every repo, out of scope to change from here.
 
+`test-lint.yaml` used to `sudo apt-get install python3.11-venv` on every single run before
+creating `.venv-ci` -- requiring root on the runner, modifying the runner host's package set,
+adding an apt-repository dependency, avoidable runtime, and possible contention with concurrent
+build/deploy jobs on the same host. `python3-venv` is now baked into the shared `mlabs-runner`
+image itself (`miramar-platform-gcp/mlabs-runner/Dockerfile`), so `test-lint.yaml` only needs to
+create the venv, not install the tooling for it first. Same org-wide-asset caveat as the
+Python 3.11-vs-3.12 gap above: the Dockerfile change ships from `miramar-platform-gcp`, not from
+here, and the *running* runner container(s) on DGX/AGX must be rebuilt and redeployed before
+`test-lint.yaml`'s simplified step will actually pass in CI.
+
 ### Acceptance criteria
 
 - [x] CI runs automatically on pull requests (and on push).
