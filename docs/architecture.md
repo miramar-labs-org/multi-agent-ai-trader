@@ -304,29 +304,51 @@ reported as a TP/SL fill once the bracket's legs are cancelled as a side effect)
 in the same process:
 - **`poll_pending_fills()`** — every `PENDING_FILL_POLL_INTERVAL_S` (30s) calls
   `execution.check_pending_fills()`, which re-fetches each tracked order by id and, once
-  `filled_avg_price` is populated, returns a fill event (dropping the entry once it does, or once
-  the order reaches a terminal non-fill status like `CANCELED`/`REJECTED`/`EXPIRED`). `main.py`
-  posts each event to Slack via `slack.notify_floor_broker_result(..., status="executed",
-  reason=event["reason"], fill_price=event["fill_price"])`.
+  `filled_avg_price` is populated, returns a `kind="fill"` event (dropping the entry once it
+  does). If the order instead reaches a terminal non-fill status (`CANCELED`/`REJECTED`/
+  `EXPIRED`), it returns a `kind="terminal"` event instead, also dropping the entry — this is the
+  only place that outcome is ever observed, so it must be reported, not silently dropped.
+  `main.py` posts a fill event to Slack via `slack.notify_floor_broker_result(..., status=
+  "executed", reason=event["reason"], fill_price=event["fill_price"])`, and a terminal event via
+  `status="no_fill"`.
 - **`poll_bracket_fills()`** — every `BRACKET_FILL_POLL_INTERVAL_S` (30s) calls
   `execution.check_bracket_fills()`, which re-fetches each tracked bracket order
   (`get_order_by_id(..., filter=GetOrderByIdRequest(nested=True))` for the `legs`), classifies a
   terminal leg by `OrderType` (`LIMIT` → `take_profit`, `STOP` → `stop_loss`) and `OrderStatus`
   (`FILLED` vs. `CANCELED`/`EXPIRED`/`REJECTED`), untracks the symbol once either leg reaches a
-  terminal state, and returns one event dict per resolved fill. `main.py` posts each event to
-  Slack the same way.
+  terminal state, and returns a `kind="fill"` event per resolved fill or a `kind="terminal"` event
+  if both legs closed with no fill. `main.py` posts each event to Slack the same way (`"executed"`
+  vs. `"no_fill"`).
 
-Both loops catch and log any exception per iteration so one bad poll (e.g. a transient Alpaca API
-error) never kills either thread.
+**Transient-vs-terminal error handling.** A poll's `get_order_by_id()` call can itself fail —
+rate limit, timeout, an Alpaca-side 5xx. `execution._is_order_not_found()` only treats this as
+"nothing left to watch" for a *confirmed* 404 (Alpaca's code `40410000`, exposed as
+`ORDER_NOT_FOUND_CODE`); any other error, including one whose body doesn't even parse as JSON, is
+treated as transient — the entry stays tracked, and a `poll_failures` counter on it (visible on
+`_pending_fills[order_id]["poll_failures"]` or `_tracked_brackets[symbol]["poll_failures"]` once
+non-zero) is incremented and logged, then cleared again once the order is reachable. This means a
+brief Alpaca outage no longer silently stops watching a still-live order.
 
-**Limitation:** `_tracked_brackets` and `_pending_fills` are both in-memory and single-process,
-with no persistence across pod restarts — matches this repo's existing `_last_market_open`-style
-edge-detection pattern in Dealer. If Floor Broker restarts while an order is still pending or a
-bracket still open, that entry drops out of tracking; the underlying order/TP/SL still executes
-correctly on Alpaca's side (Alpaca owns the order, not Floor Broker), but the Slack notice for
-that particular fill is silently missed. Accepted tradeoff — Floor Broker already holds no other
-durable state (see the workload note above), and adding persistence here for one notification
-path isn't worth a new dependency.
+Both loops also catch and log any exception per iteration at the top level, so one bad poll (e.g.
+an exception outside `check_pending_fills()`/`check_bracket_fills()`'s own error handling) never
+kills either thread.
+
+**Restart recovery.** `_tracked_brackets` and `_pending_fills` are both in-memory and
+single-process, so a Floor Broker restart would otherwise lose track of every order/bracket that
+was still open at the moment it went down. `execution.reconstruct_tracked_state()` runs once at
+the top of `main()`, before either poll thread starts, and calls
+`trading_client.get_orders(GetOrdersRequest(status="open", nested=True))` — this queries at the
+order-*family* level (Alpaca's own semantics: a bracket whose entry already filled but whose
+TP/SL legs are still live still counts as "open"), so it correctly re-populates both dicts:
+orders with no legs go into `_pending_fills`, brackets with at least one still-open leg go into
+`_tracked_brackets`. Only orders still open on Alpaca are restorable this way — by definition
+nothing has filled yet, so no notification could have been missed by the restart itself.
+
+**Limitation:** the one remaining gap is a fill that happens *during* the restart window itself —
+between the old pod dying and `reconstruct_tracked_state()` running on the new one. The underlying
+order/TP/SL still executes correctly on Alpaca's side (Alpaca owns the order, not Floor Broker)
+regardless, but the Slack notice for that specific fill is missed. This is a narrow window (pod
+restart time), not the full "no persistence at all" gap this section used to describe.
 
 **Runtime BUY kill switch (ROADMAP P0.5).** `src/common/kill_switch.py::buy_kill_switch_active()`
 reads the `buy-kill-switch` ConfigMap fresh (no caching) at the very top of `execution.buy()`,

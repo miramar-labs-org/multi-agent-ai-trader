@@ -18,6 +18,8 @@ log = get_logger("FLOOR")
 
 MIN_CRYPTO_NOTIONAL = 10.0  # Alpaca rejects a crypto notional below this (code 40310000)
 
+ORDER_NOT_FOUND_CODE = 40410000  # Alpaca's code for "no order exists with that id"
+
 _TERMINAL_NO_FILL = {OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED}
 
 
@@ -33,36 +35,61 @@ class InsufficientQuantity(InvalidOrderParameters):
     buy() turns this into a normal status="skipped" outcome rather than propagating."""
 
 # Tracks the parent order id of each open bracket BUY, keyed by symbol, so the fill-watcher
-# (check_bracket_fills) can later find out which of its TP/SL legs eventually filled. In-memory
-# only -- lost on a Floor Broker pod restart, meaning a bracket that fills while the pod is down
-# won't produce a Slack notice for that fill (the trade itself still executes fine on Alpaca's
-# side, only the notification is missed).
-_tracked_brackets: dict[str, str] = {}
+# (check_bracket_fills) can later find out which of its TP/SL legs eventually filled. Value is
+# either a plain order-id string (the normal case) or, once a poll has hit a transient error for
+# that symbol, {"order_id": str, "poll_failures": int}. In-memory only -- reconstruct_tracked_state()
+# rebuilds this from Alpaca's own open-orders state on process start, but only for brackets still
+# open on Alpaca; a bracket that fills in the gap between the pod dying and reconstruct running
+# still produces no Slack notice for that one fill (the trade itself executes fine either way).
+_tracked_brackets: dict[str, str | dict] = {}
 
 # Tracks every order buy()/sell() itself submitted, keyed by order id, so check_pending_fills()
 # can later report that order's own fill (ROADMAP P0.14) -- distinct from _tracked_brackets
-# above, which is only for a bracket's *child* TP/SL legs. Same in-memory-only caveat as
-# _tracked_brackets: lost on a pod restart, so a fill observed while the pod is down produces no
-# Slack notice (the trade itself still executes fine on Alpaca's side).
+# above, which is only for a bracket's *child* TP/SL legs. Same in-memory + reconstruct-on-start
+# caveat as _tracked_brackets: an order that fills in the gap between the pod dying and
+# reconstruct_tracked_state() running on the new pod still produces no Slack notice for that fill.
 _pending_fills: dict[str, dict] = {}
+
+
+def _is_order_not_found(exc: APIError) -> bool:
+    """True only for a confirmed "no such order" response. Any other shape -- a genuinely
+    different code, or a non-JSON/malformed error body (e.g. a raw network exception) -- must be
+    treated as transient rather than assumed to mean not-found, since dropping tracked state
+    should require positive confirmation, not just an unparseable error."""
+    try:
+        return exc.code == ORDER_NOT_FOUND_CODE
+    except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
+        return False
 
 
 def check_pending_fills() -> list[dict]:
     """Polls every order buy()/sell() submitted for its own fill -- /execute now returns
     status="submitted" before this is known (ROADMAP P0.14), so this is the only place a
-    submitted order's fill is ever observed and reported."""
+    submitted order's fill is ever observed and reported.
+
+    A transient APIError (rate limit, timeout, Alpaca-side 5xx) must not drop the entry -- that
+    would silently stop watching a live order. Only a confirmed 404 (the order genuinely no
+    longer exists) removes it without a fill ever being observed."""
     events = []
     for order_id, ctx in list(_pending_fills.items()):
         try:
             order = trading_client.get_order_by_id(order_id)
-        except APIError:
-            _pending_fills.pop(order_id, None)
+        except APIError as exc:
+            if _is_order_not_found(exc):
+                log(f"⚠️  pending order {order_id} ({ctx['symbol']}) no longer exists on Alpaca -- dropping")
+                _pending_fills.pop(order_id, None)
+            else:
+                ctx["poll_failures"] = ctx.get("poll_failures", 0) + 1
+                log(f"💥  poll failure #{ctx['poll_failures']} for pending order {order_id} ({ctx['symbol']}): {exc}")
             continue
 
+        ctx.pop("poll_failures", None)
+
         if order.filled_avg_price is not None:
-            events.append({**ctx, "order_id": order_id, "fill_price": float(order.filled_avg_price)})
+            events.append({**ctx, "kind": "fill", "order_id": order_id, "fill_price": float(order.filled_avg_price)})
             _pending_fills.pop(order_id, None)
         elif order.status in _TERMINAL_NO_FILL:
+            events.append({**ctx, "kind": "terminal", "order_id": order_id, "order_status": order.status.value})
             _pending_fills.pop(order_id, None)
 
     return events
@@ -71,13 +98,23 @@ def check_pending_fills() -> list[dict]:
 def check_bracket_fills() -> list[dict]:
     """Polls every tracked bracket BUY for a TP or SL leg that has since filled. A bracket's two
     child legs are OCO (one-cancels-other) on Alpaca's side -- once either fills, the other is
-    auto-cancelled, so a symbol is untracked as soon as either outcome is observed."""
+    auto-cancelled, so a symbol is untracked as soon as either outcome is observed.
+
+    Same transient-vs-terminal distinction as check_pending_fills: a non-404 APIError keeps the
+    symbol tracked and just records the failure."""
     events = []
-    for symbol, order_id in list(_tracked_brackets.items()):
+    for symbol, entry in list(_tracked_brackets.items()):
+        order_id = entry["order_id"] if isinstance(entry, dict) else entry
         try:
             order = trading_client.get_order_by_id(order_id, filter=GetOrderByIdRequest(nested=True))
-        except APIError:
-            _tracked_brackets.pop(symbol, None)
+        except APIError as exc:
+            if _is_order_not_found(exc):
+                log(f"⚠️  tracked bracket order {order_id} ({symbol}) no longer exists on Alpaca -- dropping")
+                _tracked_brackets.pop(symbol, None)
+            else:
+                failures = _bracket_poll_failures(symbol) + 1
+                _tracked_brackets[symbol] = {"order_id": order_id, "poll_failures": failures}
+                log(f"💥  poll failure #{failures} for tracked bracket {order_id} ({symbol}): {exc}")
             continue
 
         legs = order.legs or []
@@ -85,6 +122,7 @@ def check_bracket_fills() -> list[dict]:
         if filled_leg is not None:
             events.append(
                 {
+                    "kind": "fill",
                     "symbol": symbol,
                     "order_id": filled_leg.id,
                     "reason": "take_profit" if filled_leg.type == OrderType.LIMIT else "stop_loss",
@@ -94,9 +132,63 @@ def check_bracket_fills() -> list[dict]:
             )
             _tracked_brackets.pop(symbol, None)
         elif legs and all(leg.status in _TERMINAL_NO_FILL for leg in legs):
+            events.append(
+                {
+                    "kind": "terminal",
+                    "symbol": symbol,
+                    "order_id": order_id,
+                    "leg_statuses": [leg.status.value for leg in legs],
+                }
+            )
             _tracked_brackets.pop(symbol, None)
+        else:
+            _tracked_brackets[symbol] = order_id
 
     return events
+
+
+def _bracket_poll_failures(symbol: str) -> int:
+    entry = _tracked_brackets.get(symbol)
+    return entry["poll_failures"] if isinstance(entry, dict) else 0
+
+
+def reconstruct_tracked_state() -> None:
+    """Rebuilds _pending_fills and _tracked_brackets from Alpaca's own open-orders state on
+    startup -- both dicts are in-memory only, so a Floor Broker restart otherwise loses track of
+    every order/bracket that was still open at the moment it went down, silently dropping their
+    eventual fill notifications.
+
+    GetOrdersRequest(status="open") queries at the order-*family* level (per Alpaca's own
+    semantics, distinct from an individual leg's OrderStatus) -- a bracket whose entry already
+    filled but whose TP/SL legs are still live is still "open" here, so nested=True correctly
+    surfaces it as a parent with its legs attached, the same shape check_bracket_fills expects.
+    Only orders still open on Alpaca are restored -- by definition nothing has filled yet, so no
+    notification could have been missed by the restart."""
+    try:
+        open_orders = trading_client.get_orders(GetOrdersRequest(status="open", nested=True))
+    except APIError as exc:
+        log(f"💥  failed to reconstruct tracked orders from Alpaca after restart: {exc}")
+        return
+
+    restored_pending = 0
+    restored_brackets = 0
+    for order in open_orders:
+        legs = order.legs or []
+        if legs:
+            if any(leg.status not in _TERMINAL_NO_FILL for leg in legs):
+                _tracked_brackets[order.symbol] = order.id
+                restored_brackets += 1
+        elif order.filled_avg_price is None and order.status not in _TERMINAL_NO_FILL:
+            _pending_fills[order.id] = {
+                "symbol": order.symbol,
+                "action": "BUY" if order.side == OrderSide.BUY else "SELL",
+                "reason": "reconstructed_after_restart",
+                "sl_price": None,
+                "tp_price": None,
+            }
+            restored_pending += 1
+
+    log(f"🔄  reconstructed {restored_pending} pending order(s) and {restored_brackets} bracket(s) from Alpaca")
 
 
 def get_open_position(symbol: str) -> float:
@@ -117,7 +209,7 @@ def cancel_related_orders(order_ids: list[str]) -> None:
             trading_client.cancel_order_by_id(oid)
             log(f"✅  cancelled conflicting order {oid}")
         except APIError as exc:
-            if exc.code != 40410000:
+            if exc.code != ORDER_NOT_FOUND_CODE:
                 raise
 
 

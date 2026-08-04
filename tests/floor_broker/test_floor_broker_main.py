@@ -12,7 +12,7 @@ def test_poll_bracket_fills_posts_slack_notification_for_each_event(monkeypatch)
     monkeypatch.setattr(
         fb_main.execution,
         "check_bracket_fills",
-        lambda: [{"symbol": "MGN", "order_id": "leg-1", "reason": "take_profit", "fill_price": 15.0, "qty": 10.0}],
+        lambda: [{"kind": "fill", "symbol": "MGN", "order_id": "leg-1", "reason": "take_profit", "fill_price": 15.0, "qty": 10.0}],
     )
     posted = []
     monkeypatch.setattr(fb_main.slack, "notify_floor_broker_result", lambda *a, **k: posted.append((a, k)))
@@ -27,6 +27,26 @@ def test_poll_bracket_fills_posts_slack_notification_for_each_event(monkeypatch)
     assert args[1] == "SELL"
     assert kwargs["reason"] == "take_profit"
     assert kwargs["fill_price"] == 15.0
+
+
+def test_poll_bracket_fills_posts_no_fill_notice_for_a_terminal_event(monkeypatch):
+    monkeypatch.setattr(
+        fb_main.execution,
+        "check_bracket_fills",
+        lambda: [{"kind": "terminal", "symbol": "MGN", "order_id": "parent-1", "leg_statuses": ["canceled", "canceled"]}],
+    )
+    posted = []
+    monkeypatch.setattr(fb_main.slack, "notify_floor_broker_result", lambda *a, **k: posted.append((a, k)))
+    monkeypatch.setattr(fb_main.time, "sleep", lambda s: (_ for _ in ()).throw(_StopLoop))
+
+    with pytest.raises(_StopLoop):
+        fb_main.poll_bracket_fills()
+
+    assert len(posted) == 1
+    args, kwargs = posted[0]
+    assert args[0] == "MGN"
+    assert args[1] == "SELL"
+    assert args[2] == "no_fill"
 
 
 def test_poll_bracket_fills_posts_nothing_when_no_events(monkeypatch):
@@ -61,6 +81,7 @@ def test_poll_pending_fills_posts_slack_notification_for_each_event(monkeypatch)
         "check_pending_fills",
         lambda: [
             {
+                "kind": "fill",
                 "symbol": "MGN",
                 "action": "BUY",
                 "reason": "opening_position",
@@ -86,6 +107,36 @@ def test_poll_pending_fills_posts_slack_notification_for_each_event(monkeypatch)
     assert kwargs["fill_price"] == 10.05
     assert kwargs["sl_price"] == 9.8
     assert kwargs["tp_price"] == 10.5
+
+
+def test_poll_pending_fills_posts_no_fill_notice_for_a_terminal_event(monkeypatch):
+    monkeypatch.setattr(
+        fb_main.execution,
+        "check_pending_fills",
+        lambda: [
+            {
+                "kind": "terminal",
+                "symbol": "MGN",
+                "action": "BUY",
+                "reason": "opening_position",
+                "order_id": "order-1",
+                "order_status": "rejected",
+            }
+        ],
+    )
+    posted = []
+    monkeypatch.setattr(fb_main.slack, "notify_floor_broker_result", lambda *a, **k: posted.append((a, k)))
+    monkeypatch.setattr(fb_main.time, "sleep", lambda s: (_ for _ in ()).throw(_StopLoop))
+
+    with pytest.raises(_StopLoop):
+        fb_main.poll_pending_fills()
+
+    assert len(posted) == 1
+    args, kwargs = posted[0]
+    assert args[0] == "MGN"
+    assert args[1] == "BUY"
+    assert args[2] == "no_fill"
+    assert kwargs["reason"] == "opening_position"
 
 
 def test_poll_pending_fills_posts_nothing_when_no_events(monkeypatch):

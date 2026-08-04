@@ -2,7 +2,7 @@ import json
 
 import pytest
 from alpaca.common.exceptions import APIError
-from alpaca.trading.enums import OrderStatus, OrderType
+from alpaca.trading.enums import OrderSide, OrderStatus, OrderType
 
 from src.floor_broker import execution
 
@@ -10,6 +10,7 @@ from src.floor_broker import execution
 def _api_error(payload: dict) -> APIError:
     err = APIError.__new__(APIError)
     err.args = (json.dumps(payload),)
+    err._error = json.dumps(payload)
     return err
 
 
@@ -353,7 +354,7 @@ def test_check_bracket_fills_reports_take_profit_leg_filled(monkeypatch):
     events = execution.check_bracket_fills()
 
     assert events == [
-        {"symbol": "MGN", "order_id": "tp-leg-1", "reason": "take_profit", "fill_price": 13.50, "qty": 10.0}
+        {"kind": "fill", "symbol": "MGN", "order_id": "tp-leg-1", "reason": "take_profit", "fill_price": 13.50, "qty": 10.0}
     ]
     assert "MGN" not in execution._tracked_brackets
 
@@ -368,7 +369,7 @@ def test_check_bracket_fills_reports_stop_loss_leg_filled(monkeypatch):
     events = execution.check_bracket_fills()
 
     assert events == [
-        {"symbol": "MGN", "order_id": "sl-leg-1", "reason": "stop_loss", "fill_price": 9.80, "qty": 10.0}
+        {"kind": "fill", "symbol": "MGN", "order_id": "sl-leg-1", "reason": "stop_loss", "fill_price": 9.80, "qty": 10.0}
     ]
     assert "MGN" not in execution._tracked_brackets
 
@@ -387,7 +388,8 @@ def test_check_bracket_fills_keeps_tracking_while_both_legs_still_open(monkeypat
 
 def test_check_bracket_fills_untracks_symbol_when_both_legs_end_without_a_fill(monkeypatch):
     """e.g. the position was closed some other way and Alpaca cancelled both legs -- must stop
-    polling rather than track forever."""
+    polling rather than track forever, and must report the no-fill outcome rather than going
+    silent (nothing else ever covers this case)."""
     execution._tracked_brackets["MGN"] = "parent-1"
     legs = [FakeLeg("tp-leg-1", OrderStatus.CANCELED, OrderType.LIMIT), FakeLeg("sl-leg-1", OrderStatus.CANCELED, OrderType.STOP)]
     fake_client = FakeBracketTradingClient({"parent-1": FakeBracketOrder(legs)})
@@ -395,7 +397,9 @@ def test_check_bracket_fills_untracks_symbol_when_both_legs_end_without_a_fill(m
 
     events = execution.check_bracket_fills()
 
-    assert events == []
+    assert events == [
+        {"kind": "terminal", "symbol": "MGN", "order_id": "parent-1", "leg_statuses": ["canceled", "canceled"]}
+    ]
     assert "MGN" not in execution._tracked_brackets
 
 
@@ -434,17 +438,36 @@ def test_sell_still_permitted_when_kill_switch_active(monkeypatch):
     assert result["status"] == "submitted"
 
 
-def test_check_bracket_fills_untracks_symbol_on_api_error(monkeypatch):
-    """A cancelled/expired parent order can eventually 404 -- treat that as nothing left to
-    watch rather than retrying forever."""
+def test_check_bracket_fills_untracks_symbol_on_confirmed_not_found(monkeypatch):
+    """A cancelled/expired parent order can eventually 404 -- treat a *confirmed* not-found as
+    nothing left to watch rather than retrying forever."""
     execution._tracked_brackets["MGN"] = "parent-1"
-    fake_client = FakeBracketTradingClient({"parent-1": APIError("not found")})
+    fake_client = FakeBracketTradingClient({"parent-1": _api_error({"code": execution.ORDER_NOT_FOUND_CODE, "message": "order not found"})})
     monkeypatch.setattr(execution, "trading_client", fake_client)
 
     events = execution.check_bracket_fills()
 
     assert events == []
     assert "MGN" not in execution._tracked_brackets
+
+
+def test_check_bracket_fills_keeps_tracking_symbol_on_transient_api_error(monkeypatch):
+    """A rate limit / 5xx / network blip must not drop tracking -- that would silently stop
+    watching a still-live bracket. The symbol stays tracked and the failure is recorded so it
+    can be observed, distinct from a confirmed not-found."""
+    execution._tracked_brackets["MGN"] = "parent-1"
+    fake_client = FakeBracketTradingClient({"parent-1": _api_error({"code": 50000000, "message": "internal server error"})})
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    events = execution.check_bracket_fills()
+
+    assert events == []
+    assert execution._tracked_brackets["MGN"] == {"order_id": "parent-1", "poll_failures": 1}
+
+    events = execution.check_bracket_fills()
+
+    assert events == []
+    assert execution._tracked_brackets["MGN"] == {"order_id": "parent-1", "poll_failures": 2}
 
 
 class FakePendingOrder:
@@ -481,6 +504,7 @@ def test_check_pending_fills_reports_a_filled_order(monkeypatch):
             "reason": "opening_position",
             "sl_price": 9.8,
             "tp_price": 10.5,
+            "kind": "fill",
             "order_id": "order-1",
             "fill_price": 10.05,
         }
@@ -500,22 +524,141 @@ def test_check_pending_fills_keeps_tracking_an_unfilled_order(monkeypatch):
 
 
 def test_check_pending_fills_untracks_order_on_terminal_no_fill_status(monkeypatch):
+    """Rejected/canceled/expired must be reported, not go silent -- no /execute response ever
+    covers this outcome since it's only known after the fact."""
     execution._pending_fills["order-1"] = {"symbol": "MGN", "action": "BUY", "reason": "opening_position", "sl_price": None, "tp_price": None}
     fake_client = FakePendingFillTradingClient({"order-1": FakePendingOrder(filled_avg_price=None, status=OrderStatus.CANCELED)})
     monkeypatch.setattr(execution, "trading_client", fake_client)
 
     events = execution.check_pending_fills()
 
-    assert events == []
+    assert events == [
+        {
+            "symbol": "MGN",
+            "action": "BUY",
+            "reason": "opening_position",
+            "sl_price": None,
+            "tp_price": None,
+            "kind": "terminal",
+            "order_id": "order-1",
+            "order_status": "canceled",
+        }
+    ]
     assert "order-1" not in execution._pending_fills
 
 
-def test_check_pending_fills_untracks_order_on_api_error(monkeypatch):
+def test_check_pending_fills_untracks_order_on_confirmed_not_found(monkeypatch):
     execution._pending_fills["order-1"] = {"symbol": "MGN", "action": "BUY", "reason": "opening_position", "sl_price": None, "tp_price": None}
-    fake_client = FakePendingFillTradingClient({"order-1": APIError("not found")})
+    fake_client = FakePendingFillTradingClient({"order-1": _api_error({"code": execution.ORDER_NOT_FOUND_CODE, "message": "order not found"})})
     monkeypatch.setattr(execution, "trading_client", fake_client)
 
     events = execution.check_pending_fills()
 
     assert events == []
     assert "order-1" not in execution._pending_fills
+
+
+def test_check_pending_fills_keeps_tracking_order_on_transient_api_error(monkeypatch):
+    """A rate limit / 5xx / network blip must not drop tracking of a still-live order -- the
+    entry stays and the failure count is recorded on it."""
+    execution._pending_fills["order-1"] = {"symbol": "MGN", "action": "BUY", "reason": "opening_position", "sl_price": None, "tp_price": None}
+    fake_client = FakePendingFillTradingClient({"order-1": _api_error({"code": 50000000, "message": "internal server error"})})
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    events = execution.check_pending_fills()
+
+    assert events == []
+    assert execution._pending_fills["order-1"]["poll_failures"] == 1
+
+    events = execution.check_pending_fills()
+
+    assert events == []
+    assert execution._pending_fills["order-1"]["poll_failures"] == 2
+
+
+def test_check_pending_fills_clears_poll_failures_once_order_is_reachable_again(monkeypatch):
+    """A transient failure must not leave a stale poll_failures count behind once the order is
+    successfully observed again."""
+    execution._pending_fills["order-1"] = {
+        "symbol": "MGN",
+        "action": "BUY",
+        "reason": "opening_position",
+        "sl_price": None,
+        "tp_price": None,
+        "poll_failures": 3,
+    }
+    fake_client = FakePendingFillTradingClient({"order-1": FakePendingOrder(filled_avg_price=None, status=OrderStatus.NEW)})
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    execution.check_pending_fills()
+
+    assert "poll_failures" not in execution._pending_fills["order-1"]
+
+
+class FakeOrder:
+    def __init__(self, id, symbol, side, status, filled_avg_price=None, legs=None):
+        self.id = id
+        self.symbol = symbol
+        self.side = side
+        self.status = status
+        self.filled_avg_price = filled_avg_price
+        self.legs = legs
+
+
+class FakeReconstructTradingClient:
+    def __init__(self, open_orders):
+        self._open_orders = open_orders
+
+    def get_orders(self, request):
+        return self._open_orders
+
+
+def test_reconstruct_tracked_state_restores_a_still_open_pending_order(monkeypatch):
+    order = FakeOrder("order-1", "BTC/USD", OrderSide.BUY, OrderStatus.NEW, filled_avg_price=None, legs=None)
+    monkeypatch.setattr(execution, "trading_client", FakeReconstructTradingClient([order]))
+
+    execution.reconstruct_tracked_state()
+
+    assert execution._pending_fills["order-1"] == {
+        "symbol": "BTC/USD",
+        "action": "BUY",
+        "reason": "reconstructed_after_restart",
+        "sl_price": None,
+        "tp_price": None,
+    }
+
+
+def test_reconstruct_tracked_state_restores_a_bracket_with_a_still_open_leg(monkeypatch):
+    legs = [FakeLeg("tp-leg-1", OrderStatus.NEW, OrderType.LIMIT), FakeLeg("sl-leg-1", OrderStatus.NEW, OrderType.STOP)]
+    order = FakeOrder("parent-1", "MGN", OrderSide.BUY, OrderStatus.FILLED, filled_avg_price="10.05", legs=legs)
+    monkeypatch.setattr(execution, "trading_client", FakeReconstructTradingClient([order]))
+
+    execution.reconstruct_tracked_state()
+
+    assert execution._tracked_brackets["MGN"] == "parent-1"
+    assert "parent-1" not in execution._pending_fills
+
+
+def test_reconstruct_tracked_state_skips_a_bracket_whose_legs_are_all_terminal(monkeypatch):
+    """Shouldn't happen given the status="open" family-level query, but must not crash or
+    mistrack if it ever does."""
+    legs = [FakeLeg("tp-leg-1", OrderStatus.CANCELED, OrderType.LIMIT), FakeLeg("sl-leg-1", OrderStatus.CANCELED, OrderType.STOP)]
+    order = FakeOrder("parent-1", "MGN", OrderSide.BUY, OrderStatus.FILLED, filled_avg_price="10.05", legs=legs)
+    monkeypatch.setattr(execution, "trading_client", FakeReconstructTradingClient([order]))
+
+    execution.reconstruct_tracked_state()
+
+    assert "MGN" not in execution._tracked_brackets
+
+
+def test_reconstruct_tracked_state_handles_api_error_without_raising(monkeypatch):
+    class FailingClient:
+        def get_orders(self, request):
+            raise APIError("unreachable")
+
+    monkeypatch.setattr(execution, "trading_client", FailingClient())
+
+    execution.reconstruct_tracked_state()
+
+    assert execution._pending_fills == {}
+    assert execution._tracked_brackets == {}

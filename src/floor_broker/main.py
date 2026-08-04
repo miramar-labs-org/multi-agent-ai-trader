@@ -17,19 +17,31 @@ PENDING_FILL_POLL_INTERVAL_S = 30
 def poll_bracket_fills():
     """Runs for the lifetime of the process, watching for TP/SL bracket legs that fill
     asynchronously on Alpaca's side -- outside of any /execute request/response cycle, so this is
-    the only place those fills ever get observed and reported."""
+    the only place those fills ever get observed and reported. Also reports a bracket that goes
+    terminal with no fill at all (both legs canceled/expired/rejected) -- that's a silent gap
+    otherwise, since no /execute response ever covers it."""
     while True:
         try:
             for event in execution.check_bracket_fills():
-                log(f"🎯 {event['reason']} filled for {event['symbol']} @ {event['fill_price']}")
-                slack.notify_floor_broker_result(
-                    event["symbol"],
-                    "SELL",
-                    "executed",
-                    f"{event['reason']} leg filled: {event['order_id']}",
-                    reason=event["reason"],
-                    fill_price=event["fill_price"],
-                )
+                if event["kind"] == "fill":
+                    log(f"🎯 {event['reason']} filled for {event['symbol']} @ {event['fill_price']}")
+                    slack.notify_floor_broker_result(
+                        event["symbol"],
+                        "SELL",
+                        "executed",
+                        f"{event['reason']} leg filled: {event['order_id']}",
+                        reason=event["reason"],
+                        fill_price=event["fill_price"],
+                    )
+                else:
+                    statuses = "/".join(event["leg_statuses"])
+                    log(f"⚠️ bracket {event['order_id']} for {event['symbol']} closed with no fill: {statuses}")
+                    slack.notify_floor_broker_result(
+                        event["symbol"],
+                        "SELL",
+                        "no_fill",
+                        f"bracket legs closed with no fill ({statuses}): {event['order_id']}",
+                    )
         except Exception as exc:
             log(f"💥 bracket-fill poll failed: {exc}")
         time.sleep(BRACKET_FILL_POLL_INTERVAL_S)
@@ -38,21 +50,33 @@ def poll_bracket_fills():
 def poll_pending_fills():
     """Runs for the lifetime of the process, watching for the fill of orders buy()/sell()
     themselves submitted (ROADMAP P0.14) -- /execute now returns status="submitted" before the
-    fill is known, so this is the only place that fill is ever observed and reported."""
+    fill is known, so this is the only place that fill is ever observed and reported. Also
+    reports an order that goes terminal with no fill (canceled/expired/rejected) -- otherwise
+    that outcome is silent, since no /execute response ever covers it either."""
     while True:
         try:
             for event in execution.check_pending_fills():
-                log(f"💰 {event['action']} filled for {event['symbol']} @ {event['fill_price']}")
-                slack.notify_floor_broker_result(
-                    event["symbol"],
-                    event["action"],
-                    "executed",
-                    f"{event['reason']} order filled: {event['order_id']}",
-                    reason=event["reason"],
-                    fill_price=event["fill_price"],
-                    sl_price=event.get("sl_price"),
-                    tp_price=event.get("tp_price"),
-                )
+                if event["kind"] == "fill":
+                    log(f"💰 {event['action']} filled for {event['symbol']} @ {event['fill_price']}")
+                    slack.notify_floor_broker_result(
+                        event["symbol"],
+                        event["action"],
+                        "executed",
+                        f"{event['reason']} order filled: {event['order_id']}",
+                        reason=event["reason"],
+                        fill_price=event["fill_price"],
+                        sl_price=event.get("sl_price"),
+                        tp_price=event.get("tp_price"),
+                    )
+                else:
+                    log(f"⚠️ {event['action']} {event['symbol']} closed with no fill: {event['order_status']}")
+                    slack.notify_floor_broker_result(
+                        event["symbol"],
+                        event["action"],
+                        "no_fill",
+                        f"order {event['order_status']}, never filled: {event['order_id']}",
+                        reason=event["reason"],
+                    )
         except Exception as exc:
             log(f"💥 pending-fill poll failed: {exc}")
         time.sleep(PENDING_FILL_POLL_INTERVAL_S)
@@ -79,6 +103,7 @@ def poll_kill_switch():
 
 
 def main():
+    execution.reconstruct_tracked_state()
     threading.Thread(target=poll_bracket_fills, daemon=True).start()
     threading.Thread(target=poll_pending_fills, daemon=True).start()
     threading.Thread(target=poll_kill_switch, daemon=True).start()
