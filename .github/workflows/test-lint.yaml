@@ -1,0 +1,41 @@
+name: Test and Lint
+
+# Runs the pytest suite and ruff lint checks on every push and pull request. Self-hosted DGX
+# runner, matching build-push/deploy/undeploy — installs its own throwaway venv from
+# requirements-dev.txt (which pins the same ruff version used locally) rather than relying on
+# any tool already on the runner's PATH, so this job is reproducible independent of how the
+# runner host happens to be provisioned.
+#
+# ruff format --check is intentionally NOT run here yet — there is pre-existing formatting
+# drift across the repo that hasn't been cleaned up (see docs/architecture.md), so enforcing it
+# in CI would fail on unrelated files. ruff check (lint rules) has no such drift and is safe to
+# gate on.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-lint:
+    runs-on: [self-hosted, dgx]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up virtualenv
+        run: |
+          python3.12 -m venv .venv-ci
+          .venv-ci/bin/pip install --upgrade pip
+          .venv-ci/bin/pip install -r requirements-dev.txt
+
+      - name: Ruff check
+        run: .venv-ci/bin/ruff check .
+
+      - name: Pytest
+        run: .venv-ci/bin/pytest -q
+
+      - name: Clean up virtualenv
+        if: always()
+        run: rm -rf .venv-ci

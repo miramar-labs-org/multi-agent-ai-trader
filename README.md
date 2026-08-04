@@ -1,6 +1,7 @@
 # multi-agent-ai-trader
 
 [![Open in JupyterLab](https://img.shields.io/badge/Open%20in-JupyterLab-F37626?logo=jupyter&logoColor=white)](http://localhost:8888/lab/tree/git-miramar-labs-org/projects/multi-agent-ai-trader/notebook.ipynb)
+[![Test and Lint](https://github.com/miramar-labs-org/multi-agent-ai-trader/actions/workflows/test-lint.yaml/badge.svg)](https://github.com/miramar-labs-org/multi-agent-ai-trader/actions/workflows/test-lint.yaml)
 
 Multi-agent AI trading system (Analyst, Dealer, Floor Broker) trading on Alpaca, powered by a locally-hosted LLM on the DGX via k3s
 
@@ -130,6 +131,30 @@ Then deploy that exact version with `gh workflow run "Deploy" --ref main -f imag
 
 Versioning is semver by convention (no enforcement tooling): PATCH for bug fixes, MINOR for new
 features, MAJOR reserved for a breaking config/behavior change.
+
+## Development
+
+Supported Python version: **3.12** (matches every `Dockerfile.*`'s `python:3.12-slim` base and
+the DGX host's pyenv-managed interpreter).
+
+```sh
+python3.12 -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/ruff check .
+.venv/bin/pytest -q
+```
+
+`.github/workflows/test-lint.yaml` runs the same two checks — `ruff check` then `pytest -q` —
+on every push and pull request, on the `[self-hosted, dgx]` runner (the only registered runner
+for this org; a GitHub-hosted runner would avoid tying up the DGX for CI, but self-hosted was
+chosen to match the other 3 workflows here). It installs its own throwaway venv from
+`requirements-dev.txt` rather than depending on anything pre-installed on the runner, so it's
+reproducible independent of how the host happens to be provisioned.
+
+`ruff format --check` is **not** enforced in CI yet — there's pre-existing formatting drift
+across the repo (see `docs/ROADMAP.md`'s P0.12) that hasn't been cleaned up, so gating on it
+would fail on unrelated files. `ruff check` (lint rules, not formatting) has no such drift and
+is safe to gate on.
 
 ## How it decides trades
 

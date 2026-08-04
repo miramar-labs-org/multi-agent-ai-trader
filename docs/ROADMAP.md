@@ -27,7 +27,7 @@ All trading remains **paper-only**. SELL operations that reduce exposure should 
 | P0.9 | Quantity and bracket-price invariant checks | P0 | Planned | P0.8 |
 | P0.10 | Structured execution outcomes and HTTP contract | P0 | Planned | P0.3 |
 | P0.11 | Dependency split and reproducible pinning | P0 | Planned | — |
-| P0.12 | CI, linting, validation, and image-build checks | P0 | Planned | P0.11 |
+| P0.12 | CI, linting, validation, and image-build checks | P0 | Partial (pytest + ruff check only; see below) | P0.11 |
 | P0.13 | Baseline container security | P0 | Planned | P0.11 |
 | P1.1 | Durable decision and event schema | P1 | Planned | P0 complete |
 | P1.2 | Exact model, prompt, and input version capture | P1 | Planned | P1.1 |
@@ -462,28 +462,38 @@ A later migration to `pyproject.toml` may replace the requirements-file layout, 
 
 ### Change
 
-Add `.github/workflows/ci.yaml` on pull requests and pushes to `main`.
+**Partial.** `.github/workflows/test-lint.yaml` runs on every push and pull request:
 
-Required jobs:
+- `pytest` (fully mocked, no DGX hardware or real credentials required);
+- `ruff check`.
 
-- `pytest`;
-- `ruff check`;
-- `ruff format --check`;
+Deviates from the original spec below in one respect: it runs on the `[self-hosted, dgx]`
+runner, not a GitHub-hosted runner, matching `build-push.yaml`/`deploy.yaml`/`undeploy.yaml`'s
+existing convention — a deliberate choice (this org has no GitHub-hosted runner registered) made
+when this was scoped, trading "doesn't tie up the DGX runner" for "matches every other workflow
+here."
+
+Still outstanding from the original P0.12 scope:
+
+- `ruff format --check` — not enforced yet; there's pre-existing formatting drift across the
+  repo that predates this workflow and hasn't been cleaned up, so gating on it now would fail on
+  unrelated files;
 - YAML validation;
 - Dockerfile linting;
 - Kubernetes manifest validation;
 - secret scanning;
-- build all four images without pushing.
-
-Use a standard GitHub-hosted runner; tests must remain fully mocked and must not require DGX hardware or real credentials.
+- build all four images without pushing (`build-push.yaml` only builds+pushes on
+  `workflow_dispatch`/version tags, never as a pushless CI check);
+- branch protection actually blocking merge on failure (the workflow runs and reports status,
+  but nothing currently enforces it as a required check).
 
 ### Acceptance criteria
 
-- CI runs automatically on pull requests.
-- All four images build in CI.
-- A failing test, lint error, invalid manifest, or detected secret blocks merge.
-- README includes a CI badge.
-- Supported Python version is documented.
+- [x] CI runs automatically on pull requests (and on push).
+- [ ] All four images build in CI.
+- [ ] A failing test, lint error, invalid manifest, or detected secret blocks merge.
+- [x] README includes a CI badge.
+- [x] Supported Python version is documented (`README.md`'s new Development section: 3.12).
 
 ---
 
