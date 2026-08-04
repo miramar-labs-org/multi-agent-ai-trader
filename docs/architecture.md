@@ -37,9 +37,12 @@ communicate via a shared ConfigMap and plain HTTP, rather than a monolithic loop
                               Alpaca paper account
 ```
 
-Analyst and Floor Broker never talk to each other directly. There is no message queue, no
-database, and no shared filesystem — the only durable state between agents is the
-`portfolio` ConfigMap, and the only network hop is Dealer → Floor Broker.
+Analyst and Floor Broker never talk to each other directly. There is no message queue and
+no shared filesystem — the only *coordination* state between agents is the `portfolio`
+ConfigMap, and the only network hop is Dealer → Floor Broker. Separately, all three agents
+also write fire-and-forget history rows to Postgres (see [Persistence](#persistence) below)
+— that's an append-only audit trail read back by `/analyst-explain`, not a coordination
+channel any agent depends on to function.
 
 Independently of that cycle, a fourth CronJob queries Alpaca directly once a day after market
 close and posts a summary to Slack — it has no dependency on the ConfigMap or on Dealer/Floor
@@ -514,9 +517,13 @@ see [`docs/backtesting.md`](backtesting.md) for the full design and documented a
   to forward a BUY when `budget <= 0` (`status="skipped", reason="no_authorized_budget"`)
   rather than sizing an order off it. Symbols Analyst actually picked keep their own real
   `budget` untouched by the merge step.
-- **`logging.py`** — an emoji-prefixed stdout logger (ported from `gpt-trader.py`) — the only
-  durable trail of a trading decision is `kubectl logs` output plus whatever LangSmith
-  captured of the LLM call chain; trade outcomes are not written to any database or MLflow.
+- **`logging.py`** — an emoji-prefixed stdout logger (ported from `gpt-trader.py`), still the
+  only trail of *operational* detail (retries, warnings, non-decision errors); `kubectl logs`
+  plus whatever LangSmith captured of the LLM call chain. Decision/execution history itself is
+  durable now — see **`db.py`** below and [Persistence](#persistence).
+- **`db.py`** — Postgres persistence for Analyst picks, Dealer decisions, and Floor Broker
+  execution events, added in v0.6.0. See [Persistence](#persistence) for the schema and write
+  contract.
 - **`eod.py`** — `fetch_fills(date, only_crypto=None)` / `summarize_positions(positions,
   only_crypto=None)` shape Alpaca's raw position/activity objects into the plain dicts
   `slack.notify_eod_report`/`notify_crypto_eod_report` expect. Shared by the stock EOD Report (no
@@ -530,6 +537,51 @@ see [`docs/backtesting.md`](backtesting.md) for the full design and documented a
   Each fill dict also carries `"time"` (Alpaca's raw `transaction_time`, an ISO 8601 UTC string),
   passed through unformatted — `slack._format_fill_time()` converts it to Eastern-clock-time for
   display only at the point each EOD report line is rendered.
+
+## Persistence
+
+Added in v0.6.0, closing the gap `docs/ROADMAP.md` P1.1 flagged: before this, the Dealer's
+LLM reasoning for every BUY/HOLD/SELL was sent to Slack (`slack.notify_dealer_signal`) and
+nowhere else — unrecoverable the moment the message scrolled off the channel. Postgres is a
+**shared platform service**, not an app-local k8s resource — provisioned in the separate
+`miramar-platform-gcp` repo at `dgx/k3s/postgres/` via the `deploy-postgres.yaml` /
+`undeploy-postgres.yaml` GHA workflows, at `postgres.postgres-system.svc.cluster.local:5432`.
+This app is one tenant of that shared instance, with its own database/role provisioned by the
+same deploy workflow; the connection string is `DATABASE_URL` in the `mlabs-api-keys` secret
+(see [Secrets](#secrets)).
+
+`src/common/db.py` uses `psycopg[binary,pool]` directly — no ORM, no migration framework.
+Schema is three tables (`analyst_picks`, `dealer_decisions`, `floor_broker_events`), created
+idempotently (`CREATE TABLE IF NOT EXISTS`) by `db.py` itself on first use — there is no
+separate migrations step or Job. `dealer_decisions` records the Dealer's decision only, with
+no execution-outcome columns; `/analyst-explain` correlates it to `floor_broker_events` at
+query time by symbol + same-day timestamp proximity, not a shared foreign key — deliberately,
+since a decision and its downstream execution event are written by two different processes
+(Dealer, Floor Broker) that don't share a request context.
+
+**Write functions are fire-and-forget**, mirroring `slack.py::_post()`'s contract exactly:
+they catch and log any exception, never raise. A Postgres outage must never block a trading
+decision — this is why `db.py`'s connection pool is built lazily from `DATABASE_URL` on first
+use rather than eagerly at import, unlike `alpaca_client.py`'s `trading_client` (a missing or
+unreachable DB can't be allowed to crash import of every module that touches a decision, the
+way a missing Alpaca credential legitimately should).
+
+Write sites:
+- `src/analyst/graph.py::write_portfolio()` — one `record_analyst_pick()` call per symbol in
+  the day's selection, right after the `portfolio` ConfigMap write.
+- `src/dealer/graph.py::call_floor_broker()` — one `record_dealer_decision()` call per Dealer
+  decision, alongside `slack.notify_dealer_signal()`; then a `record_floor_broker_event()` call
+  at each of that function's `slack.notify_floor_broker_result()` sites (BUY skipped for no
+  budget, `/execute` error, `/execute` success).
+- `src/floor_broker/main.py`'s two background poll loops (`poll_bracket_fills`,
+  `poll_pending_fills`) — a `record_floor_broker_event()` call alongside each of their
+  `slack.notify_floor_broker_result()` sites (fill, no-fill, synthetic crypto stop).
+
+There is no historical backfill — the tables start empty at deploy time; decisions made before
+v0.6.0 are unrecoverable, same limitation as the Slack-only trail it replaces. Read access is
+via `db.py`'s `fetch_*_for_date()` functions, used by the read-only `/analyst-explain` skill
+(`skills/analyst-explain/SKILL.md`) to explain a trading day's P&L using the actual logged
+Dealer reasoning rather than a generic summary.
 
 ## Data flow — one full cycle
 
@@ -620,7 +672,9 @@ see [`docs/backtesting.md`](backtesting.md) for the full design and documented a
 
 All credentials live in one k8s Secret, `mlabs-api-keys` (documented, not created, by
 `k8s/secrets.example.yaml` — deploy fails fast if it's missing): `TAAPI_API_KEY`,
-`ALPACA_PAPER_API_KEY`, `ALPACA_PAPER_API_SECRET`, `LANGCHAIN_API_KEY`, `SLACK_WEBHOOK_URL`.
+`ALPACA_PAPER_API_KEY`, `ALPACA_PAPER_API_SECRET`, `LANGCHAIN_API_KEY`, `SLACK_WEBHOOK_URL`,
+`DATABASE_URL` (see [Persistence](#persistence) — provisioned by `miramar-platform-gcp`'s
+`deploy-postgres.yaml`, not created by this repo).
 Analyst and Dealer get it via `envFrom.secretRef` for both k8s-API access (via their shared
 ServiceAccount) and these external API keys. Floor Broker also has a ServiceAccount
 (`multi-agent-ai-trader-configmap-reader`, scoped to reading the `buy-kill-switch` ConfigMap)

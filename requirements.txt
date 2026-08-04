@@ -7,6 +7,7 @@ python-dotenv
 openai
 anthropic
 alpaca-py
+psycopg[binary,pool]
 beautifulsoup4
 pytz
 fastapi

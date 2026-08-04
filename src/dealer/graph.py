@@ -5,7 +5,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 
-from src.common import slack
+from src.common import db, slack
 from src.common.config import load_config
 from src.common.logging import get_logger
 from src.common.indicators import fetch_indicators_bulk
@@ -60,6 +60,7 @@ def llm_call(state: DealerState, cfg) -> DealerState:
 def call_floor_broker(state: DealerState, cfg) -> DealerState:
     signal = state["signal"]
     slack.notify_dealer_signal(state["symbol"], signal["action"], signal["reasoning"])
+    db.record_dealer_decision(state["symbol"], signal["action"], signal["reasoning"], signal.get("size_hint"))
 
     if signal["action"] == "HOLD":
         return {**state, "execution_result": {"status": "skipped", "detail": "HOLD"}}
@@ -74,6 +75,7 @@ def call_floor_broker(state: DealerState, cfg) -> DealerState:
             "detail": "held position has no authorized new-BUY budget",
         }
         slack.notify_floor_broker_result(state["symbol"], signal["action"], result["status"], result["detail"])
+        db.record_floor_broker_event(state["symbol"], "skip", result["detail"])
         return {**state, "execution_result": result}
 
     payload = {
@@ -90,6 +92,7 @@ def call_floor_broker(state: DealerState, cfg) -> DealerState:
         if response.status_code != 200:
             log(f"💥 floor broker error: {response.status_code} {response.text}")
             slack.notify_floor_broker_result(state["symbol"], signal["action"], "error", response.text)
+            db.record_floor_broker_event(state["symbol"], "error", response.text)
             return {**state, "execution_result": {"status": "error", "detail": response.text}}
         result = response.json()
         slack.notify_floor_broker_result(
@@ -102,10 +105,17 @@ def call_floor_broker(state: DealerState, cfg) -> DealerState:
             sl_price=result.get("sl_price"),
             tp_price=result.get("tp_price"),
         )
+        db.record_floor_broker_event(
+            state["symbol"],
+            f"{signal['action'].lower()}_{result['status']}",
+            result["detail"],
+            price=result.get("fill_price"),
+        )
         return {**state, "execution_result": result}
     except requests.RequestException as exc:
         log(f"💥 floor broker request failed: {exc}")
         slack.notify_floor_broker_result(state["symbol"], signal["action"], "error", str(exc))
+        db.record_floor_broker_event(state["symbol"], "error", str(exc))
         return {**state, "execution_result": {"status": "error", "detail": str(exc)}}
 
 

@@ -3,7 +3,7 @@ import time
 
 import uvicorn
 
-from src.common import kill_switch, slack
+from src.common import db, kill_switch, slack
 from src.common.logging import get_logger
 from src.floor_broker import execution
 
@@ -38,6 +38,10 @@ def poll_bracket_fills():
                         reason=event["reason"],
                         fill_price=event["fill_price"],
                     )
+                    db.record_floor_broker_event(
+                        event["symbol"], "fill", f"{event['reason']} leg filled: {event['order_id']}",
+                        price=event["fill_price"],
+                    )
                 else:
                     statuses = "/".join(event["leg_statuses"])
                     log(f"⚠️ bracket {event['order_id']} for {event['symbol']} closed with no fill: {statuses}")
@@ -47,6 +51,9 @@ def poll_bracket_fills():
                         "no_fill",
                         f"bracket legs closed with no fill ({statuses}): {event['order_id']}",
                     )
+                    db.record_floor_broker_event(
+                        event["symbol"], "no_fill", f"bracket legs closed with no fill ({statuses}): {event['order_id']}"
+                    )
             for event in execution.check_crypto_stops():
                 log(f"🎯 synthetic {event['reason']} triggered for {event['symbol']} @ {event['bid_price']}")
                 slack.notify_floor_broker_result(
@@ -55,6 +62,12 @@ def poll_bracket_fills():
                     event["sell_result"]["status"],
                     f"synthetic {event['reason']} triggered @ {event['bid_price']}: {event['sell_result']['detail']}",
                     reason=event["reason"],
+                )
+                db.record_floor_broker_event(
+                    event["symbol"],
+                    f"synthetic_{event['reason']}",
+                    event["sell_result"]["detail"],
+                    price=event["bid_price"],
                 )
         except Exception as exc:
             log(f"💥 bracket-fill poll failed: {exc}")
@@ -82,6 +95,12 @@ def poll_pending_fills():
                         sl_price=event.get("sl_price"),
                         tp_price=event.get("tp_price"),
                     )
+                    db.record_floor_broker_event(
+                        event["symbol"],
+                        "fill",
+                        f"{event['reason']} order filled: {event['order_id']}",
+                        price=event["fill_price"],
+                    )
                 else:
                     log(f"⚠️ {event['action']} {event['symbol']} closed with no fill: {event['order_status']}")
                     slack.notify_floor_broker_result(
@@ -90,6 +109,9 @@ def poll_pending_fills():
                         "no_fill",
                         f"order {event['order_status']}, never filled: {event['order_id']}",
                         reason=event["reason"],
+                    )
+                    db.record_floor_broker_event(
+                        event["symbol"], "no_fill", f"order {event['order_status']}, never filled: {event['order_id']}"
                     )
         except Exception as exc:
             log(f"💥 pending-fill poll failed: {exc}")

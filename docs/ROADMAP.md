@@ -30,7 +30,7 @@ All trading remains **paper-only**. SELL operations that reduce exposure should 
 | P0.12 | CI, linting, validation, and image-build checks | P0 | Partial (pytest + ruff check only; see below) | P0.11 |
 | P0.13 | Baseline container security | P0 | Planned | P0.11 |
 | P0.14 | Asynchronous order submission and fill reporting | P0 | Done | — |
-| P1.1 | Durable decision and event schema | P1 | Planned | P0 complete |
+| P1.1 | Durable decision and event schema | P1 | Partial (3-table MVP live; see below) | P0 complete |
 | P1.2 | Exact model, prompt, and input version capture | P1 | Planned | P1.1 |
 | P1.3 | Shadow execution mode | P1 | Planned | P1.1 |
 | P1.4 | Forward evaluation and replay | P1 | Planned | P1.1, P1.3 |
@@ -675,6 +675,17 @@ already established.
 P1 is complete when the system can explain, replay, and evaluate its decisions using durable records rather than ephemeral logs.
 
 ## P1.1 — Durable decision and event schema
+
+**Partial — an MVP slice landed in v0.6.0.** `src/common/db.py` persists three tables to a
+shared Postgres instance (provisioned by `miramar-platform-gcp`'s `dgx/k3s/postgres/`, via
+`deploy-postgres.yaml`): `analyst_picks`, `dealer_decisions`, `floor_broker_events` — see
+`docs/architecture.md` § Persistence for the schema and write sites. This covers the specific
+gap that motivated it (the Dealer's LLM reasoning was previously sent to Slack and nowhere
+else, making it unrecoverable) and backs the new `/analyst-explain` skill. It does **not**
+yet implement the full target event schema below — no research-input or indicator-snapshot
+capture, no portfolio/strategy/model/prompt version columns, no input-data timestamps. There
+is no historical backfill: the tables start empty at deploy time, so decisions made before
+v0.6.0 remain unrecoverable. The rest of this section is the still-Planned full scope.
 
 Persist structured events for:
 

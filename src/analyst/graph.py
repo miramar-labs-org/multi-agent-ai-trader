@@ -10,7 +10,7 @@ from langgraph.graph import END, StateGraph
 
 from src.analyst import sources
 from src.analyst.schema import PortfolioSelection
-from src.common import slack
+from src.common import db, slack
 from src.common.alpaca_client import trading_client
 from src.common.config import load_config
 from src.common.eod import fetch_fills, summarize_positions
@@ -138,12 +138,18 @@ def validate_selection(state: AnalystState, cfg) -> AnalystState:
 
 def write_portfolio(state: AnalystState, cfg) -> AnalystState:
     selection = state["selection"]
+    generated_at = datetime.now(timezone.utc)
     payload = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": generated_at.isoformat(),
         "symbols": selection["symbols"],
     }
     _write_portfolio(payload)
     log(f"✅ wrote portfolio with {len(payload['symbols'])} symbols")
+
+    for pick in payload["symbols"]:
+        db.record_analyst_pick(
+            pick["symbol"], pick.get("exchange"), pick.get("budget"), pick.get("rationale"), generated_at
+        )
 
     account = trading_client.get_account()
     account_summary = {
