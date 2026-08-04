@@ -504,7 +504,7 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
         "status": "submitted",
         "reason": "opening_position",
         "detail": f"buy order submitted: {order.id}",
-        "order_id": order.id,
+        "order_id": str(order.id),
         "sl_price": sl_price,
         "tp_price": tp_price,
     }
@@ -535,7 +535,7 @@ def sell(symbol: str, reason: str = "dealer_signal") -> dict:
             "status": "submitted",
             "reason": reason,
             "detail": f"sell order submitted: {order.id}",
-            "order_id": order.id,
+            "order_id": str(order.id),
         }
     except APIError as exc:
         try:
@@ -568,7 +568,7 @@ def sell(symbol: str, reason: str = "dealer_signal") -> dict:
                 "status": "submitted",
                 "reason": reason,
                 "detail": f"sell order submitted: {order.id}",
-                "order_id": order.id,
+                "order_id": str(order.id),
             }
         except APIError as retry_exc:
             log(f"💥  sell retry failed for {symbol}: {retry_exc}")

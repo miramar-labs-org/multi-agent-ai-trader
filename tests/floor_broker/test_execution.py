@@ -1,4 +1,5 @@
 import json
+import uuid
 
 import pytest
 from alpaca.common.exceptions import APIError
@@ -330,6 +331,28 @@ def test_stock_buy_returns_reason_sl_tp_and_tracks_the_bracket_and_pending_fill(
     }
 
 
+def test_stock_buy_coerces_a_uuid_order_id_to_str(monkeypatch):
+    """Alpaca's real SDK returns order.id as a uuid.UUID, not a str -- the returned dict's
+    order_id must be a str so it validates against ExecuteResponse.order_id: str | None in
+    app.py. A UUID leaking through here previously crashed /execute with a 500 on every
+    successful BUY, even though the order had already been submitted and would go on to fill."""
+    order_uuid = uuid.uuid4()
+
+    class FakeUUIDOrderClient(FakeTradingClient):
+        def submit_order(self, req):
+            self.submitted.append(req)
+            return type("Order", (), {"id": order_uuid})()
+
+    fake_client = FakeUUIDOrderClient()
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+    monkeypatch.setattr(execution, "get_current_ask_price", lambda symbol: 10.0)
+
+    result = execution.buy("MGN", "stocks", 5000.0, slP=0.98, tpP=1.05)
+
+    assert result["order_id"] == str(order_uuid)
+    assert isinstance(result["order_id"], str)
+
+
 def test_crypto_buy_has_no_sl_tp_price_and_is_not_tracked_as_a_bracket(monkeypatch):
     """Crypto BUYs are plain notional market orders, not brackets -- there's no TP/SL leg to
     later watch for a fill."""
@@ -383,6 +406,26 @@ def test_sell_returns_dealer_signal_reason_and_untracks_bracket_and_tracks_pendi
         "sl_price": None,
         "tp_price": None,
     }
+
+
+def test_sell_coerces_a_uuid_order_id_to_str(monkeypatch):
+    """Same UUID-leak regression as the BUY path (see test_stock_buy_coerces_a_uuid_order_id_to_str)
+    -- Alpaca's real order.id is a uuid.UUID, and the returned order_id must be a str."""
+    order_uuid = uuid.uuid4()
+
+    class FakeSellClient:
+        def get_open_position(self, symbol):
+            return type("Position", (), {"qty": "5"})()
+
+        def submit_order(self, req):
+            return type("Order", (), {"id": order_uuid})()
+
+    monkeypatch.setattr(execution, "trading_client", FakeSellClient())
+
+    result = execution.sell("MGN")
+
+    assert result["order_id"] == str(order_uuid)
+    assert isinstance(result["order_id"], str)
 
 
 def test_sell_accepts_a_reason_override_and_clears_tracked_crypto_stop(monkeypatch):
