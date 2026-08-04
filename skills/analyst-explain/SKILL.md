@@ -15,11 +15,12 @@ needed (unlike `/configure-strategy` or `/revert-strategy`, which mutate
 state).
 
 This only works for **today**, and only for activity that happened after
-Postgres persistence went live (`src/common/db.py`, added in v0.6.0). There is
-no historical backfill — decisions made before that deploy are unrecoverable,
-same limitation `docs/ROADMAP.md` P1.1 already documents. If the DB tables
-come back empty for today, say so plainly rather than inventing a narrative
-from the account numbers alone.
+Postgres persistence actually started writing (`src/common/db.py`, added in
+v0.6.0, but a schema bug meant no rows were written until the v0.6.1 fix).
+There is no historical backfill — decisions made before v0.6.1 are
+unrecoverable, same limitation `docs/ROADMAP.md` P1.1 already documents. If
+the DB tables come back empty for today, say so plainly rather than
+inventing a narrative from the account numbers alone.
 
 ## Step 1 — Gather data from inside the cluster
 

@@ -578,7 +578,10 @@ Write sites:
   `slack.notify_floor_broker_result()` sites (fill, no-fill, synthetic crypto stop).
 
 There is no historical backfill — the tables start empty at deploy time; decisions made before
-v0.6.0 are unrecoverable, same limitation as the Slack-only trail it replaces. Read access is
+v0.6.1 are unrecoverable, same limitation as the Slack-only trail it replaces. (v0.6.0 shipped
+a schema bug — `CREATE INDEX` on a `timestamptz::date` expression isn't `IMMUTABLE`, which
+rolled back table creation entirely and silently wrote zero rows until the v0.6.1 fix; the
+current schema indexes the raw `(symbol, timestamp)` columns instead.) Read access is
 via `db.py`'s `fetch_*_for_date()` functions, used by the read-only `/analyst-explain` skill
 (`skills/analyst-explain/SKILL.md`) to explain a trading day's P&L using the actual logged
 Dealer reasoning rather than a generic summary.

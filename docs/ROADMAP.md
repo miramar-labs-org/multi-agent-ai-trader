@@ -684,8 +684,11 @@ gap that motivated it (the Dealer's LLM reasoning was previously sent to Slack a
 else, making it unrecoverable) and backs the new `/analyst-explain` skill. It does **not**
 yet implement the full target event schema below — no research-input or indicator-snapshot
 capture, no portfolio/strategy/model/prompt version columns, no input-data timestamps. There
-is no historical backfill: the tables start empty at deploy time, so decisions made before
-v0.6.0 remain unrecoverable. The rest of this section is the still-Planned full scope.
+is no historical backfill: the tables start empty at deploy time. Note also that v0.6.0
+shipped with a schema bug — `CREATE INDEX` on a `timestamptz::date` expression isn't
+`IMMUTABLE`, which rolled back table creation entirely, so no rows were actually written
+until the fix landed in **v0.6.1**. Decisions made before v0.6.1 remain unrecoverable. The
+rest of this section is the still-Planned full scope.
 
 Persist structured events for:
 

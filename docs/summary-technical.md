@@ -8,7 +8,9 @@ field reference. For a non-technical framing, see [summary.md](summary.md).
 ## The shape of it
 
 Four independent Python services, each its own Docker image and k8s workload on the DGX Spark
-k3s cluster, coordinated with no queue and no database:
+k3s cluster, coordinated with no queue and no database in the handoff path (a shared Postgres
+instance exists for durable decision/event logging — see below — but isn't part of how the
+agents talk to each other):
 
 ```
 08:55 ET CronJob           continuous Deployment           Deployment+Service
@@ -240,12 +242,18 @@ summary via `src/common/eod.py`'s `fetch_fills()`/`summarize_positions()`.
 - `kill_switch.py` — the `buy-kill-switch` ConfigMap read (above).
 - `logging.py` — `get_logger(prefix)` returns an emoji-prefixed `print(..., file=sys.stdout,
   flush=True)` closure. Stdout-only by k8s convention (`kubectl logs`) — no file logging, no
-  database, no MLflow; this plus whatever LangSmith captured is the entire audit trail.
+  MLflow; operational detail only (retries, warnings), not decision/execution history — see
+  `db.py` below for that.
+- `db.py` — Postgres persistence for Analyst picks, Dealer decisions, and Floor Broker
+  execution events, added in v0.6.0 (a schema bug meant no rows actually landed until the
+  v0.6.1 fix). Fire-and-forget writes (catch and log, never raise) via `psycopg[binary,pool]`,
+  no ORM, no migrations — `CREATE TABLE IF NOT EXISTS` run lazily on first use. Backs the
+  `/analyst-explain` skill. See [architecture.md](architecture.md#persistence) for the schema.
 - `langsmith.py` — `configure(cfg)` wires LangGraph/LangChain tracing, gated by
   `cfg.langsmith.enabled` and capped by `cfg.langsmith.sampling_rate` to stay under LangSmith's
   free-tier 5k-traces/month quota.
-- `slack.py` — every service posts through this one module; it's the closest thing to a
-  cross-service event log that exists today.
+- `slack.py` — every service posts through this one module; it's the human-readable real-time
+  feed, while `db.py` is the durable structured record of the same events.
 
 ## Tests, build, deploy
 

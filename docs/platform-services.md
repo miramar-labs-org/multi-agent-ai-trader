@@ -13,6 +13,7 @@ reader doesn't have to grep the whole codebase to find out.
 | Service    | How                                                                                                     |
 | ---------- | --------------------------------------------------------------------------------------------------------- |
 | Ollama     | `cfg.llm.base_url` (`config.yaml`'s `llm.base_url`, an Ollama systemd service on the DGX host, not in k3s) is passed to `langchain_openai.ChatOpenAI` and called by both the Analyst and Dealer LangGraph agents. See [docs/models.md](models.md) for the model choice and Ollama-vs-vLLM decision — this project ended up on Ollama rather than a deployed vLLM `serving-vllm` endpoint. |
+| Postgres   | `DATABASE_URL` (from the `mlabs-api-keys` secret) is read by `src/common/db.py`, which persists Analyst picks, Dealer decisions, and Floor Broker execution events. Provisioned as a shared platform service in `miramar-platform-gcp` at `dgx/k3s/postgres/`, same pattern as Qdrant. See [architecture.md](architecture.md#persistence) for the schema and write sites. |
 | Kubernetes dashboard | Ops only, not called from `src/` — used to inspect the `multi-agent-ai-trader` namespace's pods/jobs when debugging (see the top-level README's Quick Links). |
 
 ## Listed in the full Miramar platform endpoint table but unused by this project's code

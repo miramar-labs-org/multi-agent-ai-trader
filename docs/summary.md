@@ -126,8 +126,9 @@ happened," never "did this even run?"
 
 ## How the pieces hand off to each other
 
-There's no database and no message queue connecting these four workers. The handoff is
-deliberately simple:
+There's no message queue connecting these four workers, and no database in the coordination
+path — Postgres exists (see below) but is a durable log written to on the side, not how the
+agents hand off to each other. The handoff itself is deliberately simple:
 
 - **Analyst → Dealer:** the Analyst writes the day's watchlist to one shared, small
   structured record (symbol, budget, indicators to watch, rationale). The Dealer reads that
@@ -136,14 +137,17 @@ deliberately simple:
   watchlist was.
 - **Dealer → Floor Broker:** a direct request, in real time, only when the decision isn't
   HOLD. Floor Broker's response (executed, skipped, or error, plus fill price if available)
-  goes back to the Dealer's logs and Slack — it isn't stored anywhere further.
+  goes back to the Dealer's logs and Slack, same as before.
 - **Everything → Slack:** every consequential event (morning picks, a BUY/SELL/HOLD decision,
   an execution, a bracket TP/SL fill, the EOD recap, a market-closed notice, any error) gets a
   Slack message. A BUY/SELL/HOLD decision, an execution/fill, and an error each carry their own
   Eastern-time timestamp; the morning picks and EOD recaps don't carry a top-level timestamp
-  (each fill listed inside an EOD recap does carry its own). Slack is effectively the
-  human-readable audit trail for the whole system today — there's no other durable log of
-  trading decisions beyond raw application logs and AI-tracing data.
+  (each fill listed inside an EOD recap does carry its own).
+- **Everything → Postgres:** since v0.6.1, Analyst picks, Dealer decisions, and Floor Broker
+  execution events are also written to a shared Postgres instance (`src/common/db.py`),
+  fire-and-forget so a DB outage can never block a trading decision. This backs the
+  `/analyst-explain` skill, which reads the actual logged Dealer reasoning back out to explain
+  a trading day rather than relying on Slack scrollback or raw logs.
 
 ## Where the "brain" comes from
 
