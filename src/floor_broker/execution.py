@@ -423,6 +423,13 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
         except InsufficientQuantity as exc:
             log(f"⚠️  {exc} -- skipping BUY")
             return {"status": "skipped", "reason": "insufficient_qty", "detail": str(exc)}
+        except InvalidOrderParameters as exc:
+            # Catches invariants _validate_bracket_order() can't satisfy at all for a given quote
+            # (e.g. a sub-$0.02 stock, where the $0.02 SL/TP floor/ceiling clamp pushes stop_loss_px
+            # negative) -- these aren't a caller/config error, just an unbrokerable symbol at this
+            # price, so skip cleanly rather than let it fall through to app.py's 500 handler.
+            log(f"⚠️  {exc} -- skipping BUY")
+            return {"status": "skipped", "reason": "invalid_order_parameters", "detail": str(exc)}
     else:
         # Alpaca rejects a crypto notional with more than 2 decimal places (code 42210000); the
         # BTCUSD failure came from a `budget` value with more precision than that (e.g. a
@@ -472,6 +479,9 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
         except InsufficientQuantity as retry_exc:
             log(f"⚠️  {retry_exc} -- skipping BUY on retry")
             return {"status": "skipped", "reason": "insufficient_qty", "detail": str(retry_exc)}
+        except InvalidOrderParameters as retry_exc:
+            log(f"⚠️  {retry_exc} -- skipping BUY on retry")
+            return {"status": "skipped", "reason": "invalid_order_parameters", "detail": str(retry_exc)}
         order = trading_client.submit_order(req)
 
     log(f"✅  buy order submitted: {order.id}")

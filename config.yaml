@@ -49,6 +49,10 @@ analyst:
   max_universe_size: 10
   default_budget: 5000
   screener_top_n: 20          # candidates pulled from Alpaca Screener before research/filtering
+  min_price_usd: 1.0          # screener candidates below this price are dropped (movers only -- see
+                               # sources.py; most-actives has no price field to filter on). Sub-$1
+                               # stocks can fail Floor Broker's SL/TP bracket math (see execution.py's
+                               # $0.02 floor/ceiling clamp in bracket_buy_with_SLTP)
   news_days: 2
   yahoo_rss_url: "https://feeds.finance.yahoo.com/rss/2.0/headline"
   indicator_fetch_limit: 15   # candidates (by |change_pct|) that get real TAAPI indicator data,

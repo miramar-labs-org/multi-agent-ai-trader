@@ -35,7 +35,7 @@ def discover_candidates(state: AnalystState, cfg) -> AnalystState:
     candidates = []
 
     if cfg.trading.enable_stocks and state["stock_market_open"]:
-        stock_candidates = sources.fetch_screener_candidates(cfg.analyst.screener_top_n)
+        stock_candidates = sources.fetch_screener_candidates(cfg.analyst.screener_top_n, cfg.analyst.min_price_usd)
         for c in stock_candidates:
             c["market"] = "stocks"
         candidates.extend(stock_candidates)

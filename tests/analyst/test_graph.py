@@ -43,12 +43,12 @@ def test_discover_candidates_skips_stocks_when_market_closed(monkeypatch):
 
 
 def test_discover_candidates_includes_stocks_when_market_open(monkeypatch):
-    monkeypatch.setattr(graph.sources, "fetch_screener_candidates", lambda n: [{"symbol": "MGN"}])
+    monkeypatch.setattr(graph.sources, "fetch_screener_candidates", lambda n, min_price: [{"symbol": "MGN"}])
     monkeypatch.setattr(graph.sources, "fetch_crypto_candidates", lambda n: [])
     cfg = OmegaConf.create(
         {
             "trading": {"enable_stocks": True, "enable_crypto": False, "crypto_taapi_exchange": "binance"},
-            "analyst": {"screener_top_n": 20},
+            "analyst": {"screener_top_n": 20, "min_price_usd": 1.0},
         }
     )
     state = {

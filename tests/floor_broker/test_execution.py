@@ -196,6 +196,39 @@ def test_buy_skips_with_insufficient_qty_reason_on_retry(monkeypatch):
     assert len(fake_client.submitted) == 1, "the initial (rejected) attempt submits once; the retry must not submit at all"
 
 
+def test_buy_skips_with_invalid_order_parameters_reason_when_stop_loss_goes_non_positive(monkeypatch):
+    """Regression for a live ANSCW 500: bracket_buy_with_SLTP's $0.02 floor/ceiling clamp can
+    push stop_loss_px negative on an extremely low-priced symbol (ask=$0.0097) -- this used to
+    propagate InvalidOrderParameters straight out of buy(), which app.py's generic exception
+    handler turned into a bare 500 instead of a clean skip. Must return status="skipped" and
+    never reach submit_order."""
+    fake_client = FakeTradingClient()
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+    monkeypatch.setattr(execution, "get_current_ask_price", lambda symbol: 0.0097)
+
+    result = execution.buy("ANSCW", "stocks", 5000.0, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "invalid_order_parameters"
+    assert fake_client.submitted == []
+
+
+def test_buy_skips_with_invalid_order_parameters_reason_on_retry(monkeypatch):
+    """Same invalid-order-parameters skip, but reached via the base_price retry path -- Alpaca's
+    own reported base_price can itself be low enough to hit the same non-positive stop_loss
+    clamp on the retry attempt, even though the initial (higher, client-quoted) ask was fine."""
+    rejection = {"base_price": "0.0097", "code": 42210000, "message": "stop_loss.stop_price must be <= base_price - 0.01"}
+    fake_client = FakeTradingClient(rejections=[rejection])
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+    monkeypatch.setattr(execution, "get_current_ask_price", lambda symbol: 0.05)
+
+    result = execution.buy("ANSCW", "stocks", 5000.0, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "invalid_order_parameters"
+    assert len(fake_client.submitted) == 1, "the initial (rejected) attempt submits once; the retry must not submit at all"
+
+
 def test_get_qty_uses_the_given_ask_not_a_fresh_quote():
     assert execution.get_qty(ask=10.0, budget=5000.0) == 500
     assert execution.get_qty(ask=0.0, budget=5000.0) == 0

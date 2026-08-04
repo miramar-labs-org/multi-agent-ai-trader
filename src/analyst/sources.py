@@ -27,7 +27,7 @@ def _alpaca_headers() -> dict:
     }
 
 
-def fetch_screener_candidates(top_n: int) -> list[dict]:
+def fetch_screener_candidates(top_n: int, min_price: float = 0.0) -> list[dict]:
     # Screener endpoints aren't wrapped by alpaca-py yet, so this hits the REST API directly.
     endpoints = [
         f"{SCREENER_BASE_URL}/most-actives?by=volume&top={top_n}",
@@ -61,8 +61,19 @@ def fetch_screener_candidates(top_n: int) -> list[dict]:
                 entry["volume"] = item["volume"]
             if "change" in item or "percent_change" in item:
                 entry["change_pct"] = item.get("percent_change", item.get("change"))
+            if "price" in item:
+                entry["price"] = item["price"]
 
-    candidates = list(by_symbol.values())
+    # Only "movers" items carry a price -- "most-actives" doesn't, so a candidate sourced only from
+    # most-actives has no price to filter on and passes through. Below-min-price candidates that do
+    # have a known price are dropped here (rather than left for Floor Broker to discover) since
+    # sub-$1 stocks can violate execution.py's SL/TP bracket invariants (see bracket_buy_with_SLTP's
+    # $0.02 floor/ceiling clamp) and are cheap to filter out before they ever reach the LLM.
+    all_candidates = list(by_symbol.values())
+    candidates = [c for c in all_candidates if c.get("price") is None or c["price"] >= min_price]
+    dropped = len(all_candidates) - len(candidates)
+    if dropped:
+        log(f"📉 dropped {dropped} screener candidate(s) below ${min_price:.2f} min price")
     log(f"📈 fetched {len(candidates)} screener candidates")
     return candidates
 
