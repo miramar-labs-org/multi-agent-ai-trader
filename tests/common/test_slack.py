@@ -210,3 +210,15 @@ def test_notify_stock_market_closed_has_no_second_competing_timestamp(monkeypatc
     slack.notify_stock_market_closed("2026-08-04 09:30:00 ET")
 
     assert posted["text"] == "🔒 *Dealer* — stock market is closed. Next open: 2026-08-04 09:30:00 ET"
+
+
+def test_notify_analyst_explain_includes_date_narrative_and_timestamp(monkeypatch):
+    posted = {}
+    monkeypatch.setattr(slack, "_post", lambda text: posted.update(text=text))
+
+    slack.notify_analyst_explain("MGN was up 5% on earnings; Dealer bought, filled at $4.50.", "2026-08-04")
+
+    text = posted["text"]
+    assert "2026-08-04" in text
+    assert "MGN was up 5% on earnings; Dealer bought, filled at $4.50." in text
+    assert re.search(_TIMESTAMP_RE, text)

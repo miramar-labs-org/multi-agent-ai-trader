@@ -181,3 +181,10 @@ def notify_crypto_eod_report(report_date: str, fills: list[dict], positions: lis
         lines.append("\n*Crypto positions:* none")
 
     _post("\n".join(lines))
+
+
+def notify_analyst_explain(narrative: str, report_date: str) -> None:
+    """Posts the /analyst-explain skill's synthesized narrative -- unlike every other notify_*
+    function, this isn't called from any pipeline; the skill only calls it when the user
+    explicitly asks to share the explanation, not on every invocation."""
+    _post(f"📊 *Analyst Explain — {report_date}* _{_timestamp()}_\n{narrative}")

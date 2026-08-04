@@ -113,3 +113,21 @@ any `error`/`no_fill` events today that a human should probably look into.
 
 Do not fabricate rationale for a symbol that has no matching DB row — say
 "no recorded Dealer decision for this symbol today" instead.
+
+## Step 4 — Posting to Slack (only if explicitly asked)
+
+This skill is chat-only by default — the narrative from Step 3 is not posted
+anywhere on its own. Only post it to `#miramar-trading-floor` if the user
+explicitly asks to share/post it (e.g. "post that to slack", "share this with
+the team"). Reuse the same pod exec pattern as Step 1, calling
+`slack.notify_analyst_explain(narrative, report_date)` with the exact
+narrative text already shown in chat — don't regenerate or summarize it:
+
+```bash
+kubectl exec -i -n multi-agent-ai-trader deploy/dealer -- python3 <<'PYEOF'
+from src.common import slack
+
+narrative = """<the Step 3 narrative, verbatim>"""
+slack.notify_analyst_explain(narrative, "<today's ET date, YYYY-MM-DD>")
+PYEOF
+```

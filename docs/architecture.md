@@ -41,8 +41,9 @@ Analyst and Floor Broker never talk to each other directly. There is no message 
 no shared filesystem — the only *coordination* state between agents is the `portfolio`
 ConfigMap, and the only network hop is Dealer → Floor Broker. Separately, all three agents
 also write fire-and-forget history rows to Postgres (see [Persistence](#persistence) below)
-— that's an append-only audit trail read back by `/analyst-explain`, not a coordination
-channel any agent depends on to function.
+— that's an append-only audit trail read back by `/analyst-explain` and, since
+`fetch_track_record`, by the Analyst itself, not a coordination channel any agent depends on
+to function.
 
 Independently of that cycle, a fourth CronJob queries Alpaca directly once a day after market
 close and posts a summary to Slack — it has no dependency on the ConfigMap or on Dealer/Floor
@@ -98,14 +99,15 @@ never skips its entire run on a closed day.
 **Purpose:** once a day, decide *which symbols are worth trading today* and hand that list
 off to the Dealer.
 
-**Implementation:** a 7-node LangGraph state machine (`src/analyst/graph.py`) over an
+**Implementation:** an 8-node LangGraph state machine (`src/analyst/graph.py`) over an
 `AnalystState`:
 
 | Node | What it does |
 |---|---|
 | `discover_candidates` | when `cfg.trading.enable_stocks` **and** `state["stock_market_open"]` (set once in `main.py`, see above), `sources.fetch_screener_candidates(screener_top_n=20)` — raw REST calls (not wrapped by `alpaca-py`) to Alpaca's `/v1beta1/screener/stocks/most-actives` and `/movers` endpoints, merged into a symbol→{volume, change_pct} dict, each tagged `market: "stocks"`. When `cfg.trading.enable_crypto`, also `sources.fetch_crypto_candidates(...)` — a fixed watchlist (`BTC/USD`, `ETH/USD`, `SOL/USD`; Alpaca's crypto screener has no most-actives equivalent) merged with `/v1beta1/screener/crypto/movers`, tagged `market: cfg.trading.crypto_taapi_exchange`. Crypto discovery is **not** gated on the stock-market-open flag — it always runs when enabled |
-| `fetch_research` | `sources.fetch_news(news_days=2)` (Alpaca News API, HTML stripped via BeautifulSoup) + `sources.fetch_yahoo_rss_headlines(...)` (Yahoo Finance RSS), concatenated into plain text |
-| `fetch_indicators` | ranks `raw_candidates` by `abs(change_pct)` (missing values sort last) and calls `src.common.indicators.fetch_indicators_bulk` (shared with the Dealer) for the top `cfg.analyst.indicator_fetch_limit` (default 15) — one TAAPI `/bulk` POST per symbol covering `rsi, macd, vwap, bbands, sma, ema`, sleeping `cfg.taapi.min_request_interval_secs` between calls to respect TAAPI's free-tier 1-req/15s cap. At the default limit this adds ~3.5 minutes to the once-daily run — accepted as a fixed cost of a pre-market CronJob, unlike the Dealer's 10-minute poll cycle where the same rate limit is a tighter constraint. Not every candidate gets indicator data; only the top movers by size do |
+| `fetch_research` | gated on `cfg.analyst.enable_news` (short-circuits before any network call when false) — `sources.fetch_news(news_days=2)` (Alpaca News API, HTML stripped via BeautifulSoup) + `sources.fetch_yahoo_rss_headlines(...)` (Yahoo Finance RSS), concatenated into plain text |
+| `fetch_indicators` | gated on `cfg.analyst.enable_indicators` (short-circuits before any TAAPI call when false) — ranks `raw_candidates` by `abs(change_pct)` (missing values sort last) and calls `src.common.indicators.fetch_indicators_bulk` (shared with the Dealer) for the top `cfg.analyst.indicator_fetch_limit` (default 15) — one TAAPI `/bulk` POST per symbol covering `rsi, macd, vwap, bbands, sma, ema`, sleeping `cfg.taapi.min_request_interval_secs` between calls to respect TAAPI's free-tier 1-req/15s cap. At the default limit this adds ~3.5 minutes to the once-daily run — accepted as a fixed cost of a pre-market CronJob, unlike the Dealer's 10-minute poll cycle where the same rate limit is a tighter constraint. Not every candidate gets indicator data; only the top movers by size do |
+| `fetch_track_record` | gated on `cfg.analyst.enable_track_record` (short-circuits before any DB call when false) — reads the Analyst's own pick history plus matching Dealer decisions and Floor Broker events from Postgres via `db.fetch_analyst_picks_since()`/`fetch_dealer_decisions_since()`/`fetch_floor_broker_events_since()` for the last `cfg.analyst.track_record_days` (default 5) calendar days, formatted as plain text (qualitative sequence only — no computed P&L; see [Persistence](#persistence)). Runs before `write_portfolio` records this run's own picks, so a symbol picked *this* run never appears in its own track record |
 | `llm_select` | the actual LLM call — see below |
 | `validate_selection` | overrides each pick's `exchange` field with the `market` tag `discover_candidates` actually assigned that symbol (never trusts the LLM's own copy of `exchange`), and drops any pick whose symbol isn't in `raw_candidates` at all (a hallucination) |
 | `write_portfolio` | patches the `portfolio` ConfigMap via the `kubernetes` Python client |
@@ -115,7 +117,8 @@ off to the Dealer.
 flowchart TD
     A[discover_candidates] --> B[fetch_research]
     B --> C[fetch_indicators]
-    C --> D[llm_select]
+    C --> C2[fetch_track_record]
+    C2 --> D[llm_select]
     D --> E[validate_selection]
     E --> F[write_portfolio]
     F --> G[crypto_eod_report]
@@ -582,9 +585,12 @@ v0.6.1 are unrecoverable, same limitation as the Slack-only trail it replaces. (
 a schema bug — `CREATE INDEX` on a `timestamptz::date` expression isn't `IMMUTABLE`, which
 rolled back table creation entirely and silently wrote zero rows until the v0.6.1 fix; the
 current schema indexes the raw `(symbol, timestamp)` columns instead.) Read access is
-via `db.py`'s `fetch_*_for_date()` functions, used by the read-only `/analyst-explain` skill
-(`skills/analyst-explain/SKILL.md`) to explain a trading day's P&L using the actual logged
-Dealer reasoning rather than a generic summary.
+via two families of functions in `db.py`: `fetch_*_for_date()`, used by the read-only
+`/analyst-explain` skill (`skills/analyst-explain/SKILL.md`) to explain a trading day's P&L
+using the actual logged Dealer reasoning rather than a generic summary; and `fetch_*_since()`,
+used by `fetch_track_record` (see [Agent 1 — Analyst](#agent-1--analyst-srcanalyst)) to feed
+the Analyst's own recent pick history back into its LLM prompt — the first read path that
+isn't purely for human/skill consumption.
 
 ## Data flow — one full cycle
 
@@ -635,6 +641,10 @@ Dealer reasoning rather than a generic summary.
 | `analyst` | `schedule` | informational copy of the CronJob's own `spec.schedule` — not templated, must be kept in sync manually |
 | `analyst` | `max_universe_size`, `default_budget`, `screener_top_n`, `news_days`, `yahoo_rss_url` | Analyst's selection parameters |
 | `analyst` | `indicator_fetch_limit` | candidates (top-N by `abs(change_pct)`) that get a real TAAPI `/bulk` indicator fetch in `fetch_indicators` (default 15) — capped by the TAAPI free-tier 15s/request limit |
+| `analyst` | `enable_news` | feature gate for `fetch_research` — when false, short-circuits before any Alpaca News/Yahoo RSS call and feeds the LLM an empty research text |
+| `analyst` | `enable_indicators` | feature gate for `fetch_indicators` — when false, short-circuits before any TAAPI call and feeds the LLM an empty indicator text |
+| `analyst` | `enable_track_record` | feature gate for `fetch_track_record` — when false, short-circuits before any Postgres read and feeds the LLM an empty track-record text |
+| `analyst` | `track_record_days` | lookback window in calendar days for `fetch_track_record` (default 5); excludes today by construction, since the node runs before `write_portfolio`'s DB write in the same run |
 | `indicators` | list of `{name, properties}` | TAAPI.io query-parameter catalog per indicator, shared by Dealer |
 
 ## Risk controls and failure handling

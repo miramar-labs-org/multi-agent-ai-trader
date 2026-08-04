@@ -174,12 +174,15 @@ context, and parse the response into a strict structured-output schema (via Lang
 `.with_structured_output()` — no hand-rolled JSON parsing). Both are implemented as small
 [LangGraph](https://langchain-ai.github.io/langgraph/) state machines:
 
-- **Analyst** (7 nodes): discover screener candidates (stocks and/or a fixed crypto watchlist,
+- **Analyst** (8 nodes): discover screener candidates (stocks and/or a fixed crypto watchlist,
   per `trading.enable_stocks`/`enable_crypto`) → fetch news/RSS research → fetch real TAAPI
-  indicators for the top candidates by move size → LLM picks up to 10 symbols with a budget
-  and rationale each → validate each pick's exchange against the actual candidate it came from
-  (dropping any hallucinated symbol) → write the `portfolio` ConfigMap → if crypto is enabled,
-  post a crypto-only EOD report to Slack.
+  indicators for the top candidates by move size → fetch its own recent track record (past
+  picks, Dealer decisions, Floor Broker outcomes, read from Postgres) → LLM picks up to 10
+  symbols with a budget and rationale each → validate each pick's exchange against the actual
+  candidate it came from (dropping any hallucinated symbol) → write the `portfolio` ConfigMap →
+  if crypto is enabled, post a crypto-only EOD report to Slack. News, indicators, and track
+  record are each individually feature-gated (`analyst.enable_news`/`enable_indicators`/
+  `enable_track_record`).
 - **Dealer** (3 nodes, per symbol per poll): fetch technical indicators → LLM decides
   BUY/HOLD/SELL → if not HOLD, dispatch to Floor Broker over HTTP.
 
