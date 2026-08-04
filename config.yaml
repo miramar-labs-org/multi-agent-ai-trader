@@ -40,8 +40,9 @@ strategy:
   max_concurrent_positions: 10    # recorded intent only -- analyst.max_universe_size already caps concurrent picks
 
 eod_report:
-  schedule: "30 21 * * *"   # informational copy of the CronJob's own spec.schedule — 21:30 UTC daily, after
-                            # market close; runs every day so closed days get a Slack notice, not silence
+  schedule: "30 17 * * *"   # informational copy of the CronJob's own spec.schedule — 17:30 America/New_York
+                            # daily (spec.timeZone), ~90min after the 4pm ET close; runs every day so closed
+                            # days get a Slack notice, not silence
 
 analyst:
   schedule: "55 8 * * *"      # informational copy of the CronJob's own spec.schedule — 08:55 America/New_York

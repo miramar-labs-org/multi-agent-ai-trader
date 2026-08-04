@@ -4,8 +4,15 @@ metadata:
   name: eod-report
   namespace: multi-agent-ai-trader
 spec:
-  schedule: "30 21 * * *"  # 21:30 UTC daily (not just Mon-Fri) — main()'s calendar check posts a Slack
-                           # market-closed notice on weekends/holidays — matches config.yaml's eod_report.schedule
+  # 17:30 America/New_York -- ~90min after the 4pm ET close, giving fills time to settle. timeZone
+  # (not a fixed UTC offset) keeps this correct across DST without manual adjustment; a bare UTC
+  # schedule was previously interpreted in the cluster host's local timezone, firing hours late and
+  # rolling past the US/Eastern midnight boundary, which made main()'s `today` compute the next
+  # (not-yet-open) trading day and report 0 fills.
+  # Runs daily (not just Mon-Fri) -- main()'s calendar check posts a Slack market-closed notice on
+  # weekends/holidays. Matches config.yaml's eod_report.schedule -- keep both in sync.
+  schedule: "30 17 * * *"
+  timeZone: "America/New_York"
   concurrencyPolicy: Forbid
   jobTemplate:
     spec:
