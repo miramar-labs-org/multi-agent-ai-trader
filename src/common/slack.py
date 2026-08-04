@@ -88,6 +88,13 @@ def notify_floor_broker_result(
     _post("\n".join(lines))
 
 
+def notify_buy_kill_switch(active: bool) -> None:
+    if active:
+        _post(f"🛑 *Floor Broker* — BUY kill switch ACTIVATED. New BUY orders blocked; SELL still allowed. _{_timestamp()}_")
+    else:
+        _post(f"✅ *Floor Broker* — BUY kill switch DEACTIVATED. BUY orders resumed. _{_timestamp()}_")
+
+
 def notify_error(component: str, text: str) -> None:
     _post(f"🚨 *ERROR [{component}]* {text} _{_timestamp()}_")
 

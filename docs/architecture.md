@@ -231,9 +231,10 @@ original 4 positional arguments, so those optional fields simply render as absen
 
 ## Agent 3 — Floor Broker (`src/floor_broker/`)
 
-**Workload:** `apps/v1 Deployment` + `ClusterIP Service` on port 8000. No ServiceAccount —
-unlike Analyst/Dealer it never touches the k8s API (it doesn't read/write the portfolio
-ConfigMap). Entrypoint: `uvicorn.run("src.floor_broker.app:app", host="0.0.0.0", port=8000)`.
+**Workload:** `apps/v1 Deployment` + `ClusterIP Service` on port 8000. Uses the shared
+`multi-agent-ai-trader-configmap-reader` ServiceAccount (ROADMAP P0.5) to read the
+`buy-kill-switch` ConfigMap — it still never reads/writes the portfolio ConfigMap Analyst/Dealer
+use. Entrypoint: `uvicorn.run("src.floor_broker.app:app", host="0.0.0.0", port=8000)`.
 
 **Purpose:** the only component that actually talks to Alpaca's *trading* API (Analyst and
 Dealer only use Alpaca's *data*/*screener*/*news* endpoints). Purely mechanical — it never
@@ -311,6 +312,32 @@ tracking; the underlying TP/SL order still executes correctly on Alpaca's side (
 bracket, not Floor Broker), but the Slack notice for that particular fill is silently missed.
 Accepted tradeoff — Floor Broker already holds no other durable state (see the workload note
 above), and adding persistence here for one notification path isn't worth a new dependency.
+
+**Runtime BUY kill switch (ROADMAP P0.5).** `src/common/kill_switch.py::buy_kill_switch_active()`
+reads the `buy-kill-switch` ConfigMap fresh (no caching) at the very top of `execution.buy()`,
+before any position/order lookup. If active, the BUY is skipped
+(`status="skipped", reason="buy_kill_switch_active"`) without ever calling Alpaca; `sell()` is
+completely untouched, so SELL always remains available even with the switch on. A missing
+ConfigMap (e.g. before the deploy workflow's seed step has ever run) fails open — treated as
+inactive rather than blocking every BUY on a setup gap — but any other k8s API error propagates.
+`src/floor_broker/main.py::poll_kill_switch()` runs alongside `poll_bracket_fills()` as a second
+daemon thread, checking the switch every `KILL_SWITCH_POLL_INTERVAL_S` (30s) purely to post a
+Slack notice (`slack.notify_buy_kill_switch`) on a state *transition* — `/execute` itself already
+re-checks the switch fresh on every request, so this thread never gates trading, only reports on
+it. The first poll after a pod start only discovers the switch's current state and never counts
+as a transition.
+
+Runbook — activate/deactivate without a redeploy:
+```sh
+# Block new BUY orders (SELL remains permitted):
+kubectl patch configmap buy-kill-switch -n multi-agent-ai-trader --type merge -p '{"data":{"active":"true"}}'
+
+# Resume BUY orders:
+kubectl patch configmap buy-kill-switch -n multi-agent-ai-trader --type merge -p '{"data":{"active":"false"}}'
+
+# Check current state:
+kubectl get configmap buy-kill-switch -n multi-agent-ai-trader -o jsonpath='{.data.active}'
+```
 
 ## EOD Report (`src/eod_report/`)
 

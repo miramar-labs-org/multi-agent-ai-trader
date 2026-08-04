@@ -11,6 +11,7 @@ from alpaca.trading.requests import (
     TakeProfitRequest,
 )
 
+from src.common import kill_switch
 from src.common.alpaca_client import get_current_ask_price, trading_client
 from src.common.logging import get_logger
 
@@ -22,6 +23,18 @@ FILL_POLL_ATTEMPTS = 5
 FILL_POLL_INTERVAL_S = 1.0
 
 _TERMINAL_NO_FILL = {OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED}
+
+
+class InvalidOrderParameters(Exception):
+    """Raised when a stock bracket order's computed quantity/prices fail the invariant checks
+    below before submission (ROADMAP P0.9) -- a stale/zero quote or an inverted SL/TP
+    relationship should never reach Alpaca as a live order."""
+
+
+class InsufficientQuantity(InvalidOrderParameters):
+    """The specific InvalidOrderParameters case where the budget affords less than one whole
+    share at the reference price -- not a bug, just too little budget for the current price, so
+    buy() turns this into a normal status="skipped" outcome rather than propagating."""
 
 # Tracks the parent order id of each open bracket BUY, keyed by symbol, so the fill-watcher
 # (check_bracket_fills) can later find out which of its TP/SL legs eventually filled. In-memory
@@ -93,9 +106,8 @@ def cancel_related_orders(order_ids: list[str]) -> None:
                 raise
 
 
-def get_qty(symbol: str, budget: float) -> int:
-    ask = get_current_ask_price(symbol)
-    if ask == 0:
+def get_qty(ask: float, budget: float) -> int:
+    if ask <= 0:
         return 0
     return int(budget // ask)
 
@@ -104,6 +116,26 @@ def _round_to_tick(price: float) -> float:
     # SEC Rule 612 / Alpaca: sub-$1 stocks are quoted in $0.0001 increments, not $0.01 --
     # rounding to 2dp for these can land TP/SL on the same cent as base_price and get rejected.
     return round(price, 4) if price < 1.0 else round(price, 2)
+
+
+def _validate_bracket_order(ask: float, qty: int, budget: float, stop_loss_px: float, take_profit_px: float) -> None:
+    """Invariant checks (ROADMAP P0.9) run just before a stock bracket order is built, using the
+    same single reference price (`ask`) that sized `qty` and priced `stop_loss_px`/
+    `take_profit_px` -- see P0.8: these three values must all derive from one quote, not
+    independent ones fetched moments apart."""
+    if ask <= 0:
+        raise InvalidOrderParameters(f"non-positive reference price: {ask}")
+    if budget <= 0:
+        raise InvalidOrderParameters(f"non-positive budget: {budget}")
+    if qty < 1:
+        raise InsufficientQuantity(f"budget {budget} affords < 1 share at reference price {ask}")
+    if not (0 < stop_loss_px < ask < take_profit_px):
+        raise InvalidOrderParameters(
+            f"invalid SL/TP relationship: stop_loss={stop_loss_px} ask={ask} take_profit={take_profit_px}"
+        )
+    estimated_notional = qty * ask
+    if estimated_notional > budget:
+        raise InvalidOrderParameters(f"estimated notional {estimated_notional} exceeds authorized budget {budget}")
 
 
 def bracket_buy_with_SLTP(
@@ -125,11 +157,18 @@ def bracket_buy_with_SLTP(
     take_profit_px = max(_round_to_tick(ask * tpP), _round_to_tick(ask + 0.02))
     stop_loss_px = min(_round_to_tick(ask * slP), _round_to_tick(ask - 0.02))
 
-    log(f"📈  ask-price {ask:.2f} => TP {take_profit_px}  |  SL {stop_loss_px}")
+    # Quantity is sized off the same `ask` used for TP/SL above (P0.8) -- previously get_qty()
+    # fetched its own independent quote, so qty and bracket prices could be based on different
+    # market snapshots.
+    qty = get_qty(ask, budget)
+
+    log(f"📈  ask-price {ask:.2f} => TP {take_profit_px}  |  SL {stop_loss_px}  |  qty {qty}")
+
+    _validate_bracket_order(ask, qty, budget, stop_loss_px, take_profit_px)
 
     return MarketOrderRequest(
         symbol=symbol,
-        qty=get_qty(symbol, budget),
+        qty=qty,
         side=OrderSide.BUY,
         time_in_force=TimeInForce.DAY,
         order_class=OrderClass.BRACKET,
@@ -139,6 +178,13 @@ def bracket_buy_with_SLTP(
 
 
 def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> dict:
+    # ROADMAP P0.5: an operator-controlled runtime switch, checked fresh on every BUY (never
+    # cached) so a kubectl patch takes effect on the very next request without a redeploy. SELL
+    # is deliberately untouched -- the switch only ever blocks new exposure, never an exit.
+    if kill_switch.buy_kill_switch_active():
+        log(f"🛑  BUY kill switch active -- skipping BUY {symbol}")
+        return {"status": "skipped", "reason": "buy_kill_switch_active", "detail": "BUY kill switch is active"}
+
     op = get_open_position(symbol)
 
     oo = trading_client.get_orders(GetOrdersRequest(status="open"))
@@ -149,7 +195,11 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
         return {"status": "skipped", "detail": "open orders/positions exist"}
 
     if exchange == "stocks":
-        req = bracket_buy_with_SLTP(symbol, budget, slP, tpP)
+        try:
+            req = bracket_buy_with_SLTP(symbol, budget, slP, tpP)
+        except InsufficientQuantity as exc:
+            log(f"⚠️  {exc} -- skipping BUY")
+            return {"status": "skipped", "reason": "insufficient_qty", "detail": str(exc)}
     else:
         # Alpaca rejects a crypto notional with more than 2 decimal places (code 42210000); the
         # BTCUSD failure came from a `budget` value with more precision than that (e.g. a
@@ -194,7 +244,11 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
         # symbols -- rather than guess an ever-bigger buffer around our own quote, retry once
         # using Alpaca's own authoritative reference price straight from the rejection.
         log(f"🔄  retrying BUY {symbol} priced off Alpaca's own base_price {base_price} ...")
-        req = bracket_buy_with_SLTP(symbol, budget, slP, tpP, base_price=float(base_price))
+        try:
+            req = bracket_buy_with_SLTP(symbol, budget, slP, tpP, base_price=float(base_price))
+        except InsufficientQuantity as retry_exc:
+            log(f"⚠️  {retry_exc} -- skipping BUY on retry")
+            return {"status": "skipped", "reason": "insufficient_qty", "detail": str(retry_exc)}
         order = trading_client.submit_order(req)
 
     log(f"✅  buy order submitted: {order.id}")

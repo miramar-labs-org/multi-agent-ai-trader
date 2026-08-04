@@ -44,6 +44,27 @@ def test_notify_floor_broker_result_includes_timestamp_and_opening_position_fiel
     assert "TP: $13.00" in text
 
 
+def test_notify_buy_kill_switch_activated_mentions_buy_blocked_and_sell_allowed(monkeypatch):
+    posted = {}
+    monkeypatch.setattr(slack, "_post", lambda text: posted.update(text=text))
+
+    slack.notify_buy_kill_switch(True)
+
+    assert "ACTIVATED" in posted["text"]
+    assert "blocked" in posted["text"]
+    assert "SELL" in posted["text"]
+
+
+def test_notify_buy_kill_switch_deactivated_mentions_resumed(monkeypatch):
+    posted = {}
+    monkeypatch.setattr(slack, "_post", lambda text: posted.update(text=text))
+
+    slack.notify_buy_kill_switch(False)
+
+    assert "DEACTIVATED" in posted["text"]
+    assert "resumed" in posted["text"]
+
+
 def test_notify_floor_broker_result_omits_extra_line_when_no_optional_fields_given(monkeypatch):
     posted = {}
     monkeypatch.setattr(slack, "_post", lambda text: posted.update(text=text))

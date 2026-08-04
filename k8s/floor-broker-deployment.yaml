@@ -13,6 +13,7 @@ spec:
       labels:
         app: floor-broker
     spec:
+      serviceAccountName: multi-agent-ai-trader-configmap-reader
       containers:
         - name: floor-broker
           image: IMAGE_FLOOR_BROKER_PLACEHOLDER

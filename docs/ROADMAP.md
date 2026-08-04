@@ -18,13 +18,13 @@ All trading remains **paper-only**. SELL operations that reduce exposure should 
 |---|---|---:|---|---|
 | P0.1 | Skip crypto orders below minimum notional | P0 | Done | — |
 | P0.2 | Validate merged-position budget semantics | P0 | Done | P0.1 |
-| P0.3 | Constrained Floor Broker request schema | P0 | Planned | — |
+| P0.3 | Constrained Floor Broker request schema | P0 | Partial (see below) | — |
 | P0.4 | Centralized Floor Broker risk policy | P0 | Planned | P0.3 |
-| P0.5 | Runtime BUY kill switch | P0 | Planned | P0.4 |
+| P0.5 | Runtime BUY kill switch | P0 | Done (required behavior only; see below) | P0.4 |
 | P0.6 | Serialize risk check and order submission | P0 | Planned | P0.4 |
 | P0.7 | Idempotent execution and Alpaca client order IDs | P0 | Planned | P0.3 |
-| P0.8 | Single-quote stock sizing | P0 | Planned | — |
-| P0.9 | Quantity and bracket-price invariant checks | P0 | Planned | P0.8 |
+| P0.8 | Single-quote stock sizing | P0 | Done | — |
+| P0.9 | Quantity and bracket-price invariant checks | P0 | Done | P0.8 |
 | P0.10 | Structured execution outcomes and HTTP contract | P0 | Planned | P0.3 |
 | P0.11 | Dependency split and reproducible pinning | P0 | Planned | — |
 | P0.12 | CI, linting, validation, and image-build checks | P0 | Partial (pytest + ruff check only; see below) | P0.11 |
@@ -110,6 +110,19 @@ Define separate fields when necessary:
 
 ## P0.3 — Constrained Floor Broker request schema
 
+**Partial.** `ExecuteRequest` (`src/floor_broker/app.py`) now normalizes and constrains `symbol`
+(stripped, uppercased, letters/digits with at most one `/`), `exchange` (stripped, lowercased,
+`stocks` or an identifier shape — not a fixed enum, since `cfg.trading.crypto_taapi_exchange` is
+config-driven), `budget` (`0 < budget <= MAX_BUDGET`, a 100,000 sanity ceiling — 20x
+`config.yaml`'s `analyst.default_budget`), `slP` (`0 < slP < 1`), and `tpP` (`1 < tpP < 2`), and
+rejects unknown fields (`extra="forbid"`). `action` was already a `Literal["BUY","SELL"]`.
+Invalid requests fail FastAPI's own validation (422) before `execution.buy()`/`sell()` is ever
+called. Tests: `tests/floor_broker/test_app.py`.
+
+Not yet done — deliberately deferred, not forgotten: a required `decision_id` field, which needs
+Dealer's request payload changed too and is really P0.7's (idempotent execution) concern, not
+just a schema constraint. Revisit as part of P0.7.
+
 ### Problem
 
 `ExecuteRequest` currently validates types but does not enforce meaningful domain constraints.
@@ -194,6 +207,30 @@ BUY risk checks fail closed when required Alpaca account, position, or order sta
 ---
 
 ## P0.5 — Runtime BUY kill switch
+
+**Done, required behavior only** — the optional follow-up (cancel open BUY orders on
+activation) is deliberately out of scope. `src/common/kill_switch.py::buy_kill_switch_active()`
+reads a new `buy-kill-switch` ConfigMap (`data.active`, `"true"`/`"false"`) fresh on every call
+via the `kubernetes` client — no caching, so an operator's `kubectl patch` takes effect on the
+very next `/execute` BUY request without a redeploy. A missing ConfigMap (404) fails open
+(treated as inactive, since the deploy workflow always seeds it — a 404 means a setup gap, not a
+deliberate activation); any other k8s API error propagates. `execution.buy()` checks this first,
+before any position/order lookup, and returns `status="skipped", reason="buy_kill_switch_active"`
+without ever calling Alpaca; `sell()` is untouched, so SELL stays available. Floor Broker now
+uses the existing shared `multi-agent-ai-trader-configmap-reader` ServiceAccount/Role/RoleBinding
+(`k8s/rbac.yaml`) rather than a new one, since its verbs already cover the required read.
+`src/floor_broker/main.py::poll_kill_switch()` is a second daemon thread (mirroring
+`poll_bracket_fills()`) that posts a Slack notice (`slack.notify_buy_kill_switch`) only on a
+state transition, not on every 30s poll. The ConfigMap is seeded once via
+`k8s/buy-kill-switch-configmap.yaml` and a new `.github/workflows/deploy.yaml` step (same
+seed-once pattern as the `portfolio` ConfigMap — never clobbered on redeploy). Runbook commands
+are documented in `docs/architecture.md`'s Floor Broker section and in
+`k8s/buy-kill-switch-configmap.yaml` itself. Tests: `tests/common/test_kill_switch.py` (active/
+inactive/missing-key/404-fail-open/non-404-raises), `tests/floor_broker/test_execution.py`
+(`test_buy_skips_with_kill_switch_reason_when_active_and_touches_no_client`,
+`test_sell_still_permitted_when_kill_switch_active`), `tests/floor_broker/test_floor_broker_main.py`
+(`test_poll_kill_switch_notifies_only_on_transition` and related), and
+`tests/common/test_slack.py` (`test_notify_buy_kill_switch_*`).
 
 ### Problem
 
@@ -294,6 +331,13 @@ Durable cross-restart event storage remains P1, but Alpaca order lookup must pro
 
 ## P0.8 — Single-quote stock sizing
 
+**Done.** `execution.get_qty()` now takes `ask` as a parameter instead of fetching its own
+quote; `bracket_buy_with_SLTP()` fetches `ask` once and passes that same value into `get_qty()`
+and the TP/SL calculation. The `base_price` retry path recomputes qty and prices from the same
+`base_price` reference. Tests: `test_bracket_buy_uses_a_single_quote_for_qty_and_prices`
+(asserts `get_current_ask_price()` is called exactly once) in
+`tests/floor_broker/test_execution.py`.
+
 ### Problem
 
 Bracket price calculation and quantity sizing currently fetch independent ask prices.
@@ -326,6 +370,18 @@ On retry:
 ---
 
 ## P0.9 — Quantity and bracket-price invariant checks
+
+**Done.** `execution._validate_bracket_order()` enforces `reference_price > 0`, `budget > 0`,
+`qty >= 1`, `0 < stop_loss_px < reference_price < take_profit_px`, and
+`estimated_notional <= budget`, called from `bracket_buy_with_SLTP()` just before the order is
+built. Two typed exceptions: `InvalidOrderParameters` (bad quote/price relationship — propagates
+as an unexpected error, matching this repo's existing "unexpected exceptions become a loud
+failure" convention in `app.py`) and its subclass `InsufficientQuantity` (`qty < 1` — an
+expected, not exceptional, outcome; `buy()` catches this specifically and returns
+`status="skipped", reason="insufficient_qty"`, on both the initial attempt and the `base_price`
+retry). Tests cover zero-price quotes, a stop-loss price going non-positive on an
+extremely-low-priced symbol, and the insufficient-qty skip path on both the initial and retry
+attempts.
 
 ### Change
 

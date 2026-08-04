@@ -6,7 +6,7 @@ name: Deploy
 #
 # The mlabs-api-keys secret (broker/LLM API credentials) is NOT created here —
 # it must already exist in the namespace (see k8s/secrets.example.yaml).
-# The portfolio ConfigMap is seeded once and never clobbered on re-deploy.
+# The portfolio and buy-kill-switch ConfigMaps are seeded once and never clobbered on re-deploy.
 #
 # Run undeploy.yaml to tear the whole namespace down.
 
@@ -60,6 +60,11 @@ jobs:
         run: |
           kubectl get configmap portfolio -n "$PROJECT_NAME" > /dev/null 2>&1 || \
             kubectl apply --validate=false -f k8s/portfolio-configmap.yaml
+
+      - name: Seed buy-kill-switch ConfigMap (once)
+        run: |
+          kubectl get configmap buy-kill-switch -n "$PROJECT_NAME" > /dev/null 2>&1 || \
+            kubectl apply --validate=false -f k8s/buy-kill-switch-configmap.yaml
 
       - name: Build image URIs
         id: images

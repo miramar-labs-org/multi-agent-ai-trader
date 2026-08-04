@@ -2,12 +2,14 @@ name: Undeploy
 
 # Removes the full multi-agent-ai-trader namespace from K3s on the DGX —
 # Deployments (Dealer, Floor Broker), the Analyst CronJob, the Floor Broker
-# Service, the portfolio ConfigMap, and all Secrets (ghcr-pull, mlabs-api-keys).
+# Service, the portfolio and buy-kill-switch ConfigMaps, and all Secrets
+# (ghcr-pull, mlabs-api-keys).
 #
-# This is a full teardown: the portfolio ConfigMap and mlabs-api-keys secret
-# are deliberately removed along with everything else. A subsequent deploy
-# will re-seed an empty portfolio and require mlabs-api-keys to be re-created
-# manually (see k8s/secrets.example.yaml).
+# This is a full teardown: the portfolio ConfigMap, buy-kill-switch ConfigMap,
+# and mlabs-api-keys secret are deliberately removed along with everything
+# else. A subsequent deploy will re-seed an empty portfolio and an inactive
+# kill switch, and will require mlabs-api-keys to be re-created manually (see
+# k8s/secrets.example.yaml).
 
 on:
   workflow_dispatch:
@@ -37,9 +39,10 @@ jobs:
             echo "- Deployments (dealer, floor-broker)"
             echo "- CronJob (analyst)"
             echo "- Service (floor-broker)"
-            echo "- ConfigMap (portfolio)"
+            echo "- ConfigMaps (portfolio, buy-kill-switch)"
             echo "- Secrets (ghcr-pull, mlabs-api-keys)"
             echo ""
             echo "A subsequent deploy will need \`mlabs-api-keys\` re-created manually"
-            echo "(see k8s/secrets.example.yaml) and the portfolio ConfigMap will re-seed empty."
+            echo "(see k8s/secrets.example.yaml); the portfolio ConfigMap will re-seed empty"
+            echo "and the buy-kill-switch ConfigMap will re-seed inactive."
           } >> "$GITHUB_STEP_SUMMARY"

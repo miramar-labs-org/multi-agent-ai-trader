@@ -22,6 +22,14 @@ def _clear_tracked_brackets():
     execution._tracked_brackets.clear()
 
 
+@pytest.fixture(autouse=True)
+def _kill_switch_inactive(monkeypatch):
+    """ROADMAP P0.5: every test in this file exercises buy() without a live k8s API to read the
+    real ConfigMap against -- default the switch to inactive so existing BUY-path tests are
+    unaffected; tests that care about the switch itself override this explicitly."""
+    monkeypatch.setattr(execution.kill_switch, "buy_kill_switch_active", lambda: False)
+
+
 class FakeTradingClient:
     """Stands in for alpaca-py's TradingClient. `submit_order` raises the given rejection(s)
     in order, then succeeds -- lets tests replay real Alpaca rejection payloads without any
@@ -96,6 +104,79 @@ def test_round_to_tick_sub_dollar_precision():
     $0.0001 increments below $1); 4-decimal rounding must be used instead."""
     assert execution._round_to_tick(0.158368) == 0.1584
     assert execution._round_to_tick(2.32 * 0.98) == 2.27
+
+
+def test_bracket_buy_uses_a_single_quote_for_qty_and_prices(monkeypatch):
+    """Regression for P0.8: get_qty() used to fetch its own independent ask, so quantity and
+    TP/SL could be priced off different market snapshots. get_current_ask_price() must now be
+    called exactly once per bracket-BUY attempt, and the resulting qty must be consistent with
+    that single ask."""
+    calls = []
+
+    def _fake_ask(symbol):
+        calls.append(symbol)
+        return 10.0
+
+    monkeypatch.setattr(execution, "get_current_ask_price", _fake_ask)
+
+    req = execution.bracket_buy_with_SLTP("MGN", budget=5000.0, slP=0.98, tpP=1.05)
+
+    assert calls == ["MGN"], "get_current_ask_price must be called exactly once"
+    assert req.qty == 500  # int(5000.0 // 10.0)
+
+
+def test_bracket_buy_raises_on_zero_price_quote(monkeypatch):
+    """P0.9: a zero-price quote must not produce an order."""
+    monkeypatch.setattr(execution, "get_current_ask_price", lambda symbol: 0.0)
+
+    with pytest.raises(execution.InvalidOrderParameters):
+        execution.bracket_buy_with_SLTP("MGN", budget=5000.0, slP=0.98, tpP=1.05)
+
+
+def test_bracket_buy_raises_when_stop_loss_goes_non_positive(monkeypatch):
+    """P0.9: on an extremely low-priced symbol, `ask - 0.02` can go to zero or negative --
+    stop_loss_px must stay strictly positive and below the reference price, or the order must
+    be rejected before submission rather than sent to Alpaca."""
+    monkeypatch.setattr(execution, "get_current_ask_price", lambda symbol: 0.01)
+
+    with pytest.raises(execution.InvalidOrderParameters):
+        execution.bracket_buy_with_SLTP("MGN", budget=5000.0, slP=0.98, tpP=1.05)
+
+
+def test_buy_skips_with_insufficient_qty_reason_when_budget_affords_less_than_one_share(monkeypatch):
+    """P0.9: qty < 1 is a normal, expected outcome (budget too small for the current price at
+    all) rather than a bug -- must produce a status="skipped" result, not an exception, and
+    must never call submit_order."""
+    fake_client = FakeTradingClient()
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+    monkeypatch.setattr(execution, "get_current_ask_price", lambda symbol: 10000.0)
+
+    result = execution.buy("MGN", "stocks", 5000.0, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "insufficient_qty"
+    assert fake_client.submitted == []
+
+
+def test_buy_skips_with_insufficient_qty_reason_on_retry(monkeypatch):
+    """Same insufficient-qty skip, but reached via the base_price retry path -- a divergent
+    Alpaca base_price can itself push the affordable quantity below one share."""
+    rejection = {"base_price": "10000.00", "code": 42210000, "message": "stop_loss.stop_price must be <= base_price - 0.01"}
+    fake_client = FakeTradingClient(rejections=[rejection])
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+    monkeypatch.setattr(execution, "get_current_ask_price", lambda symbol: 1.0)
+
+    result = execution.buy("MGN", "stocks", 5000.0, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "insufficient_qty"
+    assert len(fake_client.submitted) == 1, "the initial (rejected) attempt submits once; the retry must not submit at all"
+
+
+def test_get_qty_uses_the_given_ask_not_a_fresh_quote():
+    assert execution.get_qty(ask=10.0, budget=5000.0) == 500
+    assert execution.get_qty(ask=0.0, budget=5000.0) == 0
+    assert execution.get_qty(ask=-1.0, budget=5000.0) == 0
 
 
 def test_bracket_clamps_tp_sl_to_minimum_cent_distance(monkeypatch):
@@ -323,6 +404,44 @@ def test_check_bracket_fills_untracks_symbol_when_both_legs_end_without_a_fill(m
 
     assert events == []
     assert "MGN" not in execution._tracked_brackets
+
+
+def test_buy_skips_with_kill_switch_reason_when_active_and_touches_no_client(monkeypatch):
+    """ROADMAP P0.5: an active BUY kill switch must block the BUY before any position/order
+    lookup or submission -- no `trading_client` monkeypatch is set up here on purpose, so this
+    test would error out trying to reach the real Alpaca API if the early-exit didn't fire
+    first."""
+    monkeypatch.setattr(execution.kill_switch, "buy_kill_switch_active", lambda: True)
+
+    result = execution.buy("MGN", "stocks", 5000.0, slP=0.98, tpP=1.05)
+
+    assert result == {
+        "status": "skipped",
+        "reason": "buy_kill_switch_active",
+        "detail": "BUY kill switch is active",
+    }
+
+
+def test_sell_still_permitted_when_kill_switch_active(monkeypatch):
+    """ROADMAP P0.5: the switch only ever blocks new BUY exposure -- SELL must be completely
+    unaffected by its state."""
+    monkeypatch.setattr(execution.kill_switch, "buy_kill_switch_active", lambda: True)
+
+    class FakeSellClient:
+        def get_open_position(self, symbol):
+            return type("Position", (), {"qty": "5"})()
+
+        def submit_order(self, req):
+            return type("Order", (), {"id": "sell-order-1"})()
+
+        def get_order_by_id(self, order_id, filter=None):
+            return type("Order", (), {"filled_avg_price": "12.00"})()
+
+    monkeypatch.setattr(execution, "trading_client", FakeSellClient())
+
+    result = execution.sell("MGN")
+
+    assert result["status"] == "executed"
 
 
 def test_check_bracket_fills_untracks_symbol_on_api_error(monkeypatch):

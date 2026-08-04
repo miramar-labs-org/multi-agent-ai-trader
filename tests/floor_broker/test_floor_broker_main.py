@@ -53,3 +53,55 @@ def test_poll_bracket_fills_survives_an_exception_and_reaches_the_next_sleep(mon
 
     with pytest.raises(_StopLoop):
         fb_main.poll_bracket_fills()
+
+
+def _stop_after(n):
+    """Lets poll_kill_switch() run for exactly `n` iterations (n calls to time.sleep()) before
+    breaking out via _StopLoop, so a multi-iteration transition sequence can be tested without an
+    infinite loop."""
+    calls = {"count": 0}
+
+    def _sleep(seconds):
+        calls["count"] += 1
+        if calls["count"] >= n:
+            raise _StopLoop
+
+    return _sleep
+
+
+def test_poll_kill_switch_posts_nothing_on_first_observation(monkeypatch):
+    """ROADMAP P0.5: the first poll only discovers whatever state the switch was seeded/left in
+    -- that's not a transition, and must not fire a Slack notice on its own."""
+    monkeypatch.setattr(fb_main.kill_switch, "buy_kill_switch_active", lambda: True)
+    posted = []
+    monkeypatch.setattr(fb_main.slack, "notify_buy_kill_switch", lambda active: posted.append(active))
+    monkeypatch.setattr(fb_main.time, "sleep", _stop_after(1))
+
+    with pytest.raises(_StopLoop):
+        fb_main.poll_kill_switch()
+
+    assert posted == []
+
+
+def test_poll_kill_switch_notifies_only_on_transition(monkeypatch):
+    states = iter([False, False, True, True, False])
+    monkeypatch.setattr(fb_main.kill_switch, "buy_kill_switch_active", lambda: next(states))
+    posted = []
+    monkeypatch.setattr(fb_main.slack, "notify_buy_kill_switch", lambda active: posted.append(active))
+    monkeypatch.setattr(fb_main.time, "sleep", _stop_after(5))
+
+    with pytest.raises(_StopLoop):
+        fb_main.poll_kill_switch()
+
+    assert posted == [True, False], "must notify on False->True and True->False, and nothing else"
+
+
+def test_poll_kill_switch_survives_an_exception_and_reaches_the_next_sleep(monkeypatch):
+    def _raise():
+        raise RuntimeError("apiserver unavailable")
+
+    monkeypatch.setattr(fb_main.kill_switch, "buy_kill_switch_active", _raise)
+    monkeypatch.setattr(fb_main.time, "sleep", _stop_after(1))
+
+    with pytest.raises(_StopLoop):
+        fb_main.poll_kill_switch()
