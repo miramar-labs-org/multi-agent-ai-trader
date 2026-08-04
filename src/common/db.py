@@ -39,8 +39,8 @@ CREATE TABLE IF NOT EXISTS floor_broker_events (
     occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_dealer_decisions_symbol_date ON dealer_decisions ((decided_at::date), symbol);
-CREATE INDEX IF NOT EXISTS idx_floor_broker_events_symbol_date ON floor_broker_events ((occurred_at::date), symbol);
+CREATE INDEX IF NOT EXISTS idx_dealer_decisions_symbol_date ON dealer_decisions (symbol, decided_at);
+CREATE INDEX IF NOT EXISTS idx_floor_broker_events_symbol_date ON floor_broker_events (symbol, occurred_at);
 """
 
 _pool: ConnectionPool | None = None
