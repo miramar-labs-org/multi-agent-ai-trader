@@ -151,6 +151,14 @@ chosen to match the other 3 workflows here). It installs its own throwaway venv 
 `requirements-dev.txt` rather than depending on anything pre-installed on the runner, so it's
 reproducible independent of how the host happens to be provisioned.
 
+**Known gap:** CI actually runs on **Python 3.11**, not 3.12 — the runner container
+(`ghcr.io/miramar-labs-org/mlabs-runner`) is Debian 12 bookworm, which only ships 3.11 in its
+apt repos. Nothing in this codebase currently depends on a 3.12-only feature, so this hasn't
+caused a real bug, but it means CI isn't testing the exact interpreter version production runs
+on. Fixing this properly means baking Python 3.12 into the shared `mlabs-runner` image — that
+image is used by every repo in the org, so it's out of scope for this repo alone and hasn't
+been done yet.
+
 `ruff format --check` is **not** enforced in CI yet — there's pre-existing formatting drift
 across the repo (see `docs/ROADMAP.md`'s P0.12) that hasn't been cleaned up, so gating on it
 would fail on unrelated files. `ruff check` (lint rules, not formatting) has no such drift and

@@ -10,6 +10,12 @@ name: Test and Lint
 # drift across the repo that hasn't been cleaned up (see docs/architecture.md), so enforcing it
 # in CI would fail on unrelated files. ruff check (lint rules) has no such drift and is safe to
 # gate on.
+#
+# Runs on Python 3.11, NOT 3.12 — the [self-hosted, dgx] runner container
+# (ghcr.io/miramar-labs-org/mlabs-runner) only ships 3.11 (Debian 12 bookworm's default;
+# 3.12 isn't in bookworm's apt repos at all). This is a real, documented gap vs. the 3.12
+# every Dockerfile.* and the local dev pyenv environment actually run — see README.md's
+# Development section and docs/ROADMAP.md's P0.12 entry.
 
 on:
   push:
@@ -26,7 +32,9 @@ jobs:
 
       - name: Set up virtualenv
         run: |
-          python3.12 -m venv .venv-ci
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3.11-venv
+          python3.11 -m venv .venv-ci
           .venv-ci/bin/pip install --upgrade pip
           .venv-ci/bin/pip install -r requirements-dev.txt
 

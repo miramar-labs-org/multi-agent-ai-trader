@@ -487,6 +487,13 @@ Still outstanding from the original P0.12 scope:
 - branch protection actually blocking merge on failure (the workflow runs and reports status,
   but nothing currently enforces it as a required check).
 
+CI also runs on Python 3.11, not the 3.12 every `Dockerfile.*` and local dev actually use — the
+`[self-hosted, dgx]` runner container (`ghcr.io/miramar-labs-org/mlabs-runner`) is Debian 12
+bookworm, which doesn't have 3.12 in its apt repos. No 3.12-only feature is in use today, so
+this hasn't caused a divergence, but it's a real gap between what CI tests and what runs in
+production. The correct fix is baking Python 3.12 into the shared `mlabs-runner` image — an
+org-wide asset used by every repo, out of scope to change from here.
+
 ### Acceptance criteria
 
 - [x] CI runs automatically on pull requests (and on push).
