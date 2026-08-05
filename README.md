@@ -218,8 +218,3 @@ BUY/SELL call has already been made; it only handles order placement, safety che
 | Ollama | `http://<DGX_HOST_IP>:11434` — LLM inference backend, see `config.yaml`'s `llm.base_url` and [docs/models.md](docs/models.md) |
 | Kubernetes dashboard | Via SSH tunnel (`ssh -L 8001:localhost:8001 <user>@spark-79b7.local`), then [http://localhost:8001/api/v1/namespaces/kubernetes-dashboard/services/http:kubernetes-dashboard:/proxy/](http://localhost:8001/api/v1/namespaces/kubernetes-dashboard/services/http:kubernetes-dashboard:/proxy/) — view the `multi-agent-ai-trader` namespace's pods/jobs |
 | Postgres | No laptop tunnel — ad hoc access via `kubectl -n postgres-system exec -it deploy/postgres -- psql -U multi_agent_ai_trader -d multi_agent_ai_trader`. Stores Analyst picks, Dealer decisions, and Floor Broker events (`src/common/db.py`); backs `/analyst-explain`. See [docs/architecture.md](docs/architecture.md#persistence). |
-
-The full Miramar platform endpoint table (KFP, MLflow, NeMo/NIM, Qdrant, Nsight, Open WebUI) isn't
-included here — this project doesn't use any of those services. See
-[docs/platform-services.md](docs/platform-services.md) for the full breakdown of what's actually
-wired up vs. unused template scaffolding.
