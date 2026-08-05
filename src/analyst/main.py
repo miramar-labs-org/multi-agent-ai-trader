@@ -1,3 +1,4 @@
+import os
 from datetime import datetime
 
 import pytz
@@ -14,6 +15,11 @@ log = get_logger("ANALYST")
 def main():
     cfg = load_config()
     langsmith.configure(cfg)
+
+    is_midday_run = os.environ.get("ANALYST_RUN_LABEL") == "midday"
+    if is_midday_run and not cfg.analyst.enable_midday_run:
+        log("⏭️ midday run disabled via config — exiting without a graph run")
+        return
 
     today = datetime.now(pytz.timezone("US/Eastern")).date()
     stock_market_open = is_stock_market_open(today)
@@ -34,8 +40,9 @@ def main():
                 "pnl_text": "",
                 "selection": None,
                 "stock_market_open": stock_market_open,
+                "is_midday_run": is_midday_run,
             },
-            config={"tags": ["analyst"]},
+            config={"tags": ["analyst", "midday"] if is_midday_run else ["analyst"]},
         )
         selection = result.get("selection") or {}
         log(f"wrote portfolio with {len(selection.get('symbols', []))} symbols")

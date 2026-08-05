@@ -14,6 +14,26 @@ def test_notify_morning_report_omits_closed_market_banner_when_market_is_open(mo
     assert "closed" not in posted["text"].lower()
 
 
+def test_notify_morning_report_defaults_to_morning_title_and_sun_emoji(monkeypatch):
+    posted = {}
+    monkeypatch.setattr(slack, "_post", lambda text: posted.update(text=text))
+
+    slack.notify_morning_report("2026-08-04", _account(), [])
+
+    assert posted["text"].startswith("🌅 *Morning Market Report — 2026-08-04*")
+
+
+def test_notify_morning_report_uses_overridden_title_and_emoji(monkeypatch):
+    """Supports the Analyst's optional midday run, which posts a "Midday Update" using the same
+    function rather than a duplicated "Morning Market Report" -- see src/analyst/graph.py."""
+    posted = {}
+    monkeypatch.setattr(slack, "_post", lambda text: posted.update(text=text))
+
+    slack.notify_morning_report("2026-08-04", _account(), [], title="Midday Update", emoji="🕐")
+
+    assert posted["text"].startswith("🕐 *Midday Update — 2026-08-04*")
+
+
 def test_notify_morning_report_mentions_closed_market_and_crypto_continuing(monkeypatch):
     posted = {}
     monkeypatch.setattr(slack, "_post", lambda text: posted.update(text=text))

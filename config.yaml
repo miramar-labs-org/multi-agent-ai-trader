@@ -49,6 +49,13 @@ eod_report:
 analyst:
   schedule: "55 8 * * *"      # informational copy of the CronJob's own spec.schedule — 08:55 America/New_York
                                # daily (spec.timeZone), ~30min before the 9:30 ET open
+  enable_midday_run: true     # feature gate: optional second Analyst run at ~12:30pm ET to catch
+                               # intraday movers/news the 08:55 run missed. Opt-in, now enabled.
+                               # Toggling this is a config-only change -- no rebuild/redeploy needed,
+                               # see src/common/config.py.
+  midday_schedule: "30 12 * * *"   # informational copy of k8s/analyst-midday-cronjob-k3s.yaml's own
+                                    # spec.schedule -- not read by code, keep in sync by hand (same
+                                    # convention as the `schedule` field above)
   enable_news: true           # feature gate: Alpaca News API + Yahoo RSS headlines as an Analyst input
   enable_indicators: true     # feature gate: TAAPI technical indicator data as an Analyst input
   enable_track_record: true   # feature gate: Analyst's own recent pick history + Dealer/Floor

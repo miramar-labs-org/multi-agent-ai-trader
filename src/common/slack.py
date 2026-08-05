@@ -43,8 +43,10 @@ def notify_morning_report(
     *,
     stock_market_open: bool = True,
     crypto_enabled: bool = False,
+    title: str = "Morning Market Report",
+    emoji: str = "🌅",
 ) -> None:
-    lines = [f"🌅 *Morning Market Report — {report_date}*"]
+    lines = [f"{emoji} *{title} — {report_date}*"]
 
     if not stock_market_open:
         note = "🔒 Stock market is closed today"

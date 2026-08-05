@@ -85,6 +85,7 @@ jobs:
 
           for MANIFEST in \
             k8s/analyst-cronjob-k3s.yaml \
+            k8s/analyst-midday-cronjob-k3s.yaml \
             k8s/dealer-deployment-k3s.yaml \
             k8s/floor-broker-deployment-k3s.yaml \
             k8s/floor-broker-service-k3s.yaml \

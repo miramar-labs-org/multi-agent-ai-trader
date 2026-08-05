@@ -7,7 +7,8 @@ single-process script (`gpt-trader.py`) onto three independently-scaled k8s work
 communicate via a shared ConfigMap and plain HTTP, rather than a monolithic loop.
 
 ```
-                    08:55 America/New_York daily (k8s CronJob)
+              08:55 America/New_York daily (k8s CronJob)
+     + optional 12:30pm America/New_York run (feature-gated, off by default)
                          ┌─────────────────────────┐
                          │         Analyst          │
                          │  screener → news → LLM   │
@@ -50,7 +51,7 @@ close and posts a summary to Slack — it has no dependency on the ConfigMap or 
 Broker's HTTP hop:
 
 ```
-                         21:30 UTC Mon-Fri (k8s CronJob)
+                     17:30 America/New_York daily (k8s CronJob)
                          ┌─────────────────────────┐
                          │       EOD Report        │
                          │ account + fills → Slack │
@@ -65,7 +66,7 @@ multi-agent-ai-trader/
 │                                  # live from GitHub at runtime (main branch), not baked into images
 ├── notebook.ipynb                # bare JupyterLab entry point (no pipeline logic — see below)
 ├── Dockerfile.analyst/.dealer/.floor-broker/.eod-report
-├── k8s/                          # 2 CronJobs, 2 Deployments, 1 Service, RBAC, namespace, secrets doc
+├── k8s/                          # 3 CronJobs, 2 Deployments, 1 Service, RBAC, namespace, secrets doc
 └── src/
     ├── common/                   # shared: Alpaca clients, config loader, logger, portfolio I/O, Slack
     ├── analyst/                  # CronJob — picks the tradeable universe, posts the morning report
@@ -87,6 +88,24 @@ service that can be replaced/restarted without losing any state (it holds none).
 indicator-fetch throttle, so the Morning Report typically posts ~09:00 ET — ~30min before the
 open), `concurrencyPolicy: Forbid` (no overlapping runs), `backoffLimit: 1` — a failed research
 run is meant to surface immediately, not retry-storm. Entrypoint: `python -m src.analyst.main`.
+
+A second, optional CronJob (`k8s/analyst-midday-cronjob-k3s.yaml`, `analyst-midday`) fires at
+`30 12 * * *` `America/New_York` (12:30pm ET) using the same image and entrypoint, distinguished
+only by an `ANALYST_RUN_LABEL: "midday"` env var. It exists to catch intraday movers/news the
+08:55 run missed — Dealer already reacts to price moves on known symbols every poll, but can't
+discover a symbol that wasn't in the morning's picks. It's feature-gated via
+`analyst.enable_midday_run` (`config.yaml`, default `false`): `main()` reads the env var, and if
+it's a midday invocation with the flag off, logs and returns before `build_graph()` is even
+called — no screener/news/TAAPI/LLM calls, no portfolio write, no Slack post. Toggling the flag
+is a config-only `git push`, live within the same ~60s TTL as any other config change, no
+redeploy needed (see `config.py` below). When enabled, `AnalystState["is_midday_run"]` is
+threaded through the whole graph run: `write_portfolio` posts a "🕐 Midday Update" instead of
+a duplicate "🌅 Morning Market Report" (same `slack.notify_morning_report`, overridden
+`title`/`emoji`), and `crypto_eod_report` is skipped outright (it already ran this morning and
+only ever covers the *prior* calendar day, so a second run has nothing new to report). One
+side effect that's accepted, not fixed: `fetch_track_record`'s query has no upper date bound, so
+a midday run's track-record context includes the same day's own earlier morning-run picks —
+useful signal for the midday LLM pass, not a bug.
 
 Runs every scheduled day regardless of whether the stock market is open — `main.py` checks
 `src/common/market_calendar.py::is_stock_market_open()` (same Alpaca calendar API EOD Report
@@ -470,8 +489,9 @@ never double-sells.
 
 ## EOD Report (`src/eod_report/`)
 
-**Workload:** `batch/v1 CronJob`, schedule `30 21 * * *` (21:30 UTC **daily** — after the 4pm ET
-close in both EDT and EST), `concurrencyPolicy: Forbid`, `backoffLimit: 1`. No ServiceAccount —
+**Workload:** `batch/v1 CronJob`, schedule `30 17 * * *` with `timeZone: America/New_York`
+(17:30 ET **daily** — ~90min after the 4pm ET close), `concurrencyPolicy: Forbid`,
+`backoffLimit: 1`. No ServiceAccount —
 unlike Floor Broker (which has one, scoped to reading the kill-switch ConfigMap — see below), EOD
 Report never touches the k8s API at all. Entrypoint: `python -m src.eod_report.main`. The
 schedule runs every day rather than `1-5` (Mon-Fri) specifically so `main()`'s own
@@ -647,12 +667,17 @@ isn't purely for human/skill consumption.
 5. Floor Broker's `{"status": "submitted"|"skipped"|"error"}` response is logged by Dealer and
    not persisted further — the eventual fill (`"executed"`, with `fill_price`) is reported later,
    asynchronously, via its own Slack post from `poll_pending_fills()` (ROADMAP P0.14).
-6. Repeat step 3 until market close; the cycle restarts fresh at 08:55 America/New_York the next day using
+6. If `analyst.enable_midday_run` is true, repeat step 2 once more at **12:30pm America/New_York**
+   — the `analyst-midday` CronJob fires on the same schedule regardless, but `main()` exits
+   immediately without this step when the flag is off (the default). This run posts a "🕐 Midday
+   Update" instead of a second Morning Report, and skips the crypto EOD report entirely (already
+   posted this morning).
+7. Repeat step 3 until market close; the cycle restarts fresh at 08:55 America/New_York the next day using
    whatever portfolio the Analyst produces (or the prior day's, if the Analyst hasn't run yet
    or failed — the Dealer has no fallback logic here, it just reads whatever ConfigMap exists).
-7. **21:30 UTC daily** — independently of the above cycle, the EOD Report CronJob queries
-   Alpaca directly for the day's account state and fills, and posts a summary to Slack — or, on
-   a weekend/holiday, posts a market-closed notice instead and skips the rest of the report.
+8. **17:30 America/New_York daily** — independently of the above cycle, the EOD Report CronJob
+   queries Alpaca directly for the day's account state and fills, and posts a summary to Slack —
+   or, on a weekend/holiday, posts a market-closed notice instead and skips the rest of the report.
 
 ## `config.yaml` reference
 
@@ -673,6 +698,8 @@ isn't purely for human/skill consumption.
 | `trading` | `crypto_taapi_exchange` | TAAPI venue name (e.g. `"binance"`) used as the `exchange` for crypto positions merged in by `merge_held_positions()` — TAAPI's `/bulk` API requires an actual venue, not the literal word "crypto" |
 | `eod_report` | `schedule` | informational copy of the CronJob's own `spec.schedule` — not templated, must be kept in sync manually |
 | `analyst` | `schedule` | informational copy of the CronJob's own `spec.schedule` — not templated, must be kept in sync manually |
+| `analyst` | `enable_midday_run` | feature gate for the optional `analyst-midday` CronJob (12:30pm ET) — when false (default), `main()` exits immediately on a midday-labeled run before `build_graph()` is called |
+| `analyst` | `midday_schedule` | informational copy of `k8s/analyst-midday-cronjob-k3s.yaml`'s own `spec.schedule` — not templated, must be kept in sync manually |
 | `analyst` | `max_universe_size`, `default_budget`, `screener_top_n`, `news_days`, `yahoo_rss_url` | Analyst's selection parameters |
 | `analyst` | `indicator_fetch_limit` | candidates (top-N by `abs(change_pct)`) that get a real TAAPI `/bulk` indicator fetch in `fetch_indicators` (default 15) — capped by the TAAPI free-tier 15s/request limit |
 | `analyst` | `enable_news` | feature gate for `fetch_research` — when false, short-circuits before any Alpaca News/Yahoo RSS call and feeds the LLM an empty research text |

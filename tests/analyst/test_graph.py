@@ -96,6 +96,31 @@ def test_write_portfolio_passes_market_status_to_slack(monkeypatch):
 
     assert captured["kwargs"]["stock_market_open"] is False
     assert captured["kwargs"]["crypto_enabled"] is True
+    assert captured["kwargs"]["title"] == "Morning Market Report"
+    assert captured["kwargs"]["emoji"] == "🌅"
+
+
+def test_write_portfolio_uses_midday_title_and_emoji_on_a_midday_run(monkeypatch):
+    monkeypatch.setattr(graph, "_write_portfolio", lambda payload: None)
+    monkeypatch.setattr(graph, "trading_client", FakeAccountClient())
+    captured = {}
+    monkeypatch.setattr(
+        graph.slack, "notify_morning_report", lambda *a, **k: captured.update(args=a, kwargs=k)
+    )
+    state = {
+        "raw_candidates": [],
+        "research_text": "",
+        "indicator_text": "",
+        "selection": {"symbols": []},
+        "stock_market_open": True,
+        "is_midday_run": True,
+    }
+    cfg = OmegaConf.create({"trading": {"enable_crypto": True}})
+
+    graph.write_portfolio(state, cfg)
+
+    assert captured["kwargs"]["title"] == "Midday Update"
+    assert captured["kwargs"]["emoji"] == "🕐"
 
 
 def test_validate_selection_overrides_llm_exchange_with_known_market():
@@ -167,6 +192,18 @@ def test_crypto_eod_report_skipped_when_crypto_disabled(monkeypatch):
     monkeypatch.setattr(graph.slack, "notify_crypto_eod_report", lambda *a, **k: posted.setdefault("called", True))
 
     crypto_eod_report({}, _cfg(enable_crypto=False))
+
+    assert "called" not in posted
+
+
+def test_crypto_eod_report_skipped_on_midday_run(monkeypatch):
+    """A midday run already had its crypto EOD report posted this morning -- covers only the
+    prior calendar day, so a second post on the same day would be a verbatim duplicate."""
+    monkeypatch.setattr(graph, "trading_client", FakeTradingClient([]))
+    posted = {}
+    monkeypatch.setattr(graph.slack, "notify_crypto_eod_report", lambda *a, **k: posted.setdefault("called", True))
+
+    crypto_eod_report({"is_midday_run": True}, _cfg(enable_crypto=True))
 
     assert "called" not in posted
 

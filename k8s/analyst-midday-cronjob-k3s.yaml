@@ -1,0 +1,43 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: analyst-midday
+  namespace: multi-agent-ai-trader
+spec:
+  # 12:30pm America/New_York -- an optional second Analyst run to catch intraday movers/news the
+  # 08:55 run missed, gated on analyst.enable_midday_run in config.yaml (off by default). The
+  # CronJob always fires; ANALYST_RUN_LABEL=midday tells src/analyst/main.py to check the flag
+  # and exit immediately if it's disabled, so toggling this feature is a config-only change, no
+  # redeploy needed. timeZone (not a fixed UTC offset) keeps this correct across DST.
+  # Matches config.yaml's analyst.midday_schedule -- keep both in sync.
+  schedule: "30 12 * * *"
+  timeZone: "America/New_York"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 1  # a failed research run should surface, not silently retry-storm
+      template:
+        metadata:
+          labels:
+            app: analyst-midday
+        spec:
+          serviceAccountName: multi-agent-ai-trader-configmap-reader
+          imagePullSecrets:
+            - name: ghcr-pull
+          restartPolicy: Never
+          containers:
+            - name: analyst
+              image: GHCR_IMAGE_ANALYST_PLACEHOLDER
+              env:
+                - name: ANALYST_RUN_LABEL
+                  value: "midday"
+              envFrom:
+                - secretRef:
+                    name: mlabs-api-keys
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: "256Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "512Mi"

@@ -32,6 +32,7 @@ class AnalystState(TypedDict):
     pnl_text: str
     selection: dict | None
     stock_market_open: bool
+    is_midday_run: bool
 
 
 def discover_candidates(state: AnalystState, cfg) -> AnalystState:
@@ -101,9 +102,11 @@ def fetch_track_record(state: AnalystState, cfg) -> AnalystState:
     sold more than once, so real per-pick/realized P&L still isn't computed anywhere live (only
     in the offline backtest simulator). Floor Broker's recorded price is still documented as
     informational only (skills/analyst-explain/SKILL.md) -- Alpaca's fills remain ground truth
-    for that. This node runs before write_portfolio() records this run's own picks, so today's
-    picks are never included even though the query has no explicit upper date bound -- that's
-    expected, not a bug: a symbol picked THIS run has no track record until the NEXT run."""
+    for that. This node runs before write_portfolio() records this run's own picks, so a symbol
+    picked THIS run has no track record until the NEXT run -- but the query has no explicit upper
+    date bound, so on a midday run this DOES surface the same day's earlier morning-run picks
+    (and any Dealer/Floor Broker activity on them since) as track record, which is useful signal
+    for the midday LLM pass, not a bug."""
     if not cfg.analyst.enable_track_record:
         log("⏭️ track record disabled via config — skipping")
         return {**state, "track_record_text": ""}
@@ -281,6 +284,8 @@ def write_portfolio(state: AnalystState, cfg) -> AnalystState:
         payload["symbols"],
         stock_market_open=state["stock_market_open"],
         crypto_enabled=cfg.trading.enable_crypto,
+        title="Midday Update" if state.get("is_midday_run") else "Morning Market Report",
+        emoji="🕐" if state.get("is_midday_run") else "🌅",
     )
     return state
 
@@ -288,8 +293,10 @@ def write_portfolio(state: AnalystState, cfg) -> AnalystState:
 def crypto_eod_report(state: AnalystState, cfg) -> AnalystState:
     """Crypto trades 24/7, so it has no market close to hang an EOD report off of -- instead this
     rides along with the Analyst's morning run and covers the prior full ET calendar day, right
-    after today's new picks go out in write_portfolio()'s notify_morning_report()."""
-    if not cfg.trading.enable_crypto:
+    after today's new picks go out in write_portfolio()'s notify_morning_report(). Skipped
+    entirely on a midday run -- it already ran this morning and only ever reports on the prior
+    calendar day, so a second run has nothing new to say."""
+    if state.get("is_midday_run") or not cfg.trading.enable_crypto:
         return state
 
     report_date = (datetime.now(pytz.timezone("US/Eastern")) - timedelta(days=1)).date().isoformat()
