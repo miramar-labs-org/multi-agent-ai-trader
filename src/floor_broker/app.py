@@ -34,7 +34,10 @@ class ExecuteRequest(BaseModel):
     symbol: str
     exchange: str
     action: Literal["BUY", "SELL"]
-    budget: float = Field(gt=0, le=MAX_BUDGET)
+    # execution.sell() derives qty to sell from the live open position, not from budget -- a
+    # held-only position (merge_held_positions()) legitimately carries budget=0.0, so budget is
+    # only a real business rule (authorized new-BUY capital) for BUY. See _budget_required_for_buy.
+    budget: float = Field(ge=0, le=MAX_BUDGET)
     slP: float = Field(gt=0, lt=1)
     tpP: float = Field(gt=1, lt=2)
 
@@ -44,6 +47,13 @@ class ExecuteRequest(BaseModel):
         v = v.strip().upper()
         if not _SYMBOL_RE.match(v):
             raise ValueError(f"invalid symbol: {v!r}")
+        return v
+
+    @field_validator("budget")
+    @classmethod
+    def _budget_required_for_buy(cls, v: float, info) -> float:
+        if info.data.get("action") == "BUY" and v <= 0:
+            raise ValueError("budget must be greater than 0 for BUY")
         return v
 
     @field_validator("exchange")

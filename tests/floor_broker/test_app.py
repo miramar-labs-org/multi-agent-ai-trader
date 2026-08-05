@@ -93,6 +93,41 @@ def test_execute_returns_200_not_500_for_a_buy_while_state_unreconciled(monkeypa
     assert body["reason"] == "state_not_reconciled"
 
 
+def test_execute_sell_with_zero_budget_reaches_execution_sell(monkeypatch):
+    """Regression: a held-only position (merge_held_positions()) carries budget=0.0, and the
+    Dealer's SELL signal on it forwards that budget as-is (only BUY is guarded/scaled locally in
+    src/dealer/graph.py). Previously ExecuteRequest required budget > 0 for every action, so this
+    422'd before execution.sell() ever ran -- a held-only SELL could never actually execute."""
+    received = {}
+
+    def _fake_sell(symbol):
+        received["symbol"] = symbol
+        return {"status": "submitted", "reason": "dealer_signal", "detail": "sell order submitted: order-789", "order_id": "order-789"}
+
+    monkeypatch.setattr(app_module.execution, "sell", _fake_sell)
+
+    response = _client().post("/execute", json=_payload("SELL", budget=0.0))
+
+    assert response.status_code == 200
+    assert received["symbol"] == "MGN"
+    assert response.json()["status"] == "submitted"
+
+
+def test_execute_rejects_buy_with_zero_budget(monkeypatch):
+    """budget > 0 is still enforced for BUY -- only SELL was over-restricted."""
+    response = _client().post("/execute", json=_payload("BUY", budget=0.0))
+
+    assert response.status_code == 422
+
+
+def test_execute_rejects_negative_budget_for_sell(monkeypatch):
+    """budget=0.0 is a legitimate held-only-position value, but negative is still nonsensical
+    regardless of action."""
+    response = _client().post("/execute", json=_payload("SELL", budget=-100.0))
+
+    assert response.status_code == 422
+
+
 def test_execute_normalizes_symbol_and_exchange_case(monkeypatch):
     """ROADMAP P0.3: symbol/exchange are normalized (stripped, cased) before reaching
     execution.buy() -- a lowercase symbol or upper-case "STOCKS" exchange from a caller must
