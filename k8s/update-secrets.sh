@@ -5,6 +5,12 @@
 # k8s/secrets.example.yaml for the full key list and README.md's "Create the namespace + secret"
 # section for the initial-create form.
 #
+# Also mirrors GHA_SECRET_KEYS (the subset of keys a GitHub Actions workflow reads directly --
+# currently just ALPACA_PAPER_API_KEY/SECRET, for .github/workflows/pl-badges.yaml, which runs
+# on a self-hosted runner outside the cluster and so can't read the k8s Secret) to matching
+# GitHub Actions repo secrets via `gh secret set`, so the two credential stores can't drift --
+# see docs/architecture.md's Secrets section.
+#
 # Usage:
 #   export ALPACA_PAPER_API_KEY=PK...
 #   export ALPACA_PAPER_API_SECRET=...
@@ -23,6 +29,7 @@ set -euo pipefail
 NAMESPACE="multi-agent-ai-trader"
 SECRET_NAME="mlabs-api-keys"
 KNOWN_KEYS=(TAAPI_API_KEY ALPACA_PAPER_API_KEY ALPACA_PAPER_API_SECRET LANGCHAIN_API_KEY SLACK_WEBHOOK_URL DATABASE_URL)
+GHA_SECRET_KEYS=(ALPACA_PAPER_API_KEY ALPACA_PAPER_API_SECRET)
 RESTART=true
 
 if [[ "${1:-}" == "--restart" ]]; then
@@ -53,6 +60,22 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
+# Only require `gh` (and its auth) when a key that's actually mirrored to GitHub Actions is
+# among the ones being updated -- e.g. a lone TAAPI_API_KEY rotation shouldn't need `gh` at all.
+gha_keys=()
+for key in "${keys[@]}"; do
+  for gha_key in "${GHA_SECRET_KEYS[@]}"; do
+    if [[ "$key" == "$gha_key" ]]; then
+      gha_keys+=("$key")
+    fi
+  done
+done
+
+if [[ ${#gha_keys[@]} -gt 0 ]] && ! command -v gh >/dev/null 2>&1; then
+  echo "ERROR: gh is required to mirror ${gha_keys[*]} to GitHub Actions repo secrets." >&2
+  exit 1
+fi
+
 if ! kubectl get secret "$SECRET_NAME" -n "$NAMESPACE" >/dev/null 2>&1; then
   echo "ERROR: secret $SECRET_NAME not found in namespace $NAMESPACE -- create it first (see README.md)." >&2
   exit 1
@@ -72,6 +95,13 @@ done
 
 kubectl patch secret "$SECRET_NAME" -n "$NAMESPACE" --type=merge -p "$patch_json"
 echo "Updated keys: ${updated_keys[*]}"
+
+if [[ ${#gha_keys[@]} -gt 0 ]]; then
+  for key in "${gha_keys[@]}"; do
+    gh secret set "$key" --body "${!key}"
+  done
+  echo "Mirrored to GitHub Actions repo secrets: ${gha_keys[*]}"
+fi
 
 # envFrom values are only read at container start -- Dealer and Floor Broker are long-running
 # Deployments that must be restarted to pick up new values. Analyst/EOD Report are CronJobs and

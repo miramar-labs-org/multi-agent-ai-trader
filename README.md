@@ -3,6 +3,8 @@
 [![Test and Lint](https://github.com/miramar-labs-org/multi-agent-ai-trader/actions/workflows/test-lint.yaml/badge.svg)](https://github.com/miramar-labs-org/multi-agent-ai-trader/actions/workflows/test-lint.yaml)
 [![Build and Push](https://github.com/miramar-labs-org/multi-agent-ai-trader/actions/workflows/build-push.yaml/badge.svg)](https://github.com/miramar-labs-org/multi-agent-ai-trader/actions/workflows/build-push.yaml)
 [![License: BSL 1.1](https://img.shields.io/badge/license-BSL%201.1-blue)](LICENSE)
+[![Today's P/L](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/miramar-labs-org/multi-agent-ai-trader/main/badges/today-pl.json)](https://app.alpaca.markets/paper/dashboard/overview)
+[![YTD P/L](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/miramar-labs-org/multi-agent-ai-trader/main/badges/ytd-pl.json)](https://app.alpaca.markets/paper/dashboard/overview)
 
 Multi-agent AI trading system (Analyst, Dealer, Floor Broker) trading on Alpaca, powered by a locally-hosted LLM on the DGX via k3s
 

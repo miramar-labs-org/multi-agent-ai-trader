@@ -534,6 +534,25 @@ and exposure per symbol, and writes a JSON artifact to the gitignored `backtests
 computes indicators locally rather than replaying the live LLM's actual historical decisions —
 see [`docs/backtesting.md`](backtesting.md) for the full design and documented assumptions.
 
+## P/L badges (`src/pl_badges/`)
+
+**Not a k8s workload** — run by a scheduled GHA workflow, `.github/workflows/pl-badges.yaml`
+(`45 21 * * *` UTC, plus `workflow_dispatch`), on the same `[self-hosted, dgx]` runner as
+`test-lint.yaml`. Entrypoint: `python -m src.pl_badges.main`. Computes Today's and YTD aggregate
+P&L from the paper account (`src.common.pl_badges.fetch_pl_summary()` — today's P&L is
+`account.equity - account.last_equity`, the same math `execution.py`'s daily loss limit check
+uses; YTD P&L is `equity - base_value` from a `get_portfolio_history()` request starting Jan 1 of
+the current year — confirmed against a live account that `PortfolioHistory.profit_loss` is a
+day-over-day delta series, not cumulative from `base_value`, so `base_value` is the only reliable
+YTD anchor) and writes two shields.io endpoint-badge JSON files, `badges/today-pl.json` and
+`badges/ytd-pl.json`. The workflow commits and pushes them back to `main` only if the content
+changed. README.md's two P/L badges point at those files via
+`img.shields.io/endpoint?url=.../raw.githubusercontent.com/...` — shields.io fetches the JSON
+directly from GitHub's raw-content CDN at render time, so no publicly-reachable service needs to
+run for the badges to work, unlike the always-on Floor Broker/Postgres this data is ultimately
+sourced from. Skips the write (and therefore the commit) entirely on weekends/holidays via the
+same `is_stock_market_open()` calendar check `eod_report.main()` uses.
+
 ## Shared code (`src/common/`)
 
 - **`alpaca_client.py`** — one shared `TradingClient(..., paper=True)` (hardcoded — this is
@@ -788,6 +807,12 @@ ServiceAccount) and these external API keys. Floor Broker also has a ServiceAcco
 (`multi-agent-ai-trader-configmap-reader`, scoped to reading the `buy-kill-switch` ConfigMap)
 plus the secret for its Alpaca keys and `SLACK_WEBHOOK_URL`. EOD Report gets the same secret but
 has no ServiceAccount/k8s API access at all.
+
+`pl-badges.yaml` (see [P/L badges](#p-l-badges-src-pl_badges)) runs outside the cluster on a GHA
+self-hosted runner, not as a k8s workload, so it can't read `mlabs-api-keys` — it needs its own
+copy of `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET` as GitHub Actions repo secrets
+(`secrets.ALPACA_PAPER_API_KEY`/`secrets.ALPACA_PAPER_API_SECRET`), same pattern as
+`MIRAMAR_ORG_GHCR_PAT` for `build-push.yaml`/`deploy.yaml`.
 
 ## `notebook.ipynb`
 

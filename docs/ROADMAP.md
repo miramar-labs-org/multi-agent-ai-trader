@@ -939,6 +939,32 @@ its failure isolation) and `tests/floor_broker/test_floor_broker_main.py`
 
 ---
 
+## P1.12 — README "Today's P/L" / "YTD P/L" badges
+
+**Done.** New `src/pl_badges/` — not a k8s workload, run by a scheduled GHA workflow
+(`.github/workflows/pl-badges.yaml`, `45 21 * * *` UTC + `workflow_dispatch`) on the same
+`[self-hosted, dgx]` runner as `test-lint.yaml`. `python -m src.pl_badges.main` computes Today's
+P&L (`account.equity - account.last_equity`) and YTD P&L (`equity - base_value` from
+`get_portfolio_history()` starting Jan 1 of the current year) and writes two shields.io
+endpoint-badge JSON files, `badges/today-pl.json` / `badges/ytd-pl.json`; the workflow commits
+and pushes them back to `main` only if the content changed. README's two new badges point at
+those files via `img.shields.io/endpoint?url=.../raw.githubusercontent.com/...`, so shields.io
+fetches the JSON directly from GitHub's raw-content CDN at render time — no publicly-reachable
+service needed, unlike the Floor Broker/Postgres this data is ultimately sourced from. Skips the
+write (and commit) entirely on weekends/holidays via the same `is_stock_market_open()` calendar
+check `eod_report.main()` uses.
+
+Requires `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET` as GitHub Actions repo secrets (the
+runner is outside the cluster, so it can't read the `mlabs-api-keys` k8s Secret) — same pattern
+as `MIRAMAR_ORG_GHCR_PAT`.
+
+Tests: `tests/common/test_pl_badges.py` (`fetch_pl_summary()` today/YTD math including the
+negative case, `build_badge_payload()` color/formatting including the zero-is-up edge case) and
+`tests/pl_badges/test_pl_badges_main.py` (`main()` skips on a closed market, writes both badge
+files on an open one).
+
+---
+
 # P2 — Platform maturity
 
 P2 begins after the execution path is safe and the strategy is measurable.
