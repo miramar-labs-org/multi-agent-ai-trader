@@ -40,12 +40,15 @@ Runs once a day, early, before the market opens (8:55am Eastern — 35 minutes b
   every day in isolation with no memory of yesterday. This is qualitative only for now (a plain
   written history, not a computed profit/loss number) — see
   [What this system is not (yet)](#what-this-system-is-not-yet) for why.
-- It hands all of that — news + real indicator numbers + its own recent track record — to the AI
-  model and asks it to pick up to 10 symbols worth trading today, with a dollar budget and a
-  written rationale for each.
-- Each of these inputs — news, indicators, and its own track record — can be switched off
-  independently in config. That's a safety switch: if one input turns out to be feeding the AI
-  bad information, it can be disabled on its own without touching the others.
+- It also pulls a live snapshot of its currently-open positions and Alpaca's own unrealized
+  profit/loss for each — a point-in-time read of what the account holds right now, separate from
+  the pick-history recap above, and also switchable off independently in config.
+- It hands all of that — news + real indicator numbers + its own recent track record + the live
+  P&L snapshot — to the AI model and asks it to pick up to 10 symbols worth trading today, with a
+  dollar budget and a written rationale for each.
+- Each of these inputs — news, indicators, its own track record, and the live P&L snapshot — can
+  be switched off independently in config. That's a safety switch: if one input turns out to be
+  feeding the AI bad information, it can be disabled on its own without touching the others.
 - It double-checks the AI's picks against the actual candidate list (so the AI can't invent a
   symbol that was never a real candidate), then publishes the day's watchlist for the Dealer to
   read.
@@ -200,11 +203,13 @@ its output reliably machine-usable.
 
 ## What this system is not (yet)
 
-- It does not score whether its own past picks were actually good or bad in dollar terms. The
-  Analyst now reads back a plain-English history of its own recent picks and outcomes (see
-  "The Analyst" above), but that's a qualitative recap, not a computed win/loss or profit-and-loss
-  number — no live per-trade P&L tracking exists yet outside the offline backtesting tool, so
-  there's nothing to compute that scoring from.
+- It does not score whether its own *individual past picks* were actually good or bad in dollar
+  terms. The Analyst reads back a plain-English history of its own recent picks and outcomes,
+  plus a live snapshot of unrealized profit/loss for whatever it currently holds (see "The
+  Analyst" above) — but neither ties a specific past pick to a specific realized dollar result: a
+  symbol can be bought and sold more than once, and the live snapshot only covers positions still
+  open right now. No per-trade *realized* P&L tracking or scoring exists yet outside the offline
+  backtesting tool.
 - It does not backtest the AI's actual historical decision-making. There is a separate,
   already-built backtesting tool (see [backtesting.md](backtesting.md)) that checks simple,
   rule-based strategies (buy-and-hold, plain RSI/MACD rules, etc.) against historical prices as

@@ -99,7 +99,7 @@ never skips its entire run on a closed day.
 **Purpose:** once a day, decide *which symbols are worth trading today* and hand that list
 off to the Dealer.
 
-**Implementation:** an 8-node LangGraph state machine (`src/analyst/graph.py`) over an
+**Implementation:** a 9-node LangGraph state machine (`src/analyst/graph.py`) over an
 `AnalystState`:
 
 | Node | What it does |
@@ -108,6 +108,7 @@ off to the Dealer.
 | `fetch_research` | gated on `cfg.analyst.enable_news` (short-circuits before any network call when false) — `sources.fetch_news(news_days=2)` (Alpaca News API, HTML stripped via BeautifulSoup) + `sources.fetch_yahoo_rss_headlines(...)` (Yahoo Finance RSS), concatenated into plain text |
 | `fetch_indicators` | gated on `cfg.analyst.enable_indicators` (short-circuits before any TAAPI call when false) — ranks `raw_candidates` by `abs(change_pct)` (missing values sort last) and calls `src.common.indicators.fetch_indicators_bulk` (shared with the Dealer) for the top `cfg.analyst.indicator_fetch_limit` (default 15) — one TAAPI `/bulk` POST per symbol covering `rsi, macd, vwap, bbands, sma, ema`, sleeping `cfg.taapi.min_request_interval_secs` between calls to respect TAAPI's free-tier 1-req/15s cap. At the default limit this adds ~3.5 minutes to the once-daily run — accepted as a fixed cost of a pre-market CronJob, unlike the Dealer's 10-minute poll cycle where the same rate limit is a tighter constraint. Not every candidate gets indicator data; only the top movers by size do |
 | `fetch_track_record` | gated on `cfg.analyst.enable_track_record` (short-circuits before any DB call when false) — reads the Analyst's own pick history plus matching Dealer decisions and Floor Broker events from Postgres via `db.fetch_analyst_picks_since()`/`fetch_dealer_decisions_since()`/`fetch_floor_broker_events_since()` for the last `cfg.analyst.track_record_days` (default 5) calendar days, formatted as plain text (qualitative sequence only — no computed P&L; see [Persistence](#persistence)). Runs before `write_portfolio` records this run's own picks, so a symbol picked *this* run never appears in its own track record |
+| `fetch_position_pnl` | gated on `cfg.analyst.enable_position_pnl` (short-circuits before any Alpaca call when false) — `trading_client.get_all_positions()` + `summarize_positions()` (`src/common/eod.py`, same shape `crypto_eod_report` already uses, no `only_crypto` filter so both stocks and crypto are included) formatted as plain text: symbol, qty, avg entry price, current price, unrealized $ and %. A live point-in-time snapshot only — not persisted, not compared across days, and not per-pick attribution (a symbol can be bought/sold more than once); complements `fetch_track_record`'s qualitative history rather than replacing it. Fails open (empty text) on any Alpaca API error, matching `fetch_research`/`fetch_indicators` |
 | `llm_select` | the actual LLM call — see below |
 | `validate_selection` | overrides each pick's `exchange` field with the `market` tag `discover_candidates` actually assigned that symbol (never trusts the LLM's own copy of `exchange`), and drops any pick whose symbol isn't in `raw_candidates` at all (a hallucination) |
 | `write_portfolio` | patches the `portfolio` ConfigMap via the `kubernetes` Python client |
@@ -118,7 +119,8 @@ flowchart TD
     A[discover_candidates] --> B[fetch_research]
     B --> C[fetch_indicators]
     C --> C2[fetch_track_record]
-    C2 --> D[llm_select]
+    C2 --> C3[fetch_position_pnl]
+    C3 --> D[llm_select]
     D --> E[validate_selection]
     E --> F[write_portfolio]
     F --> G[crypto_eod_report]
@@ -539,7 +541,13 @@ see [`docs/backtesting.md`](backtesting.md) for the full design and documented a
   against a live paper account after the crypto EOD report came back empty with zero positions.
   Each fill dict also carries `"time"` (Alpaca's raw `transaction_time`, an ISO 8601 UTC string),
   passed through unformatted — `slack._format_fill_time()` converts it to Eastern-clock-time for
-  display only at the point each EOD report line is rendered.
+  display only at the point each EOD report line is rendered. `summarize_positions()` also
+  returns `unrealized_pl`, `avg_entry_price`, and `current_price` — the EOD Slack reports still
+  only read the original four fields, but the Analyst's `fetch_position_pnl` node consumes all
+  three of these for its live P&L snapshot (see [Agent 1 — Analyst](#agent-1--analyst)).
+  `unrealized_pl` and
+  `current_price` are `Optional[str]` on Alpaca's own `Position` model and pass through as `None`
+  when absent rather than raising on `float(None)`.
 
 ## Persistence
 
@@ -645,6 +653,7 @@ isn't purely for human/skill consumption.
 | `analyst` | `enable_indicators` | feature gate for `fetch_indicators` — when false, short-circuits before any TAAPI call and feeds the LLM an empty indicator text |
 | `analyst` | `enable_track_record` | feature gate for `fetch_track_record` — when false, short-circuits before any Postgres read and feeds the LLM an empty track-record text |
 | `analyst` | `track_record_days` | lookback window in calendar days for `fetch_track_record` (default 5); excludes today by construction, since the node runs before `write_portfolio`'s DB write in the same run |
+| `analyst` | `enable_position_pnl` | feature gate for `fetch_position_pnl` — when false, short-circuits before any Alpaca positions call and feeds the LLM an empty P&L snapshot |
 | `indicators` | list of `{name, properties}` | TAAPI.io query-parameter catalog per indicator, shared by Dealer |
 
 ## Risk controls and failure handling

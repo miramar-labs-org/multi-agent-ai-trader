@@ -128,12 +128,25 @@ def test_validate_selection_drops_hallucinated_pick():
 
 
 class FakePosition:
-    def __init__(self, symbol, qty, market_value, unrealized_plpc, asset_class):
+    def __init__(
+        self,
+        symbol,
+        qty,
+        market_value,
+        unrealized_plpc,
+        asset_class,
+        avg_entry_price="0",
+        unrealized_pl="0",
+        current_price="0",
+    ):
         self.symbol = symbol
         self.qty = qty
         self.market_value = market_value
         self.unrealized_plpc = unrealized_plpc
         self.asset_class = asset_class
+        self.avg_entry_price = avg_entry_price
+        self.unrealized_pl = unrealized_pl
+        self.current_price = current_price
 
 
 class FakeTradingClient:
@@ -328,6 +341,7 @@ def test_llm_select_prompt_includes_indicator_text_and_research_text(monkeypatch
         "research_text": "MGN announces earnings beat",
         "indicator_text": "MGN:\nThe current RSI for MGN is 71.2",
         "track_record_text": "",
+        "pnl_text": "",
         "selection": None,
     }
 
@@ -357,6 +371,7 @@ def test_llm_select_prompt_includes_track_record_text(monkeypatch):
         "research_text": "",
         "indicator_text": "",
         "track_record_text": "- 2026-08-01 picked MGN (budget $100): momentum play",
+        "pnl_text": "",
         "selection": None,
     }
 
@@ -364,6 +379,35 @@ def test_llm_select_prompt_includes_track_record_text(monkeypatch):
 
     user_content = captured["messages"][1].content
     assert "- 2026-08-01 picked MGN (budget $100): momentum play" in user_content
+
+
+def test_llm_select_prompt_includes_pnl_text(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(graph, "ChatOpenAI", lambda **kwargs: FakeLLM(captured))
+    cfg = OmegaConf.create(
+        {
+            "analyst": {
+                "max_universe_size": 10,
+                "default_budget": 5000,
+                "indicator_fetch_limit": 15,
+                "track_record_days": 5,
+            },
+            "llm": {"base_url": "http://x", "model": "m", "temperature": 0.1},
+        }
+    )
+    state = {
+        "raw_candidates": [{"symbol": "MGN", "market": "stocks"}],
+        "research_text": "",
+        "indicator_text": "",
+        "track_record_text": "",
+        "pnl_text": "- MGN: qty 3, avg entry $45.00, current $50.00, unrealized +$15.00 (+11.11%)",
+        "selection": None,
+    }
+
+    graph.llm_select(state, cfg)
+
+    user_content = captured["messages"][1].content
+    assert "- MGN: qty 3, avg entry $45.00, current $50.00, unrealized +$15.00 (+11.11%)" in user_content
 
 
 def _track_record_cfg(track_record_days, enable_track_record=True):
@@ -437,3 +481,99 @@ def test_fetch_track_record_includes_pick_history_when_enabled(monkeypatch):
     assert "hit stop loss" in result["track_record_text"]
     assert "sell_filled" in result["track_record_text"]
     assert "stop loss triggered" in result["track_record_text"]
+
+
+def _pnl_cfg(enable_position_pnl=True):
+    return OmegaConf.create({"analyst": {"enable_position_pnl": enable_position_pnl}})
+
+
+def _pnl_state():
+    return {
+        "raw_candidates": [],
+        "research_text": "",
+        "indicator_text": "",
+        "track_record_text": "",
+        "pnl_text": "",
+        "selection": None,
+    }
+
+
+def test_fetch_position_pnl_skipped_when_disabled_via_config(monkeypatch):
+    """The enable_position_pnl feature gate must short-circuit before any Alpaca call, not just
+    discard the result -- mirrors the enable_news/enable_indicators/enable_track_record skip tests."""
+    calls = []
+
+    class TrackingClient:
+        def get_all_positions(self):
+            calls.append(1)
+            return []
+
+    monkeypatch.setattr(graph, "trading_client", TrackingClient())
+
+    result = graph.fetch_position_pnl(_pnl_state(), _pnl_cfg(enable_position_pnl=False))
+
+    assert result["pnl_text"] == ""
+    assert calls == []
+
+
+def test_fetch_position_pnl_returns_empty_when_no_open_positions(monkeypatch):
+    monkeypatch.setattr(graph, "trading_client", FakeTradingClient([]))
+
+    result = graph.fetch_position_pnl(_pnl_state(), _pnl_cfg())
+
+    assert result["pnl_text"] == ""
+
+
+def test_fetch_position_pnl_includes_positions_when_enabled(monkeypatch):
+    positions = [
+        FakePosition(
+            "MGN", "3", "150.00", "0.1667", AssetClass.US_EQUITY,
+            avg_entry_price="45.00", unrealized_pl="15.00", current_price="50.00",
+        ),
+        FakePosition(
+            "BTCUSD", "0.01", "600.00", "-0.02", AssetClass.CRYPTO,
+            avg_entry_price="61000.00", unrealized_pl="-10.00", current_price="60000.00",
+        ),
+    ]
+    monkeypatch.setattr(graph, "trading_client", FakeTradingClient(positions))
+
+    result = graph.fetch_position_pnl(_pnl_state(), _pnl_cfg())
+
+    assert "MGN" in result["pnl_text"]
+    assert "avg entry $45.00" in result["pnl_text"]
+    assert "+$15.00" in result["pnl_text"]
+    assert "BTCUSD" in result["pnl_text"]
+    assert "-$10.00" in result["pnl_text"]
+
+
+def test_fetch_position_pnl_returns_empty_when_alpaca_call_fails(monkeypatch):
+    """Fails open, not closed -- this is supplementary context (same risk category as news/
+    track-record), not a trading gate, so a transient Alpaca API error must degrade to an empty
+    snapshot for this run rather than raising out of the node and failing the whole Analyst run."""
+
+    class FailingClient:
+        def get_all_positions(self):
+            raise RuntimeError("Alpaca API unavailable")
+
+    monkeypatch.setattr(graph, "trading_client", FailingClient())
+
+    result = graph.fetch_position_pnl(_pnl_state(), _pnl_cfg())
+
+    assert result["pnl_text"] == ""
+
+
+def test_fetch_position_pnl_handles_none_unrealized_pl_and_current_price(monkeypatch):
+    """unrealized_pl and current_price are Optional[str] on Alpaca's own Position model -- a
+    missing value on one position must render as "n/a" rather than crashing the whole snapshot."""
+    positions = [
+        FakePosition(
+            "MGN", "3", "150.00", "0.05", AssetClass.US_EQUITY,
+            avg_entry_price="45.00", unrealized_pl=None, current_price=None,
+        ),
+    ]
+    monkeypatch.setattr(graph, "trading_client", FakeTradingClient(positions))
+
+    result = graph.fetch_position_pnl(_pnl_state(), _pnl_cfg())
+
+    assert "MGN" in result["pnl_text"]
+    assert "n/a" in result["pnl_text"]

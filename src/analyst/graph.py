@@ -29,6 +29,7 @@ class AnalystState(TypedDict):
     research_text: str
     indicator_text: str
     track_record_text: str
+    pnl_text: str
     selection: dict | None
     stock_market_open: bool
 
@@ -93,13 +94,16 @@ def fetch_indicators(state: AnalystState, cfg) -> AnalystState:
 def fetch_track_record(state: AnalystState, cfg) -> AnalystState:
     """Surfaces the Analyst's own recent pick history -- what it picked, why, what Dealer did
     about it, and how Floor Broker's execution went -- as a qualitative sequence the LLM can use
-    to avoid blindly repeating a pattern that already lost. Deliberately NOT computed P&L: no
-    live per-trade P&L helper exists outside the offline backtest simulator, and Floor Broker's
-    recorded price is documented as informational only (skills/analyst-explain/SKILL.md) --
-    Alpaca's fills are ground truth for that, and wiring it up is a bigger feature deferred to a
-    later iteration. This node runs before write_portfolio() records this run's own picks, so
-    today's picks are never included even though the query has no explicit upper date bound --
-    that's expected, not a bug: a symbol picked THIS run has no track record until the NEXT run."""
+    to avoid blindly repeating a pattern that already lost. Deliberately stays qualitative rather
+    than computing per-pick P&L here: a live, point-in-time unrealized-P&L snapshot of currently
+    open positions now exists separately (see fetch_position_pnl below), but that's a read of
+    current holdings, not attribution back to a specific past pick -- a symbol can be bought and
+    sold more than once, so real per-pick/realized P&L still isn't computed anywhere live (only
+    in the offline backtest simulator). Floor Broker's recorded price is still documented as
+    informational only (skills/analyst-explain/SKILL.md) -- Alpaca's fills remain ground truth
+    for that. This node runs before write_portfolio() records this run's own picks, so today's
+    picks are never included even though the query has no explicit upper date bound -- that's
+    expected, not a bug: a symbol picked THIS run has no track record until the NEXT run."""
     if not cfg.analyst.enable_track_record:
         log("⏭️ track record disabled via config — skipping")
         return {**state, "track_record_text": ""}
@@ -140,6 +144,46 @@ def fetch_track_record(state: AnalystState, cfg) -> AnalystState:
     return {**state, "track_record_text": "\n".join(lines)}
 
 
+def fetch_position_pnl(state: AnalystState, cfg) -> AnalystState:
+    """Live, point-in-time snapshot of Alpaca's own unrealized P&L for currently-open positions --
+    deliberately NOT per-pick attribution: a symbol can be bought/sold more than once, this reads
+    current holdings only, and nothing here is persisted or compared across days (that's
+    fetch_track_record's job, kept qualitative on purpose). Includes both stocks and crypto --
+    not redundant with crypto_eod_report's crypto-only Slack recap, since that posts after the
+    fact while this feeds today's picking decision. Fails open like fetch_research/
+    fetch_indicators: a transient Alpaca API error degrades to an empty snapshot for this run
+    rather than failing the whole Analyst run, since this is supplementary context, not a trading
+    gate."""
+    if not cfg.analyst.enable_position_pnl:
+        log("⏭️ position P&L snapshot disabled via config — skipping")
+        return {**state, "pnl_text": ""}
+
+    try:
+        positions = summarize_positions(trading_client.get_all_positions())
+    except Exception as exc:
+        log(f"⚠️ failed to fetch position P&L snapshot: {exc}")
+        return {**state, "pnl_text": ""}
+
+    if not positions:
+        return {**state, "pnl_text": ""}
+
+    lines = []
+    for p in positions:
+        if p["unrealized_pl"] is not None:
+            sign = "+" if p["unrealized_pl"] >= 0 else "-"
+            pl = f"{sign}${abs(p['unrealized_pl']):,.2f}"
+        else:
+            pl = "n/a"
+        pct = f"{p['unrealized_plpc'] * 100:+.2f}%" if p.get("unrealized_plpc") is not None else "n/a"
+        cur = f"${p['current_price']:,.2f}" if p["current_price"] is not None else "n/a"
+        lines.append(
+            f"- {p['symbol']}: qty {p['qty']:g}, avg entry ${p['avg_entry_price']:,.2f}, "
+            f"current {cur}, unrealized {pl} ({pct})"
+        )
+
+    return {**state, "pnl_text": "\n".join(lines)}
+
+
 def llm_select(state: AnalystState, cfg) -> AnalystState:
     llm = ChatOpenAI(
         base_url=cfg.llm.base_url,
@@ -164,7 +208,13 @@ def llm_select(state: AnalystState, cfg) -> AnalystState:
         "at the time, what the Dealer ultimately decided to do about each, and how execution "
         "went. Use it to spot patterns -- if a rationale pattern has recently preceded a SELL, "
         "no_fill, or error outcome, don't blindly repeat it; the track record may be empty (no "
-        "history yet, or the feature is disabled), in which case ignore it."
+        "history yet, or the feature is disabled), in which case ignore it. "
+        "You're also given a live snapshot of currently-open positions with Alpaca's own "
+        "unrealized P&L for each -- a point-in-time read of current holdings, not per-pick "
+        "attribution (a symbol can be bought and sold more than once, so a listed position may "
+        "not correspond 1:1 to any specific past pick above). Use it to avoid compounding into "
+        "an already-losing position, but don't over-interpret it as scored feedback on a "
+        "specific rationale; it may be empty (no open positions, or the feature disabled)."
     )
     user_prompt = (
         f"Candidate symbols (from screener):\n{json.dumps(state['raw_candidates'])}\n\n"
@@ -172,7 +222,9 @@ def llm_select(state: AnalystState, cfg) -> AnalystState:
         f"only -- not every candidate has these):\n{state['indicator_text']}\n\n"
         f"Market research:\n{state['research_text']}\n\n"
         f"Your recent track record (last {cfg.analyst.track_record_days} days -- past picks, "
-        f"what the Dealer decided, and how execution went):\n{state['track_record_text']}"
+        f"what the Dealer decided, and how execution went):\n{state['track_record_text']}\n\n"
+        f"Live snapshot of currently-open positions and unrealized P&L (Alpaca's own numbers, "
+        f"point-in-time -- not tied to any specific past pick):\n{state['pnl_text']}"
     )
 
     log("🧠 asking LLM to select the tradeable universe")
@@ -255,6 +307,7 @@ def build_graph():
     graph.add_node("fetch_research", lambda state: fetch_research(state, cfg))
     graph.add_node("fetch_indicators", lambda state: fetch_indicators(state, cfg))
     graph.add_node("fetch_track_record", lambda state: fetch_track_record(state, cfg))
+    graph.add_node("fetch_position_pnl", lambda state: fetch_position_pnl(state, cfg))
     graph.add_node("llm_select", lambda state: llm_select(state, cfg))
     graph.add_node("validate_selection", lambda state: validate_selection(state, cfg))
     graph.add_node("write_portfolio", lambda state: write_portfolio(state, cfg))
@@ -264,7 +317,8 @@ def build_graph():
     graph.add_edge("discover_candidates", "fetch_research")
     graph.add_edge("fetch_research", "fetch_indicators")
     graph.add_edge("fetch_indicators", "fetch_track_record")
-    graph.add_edge("fetch_track_record", "llm_select")
+    graph.add_edge("fetch_track_record", "fetch_position_pnl")
+    graph.add_edge("fetch_position_pnl", "llm_select")
     graph.add_edge("llm_select", "validate_selection")
     graph.add_edge("validate_selection", "write_portfolio")
     graph.add_edge("write_portfolio", "crypto_eod_report")

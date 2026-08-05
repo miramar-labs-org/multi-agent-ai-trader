@@ -31,6 +31,7 @@ def main():
                 "research_text": "",
                 "indicator_text": "",
                 "track_record_text": "",
+                "pnl_text": "",
                 "selection": None,
                 "stock_market_open": stock_market_open,
             },

@@ -11,11 +11,23 @@ class FakeAccount:
 
 
 class FakePosition:
-    def __init__(self, symbol, qty, market_value, unrealized_plpc):
+    def __init__(
+        self,
+        symbol,
+        qty,
+        market_value,
+        unrealized_plpc,
+        avg_entry_price="0",
+        unrealized_pl="0",
+        current_price="0",
+    ):
         self.symbol = symbol
         self.qty = qty
         self.market_value = market_value
         self.unrealized_plpc = unrealized_plpc
+        self.avg_entry_price = avg_entry_price
+        self.unrealized_pl = unrealized_pl
+        self.current_price = current_price
 
 
 class FakeTradingClient:
@@ -67,7 +79,17 @@ def test_open_market_sends_full_eod_report(monkeypatch):
     _report_date, account_summary, fills, position_summaries = args
     assert account_summary["equity"] == 1050.0
     assert fills == []
-    assert position_summaries == [{"symbol": "MGN", "qty": 3.0, "market_value": 150.0, "unrealized_plpc": 0.05}]
+    assert position_summaries == [
+        {
+            "symbol": "MGN",
+            "qty": 3.0,
+            "market_value": 150.0,
+            "unrealized_plpc": 0.05,
+            "unrealized_pl": 0.0,
+            "avg_entry_price": 0.0,
+            "current_price": 0.0,
+        }
+    ]
 
 
 def test_alpaca_failure_notifies_error_and_reraises(monkeypatch):

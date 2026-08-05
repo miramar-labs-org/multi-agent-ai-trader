@@ -53,6 +53,11 @@ analyst:
                                # Broker outcomes as an Analyst input (read-only Postgres query)
   track_record_days: 5        # lookback window in calendar days; excludes today by construction
                                # -- this node runs before write_portfolio's DB write in the same run
+  enable_position_pnl: true   # feature gate: live unrealized P&L snapshot of currently-open Alpaca
+                               # positions (stocks + crypto) as an Analyst input -- a fresh
+                               # trading_client.get_all_positions() call each run, point-in-time
+                               # only, not persisted, not compared across days; complements the
+                               # qualitative track_record above rather than replacing it
   max_universe_size: 10
   default_budget: 5000
   screener_top_n: 20          # candidates pulled from Alpaca Screener before research/filtering
