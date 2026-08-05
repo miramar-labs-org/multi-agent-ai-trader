@@ -78,11 +78,31 @@ def call_floor_broker(state: DealerState, cfg) -> DealerState:
         db.record_floor_broker_event(state["symbol"], "skip", result["detail"])
         return {**state, "execution_result": result}
 
+    budget = state["budget"]
+    if signal["action"] == "BUY":
+        size_hint = signal.get("size_hint", 1.0)
+        budget = state["budget"] * size_hint
+        if budget <= 0:
+            # size_hint scaled the authorized budget to exactly $0 -- ExecuteRequest requires
+            # budget > 0 (src/floor_broker/app.py), so this must be refused locally rather than
+            # forwarded to a request that would 422. A budget scaled to a small-but-positive
+            # amount is intentionally still forwarded -- execution.py's own minimum-notional/
+            # insufficient-qty checks already handle that gracefully with their own reason codes.
+            log(f"⚠️  size_hint={size_hint} scales BUY budget for {state['symbol']} to $0 -- skipping")
+            result = {
+                "status": "skipped",
+                "reason": "size_hint_zero",
+                "detail": f"size_hint {size_hint} scales authorized budget to $0",
+            }
+            slack.notify_floor_broker_result(state["symbol"], signal["action"], result["status"], result["detail"])
+            db.record_floor_broker_event(state["symbol"], "skip", result["detail"])
+            return {**state, "execution_result": result}
+
     payload = {
         "symbol": state["symbol"],
         "exchange": state["exchange"],
         "action": signal["action"],
-        "budget": state["budget"],
+        "budget": budget,
         "slP": cfg.trading.slP,
         "tpP": cfg.trading.tpP,
     }

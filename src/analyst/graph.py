@@ -253,7 +253,27 @@ def validate_selection(state: AnalystState, cfg) -> AnalystState:
         pick["exchange"] = market
         validated.append(pick)
 
-    return {**state, "selection": {**state["selection"], "symbols": validated}}
+    # Per-pick `budget` has no upper bound of its own (src/analyst/schema.py), and the system
+    # prompt's per-pick default is only a suggestion the LLM can ignore -- nothing upstream stops
+    # a selection from authorizing far more total new-BUY capital than intended. Cap the sum,
+    # dropping trailing picks (in the LLM's own returned order, treated as its priority order)
+    # once the running total would exceed the ceiling, rather than silently rewriting any pick's
+    # budget.
+    max_total_budget = cfg.analyst.max_total_budget_usd
+    capped = []
+    running_total = 0.0
+    for pick in validated:
+        if running_total + pick["budget"] > max_total_budget:
+            log(
+                f"⚠️ dropping pick {pick['symbol']} (budget {pick['budget']}) -- "
+                f"would exceed analyst.max_total_budget_usd ({max_total_budget}), "
+                f"running total {running_total}"
+            )
+            continue
+        running_total += pick["budget"]
+        capped.append(pick)
+
+    return {**state, "selection": {**state["selection"], "symbols": capped}}
 
 
 def write_portfolio(state: AnalystState, cfg) -> AnalystState:

@@ -12,12 +12,12 @@ def _cfg():
     )
 
 
-def _state(action: str, budget: float) -> dict:
+def _state(action: str, budget: float, size_hint: float = 1.0) -> dict:
     return {
         "symbol": "MGN",
         "exchange": "stocks",
         "budget": budget,
-        "signal": {"action": action, "reasoning": "test", "size_hint": 1.0},
+        "signal": {"action": action, "reasoning": "test", "size_hint": size_hint},
         "execution_result": None,
     }
 
@@ -70,6 +70,72 @@ def test_buy_with_authorized_budget_is_forwarded_to_floor_broker(monkeypatch):
 
     assert posted["json"]["budget"] == 5000.0
     assert result["execution_result"]["status"] == "executed"
+
+
+def test_buy_scales_forwarded_budget_by_size_hint(monkeypatch):
+    """The Dealer LLM's size_hint (fraction of budget to deploy) was previously captured in the
+    schema but never actually applied -- ROADMAP P1.7. A 0.5 hint on a $5000 budget must reach
+    Floor Broker as $2500, not the full $5000."""
+    _silence_slack(monkeypatch)
+    posted = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"status": "executed", "detail": "buy order submitted: order-123"}
+
+    def _fake_post(url, json, timeout):
+        posted["json"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr(graph.requests, "post", _fake_post)
+
+    result = graph.call_floor_broker(_state("BUY", budget=5000.0, size_hint=0.5), _cfg())
+
+    assert posted["json"]["budget"] == 2500.0
+    assert result["execution_result"]["status"] == "executed"
+
+
+def test_buy_with_zero_size_hint_is_skipped_without_calling_floor_broker(monkeypatch):
+    """A size_hint of exactly 0.0 scales the authorized budget to $0 -- ExecuteRequest requires
+    budget > 0 (src/floor_broker/app.py), so this must be refused locally rather than forwarded
+    to a request that would fail Pydantic validation."""
+    _silence_slack(monkeypatch)
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("Floor Broker must not be called for a size_hint-zeroed BUY")
+
+    monkeypatch.setattr(graph.requests, "post", _fail_if_called)
+
+    result = graph.call_floor_broker(_state("BUY", budget=5000.0, size_hint=0.0), _cfg())
+
+    assert result["execution_result"]["status"] == "skipped"
+    assert result["execution_result"]["reason"] == "size_hint_zero"
+
+
+def test_sell_forwards_budget_unscaled_by_size_hint(monkeypatch):
+    """size_hint is documented as a BUY-only sizing hint (src/dealer/schema.py) -- Floor Broker's
+    sell() ignores budget entirely, but confirm call_floor_broker doesn't scale it for SELL
+    either, in case that ever changes."""
+    _silence_slack(monkeypatch)
+    posted = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"status": "executed", "detail": "sell order submitted: order-456"}
+
+    def _fake_post(url, json, timeout):
+        posted["json"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr(graph.requests, "post", _fake_post)
+
+    graph.call_floor_broker(_state("SELL", budget=5000.0, size_hint=0.1), _cfg())
+
+    assert posted["json"]["budget"] == 5000.0
 
 
 def test_execution_result_fields_are_forwarded_to_the_slack_notification(monkeypatch):

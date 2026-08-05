@@ -130,7 +130,7 @@ off to the Dealer.
 | `fetch_track_record` | gated on `cfg.analyst.enable_track_record` (short-circuits before any DB call when false) — reads the Analyst's own pick history plus matching Dealer decisions and Floor Broker events from Postgres via `db.fetch_analyst_picks_since()`/`fetch_dealer_decisions_since()`/`fetch_floor_broker_events_since()` for the last `cfg.analyst.track_record_days` (default 5) calendar days, formatted as plain text (qualitative sequence only — no computed P&L; see [Persistence](#persistence)). Runs before `write_portfolio` records this run's own picks, so a symbol picked *this* run never appears in its own track record |
 | `fetch_position_pnl` | gated on `cfg.analyst.enable_position_pnl` (short-circuits before any Alpaca call when false) — `trading_client.get_all_positions()` + `summarize_positions()` (`src/common/eod.py`, same shape `crypto_eod_report` already uses, no `only_crypto` filter so both stocks and crypto are included) formatted as plain text: symbol, qty, avg entry price, current price, unrealized $ and %. A live point-in-time snapshot only — not persisted, not compared across days, and not per-pick attribution (a symbol can be bought/sold more than once); complements `fetch_track_record`'s qualitative history rather than replacing it. Fails open (empty text) on any Alpaca API error, matching `fetch_research`/`fetch_indicators` |
 | `llm_select` | the actual LLM call — see below |
-| `validate_selection` | overrides each pick's `exchange` field with the `market` tag `discover_candidates` actually assigned that symbol (never trusts the LLM's own copy of `exchange`), and drops any pick whose symbol isn't in `raw_candidates` at all (a hallucination) |
+| `validate_selection` | overrides each pick's `exchange` field with the `market` tag `discover_candidates` actually assigned that symbol (never trusts the LLM's own copy of `exchange`), drops any pick whose symbol isn't in `raw_candidates` at all (a hallucination), then walks the remaining picks in the LLM's own returned order and greedily drops (logs, doesn't error) any pick that would push the running total of `budget` over `cfg.analyst.max_total_budget_usd` — a last-line-of-defense cap since no per-pick `budget` upper bound exists on its own (`src/analyst/schema.py`) and the LLM's suggested `default_budget` is only a prompt hint it can ignore |
 | `write_portfolio` | patches the `portfolio` ConfigMap via the `kubernetes` Python client |
 | `crypto_eod_report` | gated on `cfg.trading.enable_crypto` — posts a crypto-only "Crypto EOD Report" to Slack covering the prior full ET day's crypto fills/positions; see below |
 
@@ -249,11 +249,17 @@ fraction between 0.0 and 1.0 representing the portion of the symbol's budget to 
 (e.g. 0.5 = half the budget, 1.0 = the full budget) — never a dollar amount or share count."*
 The `Signal` model
 (`src/dealer/schema.py`) is `{symbol, action: BUY|HOLD|SELL, reasoning, size_hint}` —
-`size_hint` (a 0–1 fraction) is captured in the schema but **not currently consumed**;
-`call_floor_broker` forwards the symbol's configured `budget` unmodified regardless of
-`size_hint` — except a BUY signal on a held-only entry (`budget == 0`, see
-`merge_held_positions()` above), which is refused locally (`status="skipped",
-reason="no_authorized_budget"`) rather than forwarded.
+`size_hint` (a 0–1 fraction, default 1.0) scales the symbol's configured `budget` on a BUY
+(`budget * size_hint`); it has no effect on SELL, which ignores `budget` entirely
+(`execution.py::sell()` closes the full open position, not a partial amount). Two cases are
+refused locally rather than forwarded to Floor Broker: a BUY signal on a held-only entry
+(`budget == 0`, see `merge_held_positions()` above — `status="skipped",
+reason="no_authorized_budget"`), and a BUY whose `size_hint` scales the budget to exactly $0
+(`status="skipped", reason="size_hint_zero"` — `ExecuteRequest.budget` requires `> 0`, so this
+would otherwise fail request validation rather than get a graceful business-logic skip). A
+budget scaled to a small but nonzero amount is still forwarded as-is — Floor Broker's own
+minimum-notional/insufficient-qty checks (`execution.py`) already handle that gracefully with
+their own reason codes, so Dealer doesn't need a second floor.
 
 **Dispatch to Floor Broker** — plain in-cluster HTTP, no message queue:
 ```python
@@ -701,6 +707,7 @@ isn't purely for human/skill consumption.
 | `analyst` | `enable_midday_run` | feature gate for the optional `analyst-midday` CronJob (12:30pm ET) — when false (default), `main()` exits immediately on a midday-labeled run before `build_graph()` is called |
 | `analyst` | `midday_schedule` | informational copy of `k8s/analyst-midday-cronjob-k3s.yaml`'s own `spec.schedule` — not templated, must be kept in sync manually |
 | `analyst` | `max_universe_size`, `default_budget`, `screener_top_n`, `news_days`, `yahoo_rss_url` | Analyst's selection parameters |
+| `analyst` | `max_total_budget_usd` | last-line-of-defense cap (default 50000 = `max_universe_size` × `default_budget`) on the sum of every pick's `budget` in one selection — `validate_selection` drops trailing picks (in the LLM's own returned order) once the running total would exceed it |
 | `analyst` | `indicator_fetch_limit` | candidates (top-N by `abs(change_pct)`) that get a real TAAPI `/bulk` indicator fetch in `fetch_indicators` (default 15) — capped by the TAAPI free-tier 15s/request limit |
 | `analyst` | `enable_news` | feature gate for `fetch_research` — when false, short-circuits before any Alpaca News/Yahoo RSS call and feeds the LLM an empty research text |
 | `analyst` | `enable_indicators` | feature gate for `fetch_indicators` — when false, short-circuits before any TAAPI call and feeds the LLM an empty indicator text |

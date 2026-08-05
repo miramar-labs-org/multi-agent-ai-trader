@@ -123,6 +123,10 @@ def test_write_portfolio_uses_midday_title_and_emoji_on_a_midday_run(monkeypatch
     assert captured["kwargs"]["emoji"] == "🕐"
 
 
+def _budget_cfg(max_total_budget_usd=1_000_000.0):
+    return OmegaConf.create({"analyst": {"max_total_budget_usd": max_total_budget_usd}})
+
+
 def test_validate_selection_overrides_llm_exchange_with_known_market():
     """The LLM sometimes echoes back the wrong exchange for a pick -- validate_selection must
     trust discover_candidates()'s own `market` tag, not the LLM's copy of the field."""
@@ -131,7 +135,7 @@ def test_validate_selection_overrides_llm_exchange_with_known_market():
         picks=[{"symbol": "BTC/USD", "exchange": "stocks", "budget": 100.0}],
     )
 
-    result = validate_selection(state, cfg=None)
+    result = validate_selection(state, _budget_cfg())
 
     assert result["selection"]["symbols"] == [{"symbol": "BTC/USD", "exchange": "binance", "budget": 100.0}]
 
@@ -147,9 +151,46 @@ def test_validate_selection_drops_hallucinated_pick():
         ],
     )
 
-    result = validate_selection(state, cfg=None)
+    result = validate_selection(state, _budget_cfg())
 
     assert [pick["symbol"] for pick in result["selection"]["symbols"]] == ["MGN"]
+
+
+def test_validate_selection_keeps_picks_within_the_total_budget_cap():
+    state = _state(
+        raw_candidates=[{"symbol": "A", "market": "stocks"}, {"symbol": "B", "market": "stocks"}],
+        picks=[
+            {"symbol": "A", "exchange": "stocks", "budget": 5000.0},
+            {"symbol": "B", "exchange": "stocks", "budget": 5000.0},
+        ],
+    )
+
+    result = validate_selection(state, _budget_cfg(max_total_budget_usd=50000.0))
+
+    assert [pick["symbol"] for pick in result["selection"]["symbols"]] == ["A", "B"]
+
+
+def test_validate_selection_drops_trailing_picks_that_would_exceed_the_total_budget_cap():
+    """Per-pick budget has no upper bound of its own (src/analyst/schema.py) -- a selection that
+    sums past analyst.max_total_budget_usd must be trimmed, not written through as-is. Picks are
+    considered in the LLM's own returned order; a later pick that doesn't fit is dropped even if
+    an even-later, smaller pick would have fit."""
+    state = _state(
+        raw_candidates=[
+            {"symbol": "A", "market": "stocks"},
+            {"symbol": "B", "market": "stocks"},
+            {"symbol": "C", "market": "stocks"},
+        ],
+        picks=[
+            {"symbol": "A", "exchange": "stocks", "budget": 40000.0},
+            {"symbol": "B", "exchange": "stocks", "budget": 20000.0},
+            {"symbol": "C", "exchange": "stocks", "budget": 5000.0},
+        ],
+    )
+
+    result = validate_selection(state, _budget_cfg(max_total_budget_usd=50000.0))
+
+    assert [pick["symbol"] for pick in result["selection"]["symbols"]] == ["A", "C"]
 
 
 class FakePosition:

@@ -36,7 +36,7 @@ All trading remains **paper-only**. SELL operations that reduce exposure should 
 | P1.4 | Forward evaluation and replay | P1 | Planned | P1.1, P1.3 |
 | P1.5 | Historical backtesting harness | P1 | Done (deterministic baselines only; see below) | P1.1 |
 | P1.6 | Deterministic baseline strategies | P1 | Done | P1.4 or P1.5 |
-| P1.7 | Resolve `size_hint` semantics | P1 | Planned | P1.1 |
+| P1.7 | Resolve `size_hint` semantics | P1 | Done | P1.1 |
 | P1.8 | Daily loss, trade-count, and aggregate exposure controls | P1 | Partial (daily P&L halt only; see below) | P0.4, P1.1 |
 | P1.9 | Core operational metrics | P1 | Planned | P1.1 |
 | P2.1 | Full Prometheus and Grafana observability | P2 | Planned | P1.9 |
@@ -806,21 +806,23 @@ No claim of trading edge should be made without these comparisons.
 
 ## P1.7 — Resolve `size_hint` semantics
 
-Choose one:
+**Done.** Chose option 3: `size_hint` is used deterministically as a bounded fraction (`0.0`–
+`1.0`, schema-enforced in `src/dealer/schema.py`) of the authorized budget.
+`call_floor_broker` (`src/dealer/graph.py`) now computes `budget = state["budget"] * size_hint`
+for BUY signals only; SELL forwards `budget` unscaled since `execution.sell()` ignores it
+entirely and closes the whole position.
 
-1. remove `size_hint`;
-2. rename it as informational only;
-3. use it deterministically as a bounded fraction of an authorized budget.
+`size_hint=0` is a skipped BUY, not a HOLD or a valid zero-allocation signal: it would scale the
+authorized budget to exactly `$0`, which `ExecuteRequest.budget`'s `gt=0` constraint
+(`src/floor_broker/app.py`) would reject as a validation error, so it's refused locally instead
+(`status="skipped", reason="size_hint_zero"`) before ever reaching Floor Broker. A budget scaled
+to a small-but-positive amount is still forwarded as-is — Floor Broker already applies all P0
+risk limits and has its own graceful skip paths for that case (`reason="budget_below_minimum"`,
+`reason="insufficient_qty"`), so Dealer doesn't need a second floor/clamp on top.
 
-If used:
-
-```text
-proposed_notional = authorized_budget × size_hint
-```
-
-The Floor Broker must still apply all P0 risk limits.
-
-Document whether `size_hint=0` means HOLD, a skipped BUY, or a valid zero-allocation signal.
+Tests: `tests/dealer/test_call_floor_broker.py` (`test_buy_scales_forwarded_budget_by_size_hint`,
+`test_buy_with_zero_size_hint_is_skipped_without_calling_floor_broker`,
+`test_sell_forwards_budget_unscaled_by_size_hint`).
 
 ---
 
