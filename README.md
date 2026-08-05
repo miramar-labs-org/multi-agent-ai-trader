@@ -14,7 +14,9 @@ Four independently-deployed Kubernetes workloads that together run a daily equit
 trading loop against Alpaca's **paper** trading account:
 
 - **Analyst** — a `CronJob` that runs once a day before market open, screens for candidate
-  symbols, and decides a tradeable watchlist for the day.
+  symbols, decides a tradeable watchlist for the day, and posts a Morning Report to Slack.
+  Optionally (`analyst.enable_midday_run`) runs again around midday and posts a Midday Update
+  instead of a second Morning Report.
 - **Dealer** — a long-running `Deployment` that polls every 10 minutes while the market is
   open, pulls technical indicators for each watchlist symbol, and asks an LLM whether to
   BUY, HOLD, or SELL.
