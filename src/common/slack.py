@@ -9,8 +9,6 @@ from src.common.logging import get_logger
 
 log = get_logger("SLACK")
 
-_cfg = load_config()
-_ENABLED = _cfg.slack.enabled
 _WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
 
 
@@ -28,7 +26,7 @@ def _format_fill_time(iso_time: str) -> str:
 def _post(text: str) -> None:
     """Fire-and-forget POST to the Slack incoming webhook. Never raises -- a Slack
     outage must never affect a trading decision."""
-    if not _ENABLED or not _WEBHOOK_URL:
+    if not load_config().slack.enabled or not _WEBHOOK_URL:
         return
     try:
         resp = requests.post(_WEBHOOK_URL, json={"text": text}, timeout=10)

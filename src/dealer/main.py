@@ -71,12 +71,12 @@ def market_is_open(cfg, log) -> bool:
 
 
 def main():
-    cfg = load_config()
-    langsmith.configure(cfg)
+    langsmith.configure(load_config())
 
     graph = build_graph()
 
     while True:
+        cfg = load_config()  # reloaded every poll cycle so a live config change never needs a restart
         if market_is_open(cfg, log):
             try:
                 portfolio = merge_held_positions(read_portfolio(), cfg)

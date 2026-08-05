@@ -114,12 +114,29 @@ strategy:
 ```
 
 Show the exact diff against the current `config.yaml` and get explicit confirmation
-before writing — this file is loaded by live k8s services (even though it's a paper
-account, per this org's "Ask Before Acting" rule, don't write config changes silently).
+before writing — this file is loaded live by every k8s service straight from GitHub
+(`main` branch, refetched every ~60s, no rebuild/redeploy — see `src/common/config.py`),
+so per this org's "Ask Before Acting" rule, don't write config changes silently.
 Preserve every existing top-level key in `config.yaml`; only touch `trading.slP`/
 `trading.tpP` and the `strategy:` block itself.
 
-## Step 8 — Log the outcome
+## Step 8 — Commit and push
+
+The confirmation obtained in Step 7 covers this too — writing `config.yaml` locally
+does nothing for live services until it's on `main`. Immediately after writing the
+file(s):
+
+```
+git add config.yaml   # plus config.default.yaml if Step 7 just created it
+git commit -m "..."   # summarize the strategy change
+git push origin main
+```
+
+Per this org's "No Push Until Confirmed" rule, do not push without the explicit
+confirmation from Step 7 having been given. Once pushed, every live service picks up
+the change within ~60s on its own — no `build-push.yaml`/`deploy.yaml` run needed.
+
+## Step 9 — Log the outcome
 
 Append a dated entry to `docs/strategy.md` (create it if missing) summarizing: the
 goal as stated, the answers given, the resulting `trading.slP`/`tpP` and `strategy:`

@@ -4,8 +4,30 @@ import uuid
 import pytest
 from alpaca.common.exceptions import APIError
 from alpaca.trading.enums import OrderSide, OrderStatus, OrderType
+from omegaconf import OmegaConf
 
 from src.floor_broker import execution
+
+# buy() now calls load_config() itself (fetched live from GitHub in production, see
+# src/common/config.py) rather than reading a module-level cfg captured at import time --
+# without this fixture every test in this file would attempt a real network fetch, and would be
+# coupled to whatever config.yaml on `main` happens to contain (e.g. Task D's
+# daily_loss_limit_usd change) instead of the fixed values these tests assert against.
+_FAKE_CFG = OmegaConf.create(
+    {
+        "strategy": {
+            "daily_profit_target_usd": 1000,
+            "daily_loss_limit_usd": 500,
+            "crypto_slP": 0.98,
+            "crypto_tpP": 1.03,
+        },
+    }
+)
+
+
+@pytest.fixture(autouse=True)
+def _fake_cfg(monkeypatch):
+    monkeypatch.setattr(execution, "load_config", lambda: _FAKE_CFG)
 
 
 def _api_error(payload: dict) -> APIError:
@@ -522,8 +544,8 @@ def test_crypto_buy_stores_strategy_crypto_slp_tpp_for_the_pending_fill(monkeypa
 
     assert result["status"] == "submitted"
     pending = execution._pending_fills["order-123"]
-    assert pending["crypto_slP"] == execution.cfg.strategy.crypto_slP
-    assert pending["crypto_tpP"] == execution.cfg.strategy.crypto_tpP
+    assert pending["crypto_slP"] == _FAKE_CFG.strategy.crypto_slP
+    assert pending["crypto_tpP"] == _FAKE_CFG.strategy.crypto_tpP
 
 
 def test_sell_returns_dealer_signal_reason_and_untracks_bracket_and_tracks_pending_fill(monkeypatch):

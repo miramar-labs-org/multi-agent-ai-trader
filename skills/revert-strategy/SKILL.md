@@ -28,9 +28,12 @@ the config is already at default and stop — nothing to do.
 ## Step 3 — Show the diff and confirm
 
 Show the user exactly what will change (the diff from Step 2, read as "current →
-default"). Get explicit confirmation before writing — `config.yaml` is loaded by live
-k8s services (paper account, but still don't overwrite silently, per this org's "Ask
-Before Acting" rule).
+default"). Get explicit confirmation before writing — `config.yaml` is loaded live by
+every k8s service straight from GitHub (`main` branch, refetched every ~60s, no
+rebuild/redeploy — see `src/common/config.py`), so per this org's "Ask Before Acting"
+rule, don't overwrite it silently. This same confirmation also covers the commit+push
+in Step 5 below — restoring the file locally does nothing for live services until it's
+on `main`.
 
 ## Step 4 — Restore
 
@@ -38,7 +41,19 @@ Copy `config.default.yaml` over `config.yaml` verbatim (`cp config.default.yaml
 config.yaml`). Do not hand-merge or selectively revert fields — the whole point is an
 exact, unambiguous return to the known-good baseline.
 
-## Step 5 — Log the outcome
+## Step 5 — Commit and push
+
+```
+git add config.yaml
+git commit -m "Revert strategy config to default"
+git push origin main
+```
+
+Per this org's "No Push Until Confirmed" rule, do not push without the explicit
+confirmation obtained in Step 3. Once pushed, every live service picks up the reverted
+config within ~60s on its own — no `build-push.yaml`/`deploy.yaml` run needed.
+
+## Step 6 — Log the outcome
 
 Append a dated entry to `docs/strategy.md` noting the revert happened and what the
 diff (from Step 2) contained, so the strategy history isn't silently lost even though

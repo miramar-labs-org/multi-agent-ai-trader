@@ -18,8 +18,6 @@ from src.common.logging import get_logger
 
 log = get_logger("FLOOR")
 
-cfg = load_config()
-
 MIN_CRYPTO_NOTIONAL = 10.0  # Alpaca rejects a crypto notional below this (code 40310000)
 
 ORDER_NOT_FOUND_CODE = 40410000  # Alpaca's code for "no order exists with that id"
@@ -396,6 +394,7 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
     # own account.equity/last_equity already handles the trading-day boundary, so no custom
     # bookkeeping is needed. Only blocks new BUYs (halt_behavior: block_new_buys); SELL is
     # unaffected, same as the kill switch above.
+    cfg = load_config()  # fresh (within its own refresh window) so a live strategy change never needs a restart
     account = trading_client.get_account()
     daily_pnl = float(account.equity) - float(account.last_equity)
     if daily_pnl >= cfg.strategy.daily_profit_target_usd:

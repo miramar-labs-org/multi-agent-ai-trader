@@ -120,12 +120,14 @@ def call_floor_broker(state: DealerState, cfg) -> DealerState:
 
 
 def build_graph():
-    cfg = load_config()
-
+    # Each lambda calls load_config() fresh at invocation time (once per node per graph run,
+    # i.e. once per Dealer poll cycle per symbol) rather than baking one cfg into the closure at
+    # build time -- build_graph() itself only runs once per process, but a live config change
+    # must be visible within load_config()'s refresh window without a Dealer restart.
     graph = StateGraph(DealerState)
-    graph.add_node("fetch_indicators", lambda state: fetch_indicators(state, cfg))
-    graph.add_node("llm_call", lambda state: llm_call(state, cfg))
-    graph.add_node("call_floor_broker", lambda state: call_floor_broker(state, cfg))
+    graph.add_node("fetch_indicators", lambda state: fetch_indicators(state, load_config()))
+    graph.add_node("llm_call", lambda state: llm_call(state, load_config()))
+    graph.add_node("call_floor_broker", lambda state: call_floor_broker(state, load_config()))
 
     graph.set_entry_point("fetch_indicators")
     graph.add_edge("fetch_indicators", "llm_call")

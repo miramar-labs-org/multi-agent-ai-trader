@@ -61,7 +61,8 @@ Broker's HTTP hop:
 
 ```
 multi-agent-ai-trader/
-├── config.yaml                  # single source of config for all agents + EOD report
+├── config.yaml                  # single source of config for all agents + EOD report -- fetched
+│                                  # live from GitHub at runtime (main branch), not baked into images
 ├── notebook.ipynb                # bare JupyterLab entry point (no pipeline logic — see below)
 ├── Dockerfile.analyst/.dealer/.floor-broker/.eod-report
 ├── k8s/                          # 2 CronJobs, 2 Deployments, 1 Service, RBAC, namespace, secrets doc
@@ -514,8 +515,19 @@ see [`docs/backtesting.md`](backtesting.md) for the full design and documented a
   `StockHistoricalDataClient`/`CryptoHistoricalDataClient` for market data, and
   `get_current_ask_price`/`get_current_bid_price` helpers used by Floor Broker for order sizing.
   Credentials come from `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET` env vars.
-- **`config.py`** — loads `config.yaml` once via OmegaConf; every agent imports the same
-  loader, so there is exactly one config schema for the whole system.
+- **`config.py`** — `load_config()` fetches `config.yaml` fresh from
+  `raw.githubusercontent.com/miramar-labs-org/multi-agent-ai-trader/main/config.yaml`
+  (unauthenticated — the repo is public) instead of reading a local file, so every service
+  reflects a `config.yaml` push within a short in-process cache TTL (`_REFRESH_SECS`, 60s) with no
+  rebuild/redeploy. On a failed refetch, falls back to the last-known-good cached value with a
+  warning (a transient GitHub blip must not crash a running trading system or block a Slack
+  notification) — but fails closed (raises) if no cached value exists yet, since a fresh pod with
+  no bundled fallback config genuinely cannot run without one. Long-running processes (Dealer's
+  poll loop, Floor Broker's HTTP handlers, Slack's `_post()`) call `load_config()` fresh at each
+  point of use rather than caching the returned object themselves — see `src/dealer/main.py`'s
+  per-iteration reload, `src/dealer/graph.py`'s per-node-invocation reload, and
+  `src/floor_broker/execution.py::buy()`'s per-call reload. One-shot processes (Analyst, EOD
+  Report, Backtest) call it once per invocation, which is already as fresh as this can make them.
 - **`portfolio_state.py`** — `read_portfolio()`/`write_portfolio()` against the k8s
   `portfolio` ConfigMap via the `kubernetes` Python client. This is the entire
   Analyst↔Dealer interface. `merge_held_positions()` additionally folds any Alpaca position

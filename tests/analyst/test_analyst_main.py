@@ -1,3 +1,5 @@
+from omegaconf import OmegaConf
+
 from src.analyst import main
 
 
@@ -14,6 +16,7 @@ def test_main_threads_stock_market_open_true_into_initial_state(monkeypatch):
     captured = {}
     monkeypatch.setattr(main, "is_stock_market_open", lambda day: True)
     monkeypatch.setattr(main, "build_graph", lambda: FakeGraph(captured))
+    monkeypatch.setattr(main, "load_config", lambda: OmegaConf.create({}))
     monkeypatch.setattr(main.langsmith, "configure", lambda cfg: None)
 
     main.main()
@@ -28,6 +31,7 @@ def test_main_threads_stock_market_open_false_into_initial_state_on_a_closed_day
     captured = {}
     monkeypatch.setattr(main, "is_stock_market_open", lambda day: False)
     monkeypatch.setattr(main, "build_graph", lambda: FakeGraph(captured))
+    monkeypatch.setattr(main, "load_config", lambda: OmegaConf.create({}))
     monkeypatch.setattr(main.langsmith, "configure", lambda cfg: None)
 
     main.main()
