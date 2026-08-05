@@ -24,7 +24,7 @@ def _state(action: str, budget: float, size_hint: float = 1.0) -> dict:
 
 def _silence_slack(monkeypatch):
     # These tests target call_floor_broker's own HTTP dispatch, not Slack notifications --
-    # silence both so the environment's real SLACK_WEBHOOK_URL (if configured) can't cause an
+    # silence both so the environment's real SLACK_WEBHOOK_URL2 (if configured) can't cause an
     # actual network call, and so its use of the shared `requests` module doesn't clobber the
     # fake `requests.post` these tests install for the Floor Broker call.
     monkeypatch.setattr(graph.slack, "notify_dealer_signal", lambda *a, **k: None)

@@ -722,7 +722,7 @@ isn't purely for human/skill consumption.
 | `llm` | `base_url`, `model`, `temperature` | shared OpenAI-compatible endpoint for **both** Analyst and Dealer LLM calls — see [platform-services.md](platform-services.md) for current wiring status |
 | `langsmith` | `enabled`, `project` | toggles LangGraph/LangChain tracing to LangSmith (requires `LANGCHAIN_API_KEY`) |
 | `langsmith` | `sampling_rate` | fraction of traces actually sent to LangSmith (0.5) — keeps Dealer's poll-driven trace volume under the free Developer plan's 5k traces/month limit |
-| `slack` | `enabled` | toggles posting interesting events (Morning Report, Crypto EOD Report, Dealer signals, Floor Broker executions, EOD Report, EOD's non-trading-day notice, Dealer's live market-closed notice, errors) to `#miramar-trading-floor` (requires `SLACK_WEBHOOK_URL`) — Dealer signals, Floor Broker executions, EOD's non-trading-day notice, and errors each carry a message-level Eastern-time timestamp; Morning Report, EOD Report, Crypto EOD Report, and Dealer's live market-closed notice do not. Dealer signal notices keep the LLM's full rationale on their own line, and a Floor Broker execution notice includes fill price/reason/SL/TP whenever `execution.py` supplies them; EOD Report/Crypto EOD Report fill lines each carry the fill's own Eastern-time timestamp even though the message as a whole doesn't |
+| `slack` | `enabled` | toggles posting interesting events (Morning Report, Crypto EOD Report, Dealer signals, Floor Broker executions, EOD Report, EOD's non-trading-day notice, Dealer's live market-closed notice, errors) to `#miramar-trading-floor` (requires `SLACK_WEBHOOK_URL2`) — Dealer signals, Floor Broker executions, EOD's non-trading-day notice, and errors each carry a message-level Eastern-time timestamp; Morning Report, EOD Report, Crypto EOD Report, and Dealer's live market-closed notice do not. Dealer signal notices keep the LLM's full rationale on their own line, and a Floor Broker execution notice includes fill price/reason/SL/TP whenever `execution.py` supplies them; EOD Report/Crypto EOD Report fill lines each carry the fill's own Eastern-time timestamp even though the message as a whole doesn't |
 | `floor_broker` | `base_url` | in-cluster Service DNS Dealer uses to reach Floor Broker |
 | `taapi` | `min_request_interval_secs` | seconds Dealer and Analyst (`fetch_indicators`) each wait between symbols' TAAPI `/bulk` calls (15) — sized to the TAAPI Free plan's 1 request/15s cap; lower it if the account is on a paid plan |
 | `trading` | `slP` / `tpP` | stop-loss/take-profit price multipliers on bracket orders (0.98/1.05 ≈ 2% stop, 5% target) |
@@ -799,13 +799,13 @@ isn't purely for human/skill consumption.
 
 All credentials live in one k8s Secret, `mlabs-api-keys` (documented, not created, by
 `k8s/secrets.example.yaml` — deploy fails fast if it's missing): `TAAPI_API_KEY`,
-`ALPACA_PAPER_API_KEY`, `ALPACA_PAPER_API_SECRET`, `LANGCHAIN_API_KEY`, `SLACK_WEBHOOK_URL`,
+`ALPACA_PAPER_API_KEY`, `ALPACA_PAPER_API_SECRET`, `LANGCHAIN_API_KEY`, `SLACK_WEBHOOK_URL2`,
 `DATABASE_URL` (see [Persistence](#persistence) — provisioned by `miramar-platform-gcp`'s
 `deploy-postgres.yaml`, not created by this repo).
 Analyst and Dealer get it via `envFrom.secretRef` for both k8s-API access (via their shared
 ServiceAccount) and these external API keys. Floor Broker also has a ServiceAccount
 (`multi-agent-ai-trader-configmap-reader`, scoped to reading the `buy-kill-switch` ConfigMap)
-plus the secret for its Alpaca keys and `SLACK_WEBHOOK_URL`. EOD Report gets the same secret but
+plus the secret for its Alpaca keys and `SLACK_WEBHOOK_URL2`. EOD Report gets the same secret but
 has no ServiceAccount/k8s API access at all.
 
 `pl-badges.yaml` (see [P/L badges](#p-l-badges-src-pl_badges)) runs outside the cluster on a GHA

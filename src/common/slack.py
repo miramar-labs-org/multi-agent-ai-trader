@@ -9,7 +9,7 @@ from src.common.logging import get_logger
 
 log = get_logger("SLACK")
 
-_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
+_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL2")
 
 
 def _timestamp() -> str:

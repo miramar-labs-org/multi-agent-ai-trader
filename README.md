@@ -53,7 +53,7 @@ accounts/API keys, put them in one k8s Secret, then run the two GHA deploy workf
 | `ALPACA_PAPER_API_KEY` / `ALPACA_PAPER_API_SECRET` | [Alpaca](https://alpaca.markets/) — generate a **paper trading** key pair from the dashboard | Required — every component needs this |
 | `TAAPI_API_KEY` | [TAAPI.io](https://taapi.io/) — free plan works (1 request/15s, see `config.yaml`'s `taapi.min_request_interval_secs`) | Required — Dealer's technical indicators |
 | `LANGCHAIN_API_KEY` | [smith.langchain.com](https://smith.langchain.com/) | Optional — only if `config.yaml`'s `langsmith.enabled: true` |
-| `SLACK_WEBHOOK_URL` | An [incoming webhook](https://api.slack.com/messaging/webhooks) for whatever channel you want notifications in | Optional — only if `config.yaml`'s `slack.enabled: true` |
+| `SLACK_WEBHOOK_URL2` | An [incoming webhook](https://api.slack.com/messaging/webhooks) for whatever channel you want notifications in | Optional — only if `config.yaml`'s `slack.enabled: true` |
 
 No LLM API key is needed — the LLM is self-hosted (next step).
 
@@ -79,11 +79,11 @@ kubectl create secret generic mlabs-api-keys -n multi-agent-ai-trader \
   --from-literal=ALPACA_PAPER_API_KEY=... \
   --from-literal=ALPACA_PAPER_API_SECRET=... \
   --from-literal=LANGCHAIN_API_KEY=... \
-  --from-literal=SLACK_WEBHOOK_URL=...
+  --from-literal=SLACK_WEBHOOK_URL2=...
 ```
 
 (see [k8s/secrets.example.yaml](k8s/secrets.example.yaml) for the canonical key list — omit
-`LANGCHAIN_API_KEY`/`SLACK_WEBHOOK_URL` if you're leaving those integrations disabled.)
+`LANGCHAIN_API_KEY`/`SLACK_WEBHOOK_URL2` if you're leaving those integrations disabled.)
 
 ### 4. Review `config.yaml`
 
