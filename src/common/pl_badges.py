@@ -11,14 +11,20 @@ def fetch_pl_summary() -> dict:
     a portfolio-history request starting Jan 1 of the current year: confirmed against a live
     account that PortfolioHistory.profit_loss is a day-over-day delta series (profit_loss[i] ==
     equity[i] - equity[i-1]), not cumulative from base_value, so base_value (Alpaca's own equity
-    snapshot as of the requested start date) is the only reliable YTD anchor."""
+    snapshot as of the requested start date) is the only reliable YTD anchor.
+
+    base_value comes back None for an account with no equity snapshot yet at the requested start
+    date -- observed right after an account reset, where Alpaca hasn't recorded any Jan-1-to-now
+    history for the new account state. Treat that as "no YTD history yet" (ytd_pl = 0.0, current
+    equity is its own baseline) rather than crashing."""
     account = trading_client.get_account()
     equity = float(account.equity)
     today_pl = equity - float(account.last_equity)
 
     year_start = date(date.today().year, 1, 1)
     history = trading_client.get_portfolio_history(GetPortfolioHistoryRequest(start=year_start, timeframe="1D"))
-    ytd_pl = equity - float(history.base_value)
+    base_value = equity if history.base_value is None else float(history.base_value)
+    ytd_pl = equity - base_value
 
     return {"equity": equity, "today_pl": today_pl, "ytd_pl": ytd_pl}
 

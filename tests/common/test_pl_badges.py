@@ -42,6 +42,15 @@ def test_fetch_pl_summary_handles_negative_pl(monkeypatch):
     assert summary == {"equity": 900.0, "today_pl": -100.0, "ytd_pl": -300.0}
 
 
+def test_fetch_pl_summary_handles_none_base_value(monkeypatch):
+    fake_client = FakeTradingClient(equity="1000000.00", last_equity="1000000.00", base_value=None)
+    monkeypatch.setattr(pl_badges, "trading_client", fake_client)
+
+    summary = pl_badges.fetch_pl_summary()
+
+    assert summary == {"equity": 1000000.0, "today_pl": 0.0, "ytd_pl": 0.0}
+
+
 def test_build_badge_payload_formats_positive_value_as_brightgreen():
     payload = pl_badges.build_badge_payload("Today's P/L", 243.359)
 
