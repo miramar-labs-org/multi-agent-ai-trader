@@ -16,6 +16,9 @@ class FakeCursor:
     def fetchall(self):
         return self._rows
 
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
     def __enter__(self):
         return self
 
@@ -103,12 +106,56 @@ def test_record_floor_broker_event_inserts_expected_row(monkeypatch):
     assert params == ("MGN", "buy_submitted", "order abc123", 10, 5.5)
 
 
+def test_record_position_opened_inserts_expected_row(monkeypatch):
+    conn = FakeConnection()
+    _patch_pool(monkeypatch, conn)
+
+    db.record_position_opened("MGN")
+
+    sql, params = conn.executed[0]
+    assert "INSERT INTO position_opens" in sql
+    assert "ON CONFLICT (symbol) DO NOTHING" in sql
+    assert params == ("MGN",)
+
+
+def test_record_position_closed_deletes_expected_row(monkeypatch):
+    conn = FakeConnection()
+    _patch_pool(monkeypatch, conn)
+
+    db.record_position_closed("MGN")
+
+    sql, params = conn.executed[0]
+    assert "DELETE FROM position_opens" in sql
+    assert params == ("MGN",)
+
+
+def test_fetch_position_opened_at_returns_timestamp_when_tracked(monkeypatch):
+    opened_at = datetime(2026, 8, 1, 9, 30)
+    conn = FakeConnection(rows=[{"opened_at": opened_at}])
+    _patch_pool(monkeypatch, conn)
+
+    result = db.fetch_position_opened_at("MGN")
+
+    assert result == opened_at
+
+
+def test_fetch_position_opened_at_returns_none_when_untracked(monkeypatch):
+    conn = FakeConnection(rows=[])
+    _patch_pool(monkeypatch, conn)
+
+    result = db.fetch_position_opened_at("MGN")
+
+    assert result is None
+
+
 @pytest.mark.parametrize(
     "record_fn,args",
     [
         (db.record_analyst_pick, ("MGN", "NASDAQ", 100.0, "rationale", datetime(2026, 8, 4))),
         (db.record_dealer_decision, ("MGN", "BUY", "reasoning", 5.0)),
         (db.record_floor_broker_event, ("MGN", "error", "boom")),
+        (db.record_position_opened, ("MGN",)),
+        (db.record_position_closed, ("MGN",)),
     ],
 )
 def test_write_functions_swallow_exceptions(monkeypatch, record_fn, args):

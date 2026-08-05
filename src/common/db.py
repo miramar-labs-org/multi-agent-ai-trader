@@ -38,6 +38,16 @@ CREATE TABLE IF NOT EXISTS floor_broker_events (
     occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Tracks the timestamp a currently-open stock/crypto position was (re)opened, keyed by symbol.
+-- Populated from poll_pending_fills() (src/floor_broker/main.py) on a BUY fill, and cleared on a
+-- SELL fill -- sell() always closes the entire current position, so there is no partial-lot case
+-- to model. Used by check_eod_flatten()'s conditional mode to compute days-held for its
+-- max_days_held_loss cap.
+CREATE TABLE IF NOT EXISTS position_opens (
+    symbol TEXT PRIMARY KEY,
+    opened_at TIMESTAMPTZ NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_dealer_decisions_symbol_date ON dealer_decisions (symbol, decided_at);
 CREATE INDEX IF NOT EXISTS idx_floor_broker_events_symbol_date ON floor_broker_events (symbol, occurred_at);
 """
@@ -126,6 +136,47 @@ def record_floor_broker_event(
             )
     except Exception as exc:
         log(f"⚠️ record_floor_broker_event failed: {exc}")
+
+
+def record_position_opened(symbol: str) -> None:
+    """Fire-and-forget upsert -- never raises. ON CONFLICT DO NOTHING means a BUY that adds to an
+    already-open position never resets the clock; only a symbol's first BUY since it was last
+    fully closed (or never tracked) starts a new opened_at."""
+    try:
+        _ensure_schema()
+        with _get_pool().connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO position_opens (symbol, opened_at)
+                VALUES (%s, now())
+                ON CONFLICT (symbol) DO NOTHING
+                """,
+                (symbol,),
+            )
+    except Exception as exc:
+        log(f"⚠️ record_position_opened failed: {exc}")
+
+
+def record_position_closed(symbol: str) -> None:
+    """Fire-and-forget delete -- never raises. Called on a SELL fill, which always closes the
+    entire current position (execution.sell() sells the full open qty)."""
+    try:
+        _ensure_schema()
+        with _get_pool().connection() as conn:
+            conn.execute("DELETE FROM position_opens WHERE symbol = %s", (symbol,))
+    except Exception as exc:
+        log(f"⚠️ record_position_closed failed: {exc}")
+
+
+def fetch_position_opened_at(symbol: str) -> datetime | None:
+    """Returns None if the symbol has no tracked open position -- e.g. a position that existed
+    before this feature shipped and hasn't gone through a BUY fill since."""
+    _ensure_schema()
+    with _get_pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT opened_at FROM position_opens WHERE symbol = %s", (symbol,))
+            row = cur.fetchone()
+            return row["opened_at"] if row else None
 
 
 def fetch_analyst_picks_for_date(for_date: date) -> list[dict]:

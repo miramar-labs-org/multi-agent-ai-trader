@@ -102,6 +102,10 @@ def poll_pending_fills():
                         f"{event['reason']} order filled: {event['order_id']}",
                         price=event["fill_price"],
                     )
+                    if event["action"] == "BUY":
+                        db.record_position_opened(event["symbol"])
+                    else:
+                        db.record_position_closed(event["symbol"])
                 else:
                     log(f"⚠️ {event['action']} {event['symbol']} closed with no fill: {event['order_status']}")
                     slack.notify_floor_broker_result(

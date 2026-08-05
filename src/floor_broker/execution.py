@@ -11,7 +11,7 @@ from alpaca.trading.requests import (
     TakeProfitRequest,
 )
 
-from src.common import kill_switch
+from src.common import db, kill_switch
 from src.common.alpaca_client import get_current_ask_price, get_current_bid_price, trading_client
 from src.common.config import load_config
 from src.common.logging import get_logger
@@ -199,11 +199,18 @@ def check_crypto_stops() -> list[dict]:
 def check_eod_flatten() -> list[dict]:
     """Feature-gated (strategy config eod_flatten.enabled, off by default). When enabled and
     Alpaca's live clock reports the market is within eod_flatten.minutes_before_close minutes of
-    closing, sells every open stock position -- crypto is 24/7 so "end of day" doesn't apply to
-    it. Uses the live clock (not a fixed schedule) so early/half-trading-close days are handled
-    correctly with no special-casing. No "already flattened today" bookkeeping is needed: once a
-    symbol is sold, trading_client.get_all_positions() simply stops returning it, so later polls
-    within the same closing window are cheap no-ops."""
+    closing, decides which open stock positions to sell -- crypto is 24/7 so "end of day" doesn't
+    apply to it. Uses the live clock (not a fixed schedule) so early/half-trading-close days are
+    handled correctly with no special-casing. No "already flattened today" bookkeeping is needed:
+    once a symbol is sold, trading_client.get_all_positions() simply stops returning it, so later
+    polls within the same closing window are cheap no-ops.
+
+    Non-conditional mode (eod_flatten.conditional: false, the default) sells every open stock
+    position, same as always. Conditional mode sells everything only if the aggregate unrealized
+    P&L across all open stock positions is >= 0 ("UP"); if it's negative ("DOWN"), positions are
+    held overnight instead -- except any individual position held >= eod_flatten.max_days_held_loss
+    days, which is force-flattened regardless of the aggregate sign so a single loser can't ride
+    forever."""
     cfg = load_config()  # fresh (within its own refresh window), same live-reload pattern buy() uses
     if not cfg.eod_flatten.enabled:
         return []
@@ -216,10 +223,25 @@ def check_eod_flatten() -> list[dict]:
     if minutes_to_close > cfg.eod_flatten.minutes_before_close:
         return []
 
+    positions = [p for p in trading_client.get_all_positions() if p.asset_class == AssetClass.US_EQUITY]
+
+    if cfg.eod_flatten.get("conditional", False):
+        aggregate_pl = sum(float(p.unrealized_pl) for p in positions if p.unrealized_pl is not None)
+        if aggregate_pl >= 0:
+            to_sell = positions
+        else:
+            max_days = cfg.eod_flatten.get("max_days_held_loss", 5)
+            to_sell = []
+            for position in positions:
+                opened_at = db.fetch_position_opened_at(position.symbol)
+                days_held = (clock.timestamp - opened_at).days if opened_at else 0
+                if days_held >= max_days:
+                    to_sell.append(position)
+    else:
+        to_sell = positions
+
     events = []
-    for position in trading_client.get_all_positions():
-        if position.asset_class != AssetClass.US_EQUITY:
-            continue  # crypto is 24/7 -- "end of day" doesn't apply, leave it alone
+    for position in to_sell:
         result = sell(position.symbol, reason="eod_flatten")
         if result["status"] != "skipped":
             events.append({"symbol": position.symbol, "reason": "eod_flatten", "sell_result": result})
@@ -273,6 +295,18 @@ def reconcile_tracked_state_once() -> bool:
             restored_pending += 1
 
     log(f"🔄  reconstructed {restored_pending} pending order(s) and {restored_brackets} bracket(s) from Alpaca")
+
+    # Backfill position_opens for every currently-open position -- ON CONFLICT DO NOTHING means
+    # this is a no-op for a symbol already tracked, and only seeds an opened_at for a position
+    # this process has never observed a BUY fill for (e.g. one that predates this feature, or was
+    # opened in a gap while the pod was down). Best-effort: a failure here must not block order
+    # reconciliation, which is why it's wrapped separately from the get_orders() call above.
+    try:
+        for position in trading_client.get_all_positions():
+            db.record_position_opened(position.symbol)
+    except APIError as exc:
+        log(f"💥  failed to fetch open positions from Alpaca while backfilling position_opens: {exc}")
+
     _state_reconciled = True
     return True
 

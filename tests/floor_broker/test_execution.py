@@ -7,6 +7,7 @@ from alpaca.common.exceptions import APIError
 from alpaca.trading.enums import AssetClass, OrderSide, OrderStatus, OrderType
 from omegaconf import OmegaConf
 
+from src.common import db
 from src.floor_broker import execution
 
 # buy() now calls load_config() itself (fetched live from GitHub in production, see
@@ -696,10 +697,11 @@ class FakeClock:
 
 
 class FakeEodPosition:
-    def __init__(self, symbol, asset_class, qty="1"):
+    def __init__(self, symbol, asset_class, qty="1", unrealized_pl=None):
         self.symbol = symbol
         self.asset_class = asset_class
         self.qty = qty
+        self.unrealized_pl = unrealized_pl
 
 
 class FakeEodFlattenTradingClient:
@@ -729,11 +731,16 @@ class FakeEodFlattenTradingClient:
         return type("Order", (), {"id": f"order-{req.symbol}"})()
 
 
-def _eod_flatten_cfg(enabled=True, minutes_before_close=10):
+def _eod_flatten_cfg(enabled=True, minutes_before_close=10, conditional=False, max_days_held_loss=5):
     return OmegaConf.create(
         {
             "strategy": _FAKE_CFG.strategy,
-            "eod_flatten": {"enabled": enabled, "minutes_before_close": minutes_before_close},
+            "eod_flatten": {
+                "enabled": enabled,
+                "minutes_before_close": minutes_before_close,
+                "conditional": conditional,
+                "max_days_held_loss": max_days_held_loss,
+            },
         }
     )
 
@@ -804,6 +811,66 @@ def test_check_eod_flatten_excludes_a_skipped_sell_from_the_returned_events(monk
 
     assert events == []
     assert fake_client.submitted == []
+
+
+def test_check_eod_flatten_conditional_flattens_everything_when_aggregate_pl_is_up(monkeypatch):
+    monkeypatch.setattr(execution, "load_config", lambda: _eod_flatten_cfg(conditional=True))
+    fake_client = FakeEodFlattenTradingClient(
+        FakeClock(is_open=True, minutes_to_close=5),
+        [
+            FakeEodPosition("MGN", AssetClass.US_EQUITY, unrealized_pl="50"),
+            FakeEodPosition("ACME", AssetClass.US_EQUITY, unrealized_pl="-20"),
+        ],
+    )
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    events = execution.check_eod_flatten()
+
+    assert {e["symbol"] for e in events} == {"MGN", "ACME"}
+    assert {req.symbol for req in fake_client.submitted} == {"MGN", "ACME"}
+
+
+def test_check_eod_flatten_conditional_holds_everything_when_aggregate_pl_is_down(monkeypatch):
+    monkeypatch.setattr(execution, "load_config", lambda: _eod_flatten_cfg(conditional=True, max_days_held_loss=5))
+    fake_client = FakeEodFlattenTradingClient(
+        FakeClock(is_open=True, minutes_to_close=5),
+        [
+            FakeEodPosition("MGN", AssetClass.US_EQUITY, unrealized_pl="-50"),
+            FakeEodPosition("ACME", AssetClass.US_EQUITY, unrealized_pl="20"),
+        ],
+    )
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+    monkeypatch.setattr(db, "fetch_position_opened_at", lambda symbol: None)  # untracked -> 0 days held
+
+    events = execution.check_eod_flatten()
+
+    assert events == []
+    assert fake_client.submitted == []
+
+
+def test_check_eod_flatten_conditional_force_flattens_a_position_past_the_days_held_cap(monkeypatch):
+    monkeypatch.setattr(execution, "load_config", lambda: _eod_flatten_cfg(conditional=True, max_days_held_loss=3))
+    clock = FakeClock(is_open=True, minutes_to_close=5)
+    fake_client = FakeEodFlattenTradingClient(
+        clock,
+        [
+            FakeEodPosition("MGN", AssetClass.US_EQUITY, unrealized_pl="-10"),
+            FakeEodPosition("ACME", AssetClass.US_EQUITY, unrealized_pl="-5"),
+        ],
+    )
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    def fake_opened_at(symbol):
+        if symbol == "MGN":
+            return clock.timestamp - timedelta(days=4)  # past the 3-day cap
+        return clock.timestamp - timedelta(days=1)  # under the cap
+
+    monkeypatch.setattr(db, "fetch_position_opened_at", fake_opened_at)
+
+    events = execution.check_eod_flatten()
+
+    assert [e["symbol"] for e in events] == ["MGN"]
+    assert [req.symbol for req in fake_client.submitted] == ["MGN"]
 
 
 def test_check_bracket_fills_reports_take_profit_leg_filled(monkeypatch):
@@ -1158,11 +1225,15 @@ class FakeOrder:
 
 
 class FakeReconstructTradingClient:
-    def __init__(self, open_orders):
+    def __init__(self, open_orders, positions=None):
         self._open_orders = open_orders
+        self._positions = positions or []
 
     def get_orders(self, request):
         return self._open_orders
+
+    def get_all_positions(self):
+        return self._positions
 
 
 def test_reconcile_tracked_state_once_restores_a_still_open_pending_order(monkeypatch):
@@ -1205,6 +1276,32 @@ def test_reconcile_tracked_state_once_skips_a_bracket_whose_legs_are_all_termina
     assert "MGN" not in execution._tracked_brackets
 
 
+def test_reconcile_tracked_state_once_backfills_position_opens_for_open_positions(monkeypatch):
+    positions = [FakeEodPosition("MGN", AssetClass.US_EQUITY), FakeEodPosition("BTC/USD", AssetClass.CRYPTO)]
+    monkeypatch.setattr(execution, "trading_client", FakeReconstructTradingClient([], positions=positions))
+    recorded = []
+    monkeypatch.setattr(db, "record_position_opened", lambda symbol: recorded.append(symbol))
+
+    assert execution.reconcile_tracked_state_once() is True
+
+    assert recorded == ["MGN", "BTC/USD"]
+
+
+def test_reconcile_tracked_state_once_backfill_failure_does_not_block_reconciliation(monkeypatch):
+    """A failure fetching positions for the backfill must not undo an otherwise-successful order
+    reconciliation -- the two are independent concerns."""
+
+    class FailingPositionsClient(FakeReconstructTradingClient):
+        def get_all_positions(self):
+            raise APIError("unreachable")
+
+    monkeypatch.setattr(execution, "trading_client", FailingPositionsClient([]))
+    monkeypatch.setattr(execution, "_state_reconciled", False)
+
+    assert execution.reconcile_tracked_state_once() is True
+    assert execution.is_state_reconciled() is True
+
+
 def test_reconcile_tracked_state_once_handles_api_error_without_raising(monkeypatch):
     class FailingClient:
         def get_orders(self, request):
@@ -1235,6 +1332,9 @@ class FakeFlakyReconstructTradingClient:
         if self.calls <= self._fail_times:
             raise APIError("unreachable")
         return self._open_orders
+
+    def get_all_positions(self):
+        return []
 
 
 def test_reconstruct_tracked_state_retries_with_backoff_until_success(monkeypatch):

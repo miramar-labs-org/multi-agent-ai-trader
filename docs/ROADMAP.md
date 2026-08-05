@@ -906,6 +906,39 @@ notification per event, no-op with no events, survives an exception).
 
 ---
 
+## P1.11 — Conditional (aggregate-P&L-gated) EOD flatten
+
+**Done.** New `eod_flatten.conditional` flag (`config.yaml`, default `false`) layers an
+aggregate-P&L gate on top of P1.10's unconditional flatten. When `true`, `check_eod_flatten()`
+sums `unrealized_pl` across all open stock positions at the same trigger point
+(`minutes_before_close`); if the aggregate is `>= 0` ("UP") it flattens everything exactly as
+P1.10 does, and if it's negative ("DOWN") it holds every stock position open overnight instead —
+except any single position held `>= eod_flatten.max_days_held_loss` days (default `5`), which is
+force-flattened regardless of the aggregate sign so a loser can't ride indefinitely. The UP/DOWN
+call is whole-account aggregate, not per-symbol, per explicit direction from the strategy owner.
+
+Days-held tracking is new: Alpaca's `Position` object has no entry-date field and the installed
+alpaca-py SDK has no account-activities endpoint, so a small `position_opens` table
+(`symbol TEXT PRIMARY KEY, opened_at TIMESTAMPTZ`) was added to `src/common/db.py`, populated from
+the existing BUY/SELL fill distinction in `poll_pending_fills()` (`src/floor_broker/main.py`) —
+`ON CONFLICT (symbol) DO NOTHING` on open so a BUY that adds to an already-open position never
+resets the clock, `DELETE` on close. `sell()` always closes the full current position in this
+codebase, so no partial-lot history is needed. Pre-existing or gap-opened positions are
+backfilled once at process start in `reconcile_tracked_state_once()`
+(`src/floor_broker/execution.py`), best-effort and non-blocking to order reconciliation.
+
+Off by default (`conditional: false`); toggling is a config-only change (no rebuild/redeploy),
+same live-reload story as `eod_flatten.enabled` itself.
+
+Tests: `tests/common/test_db.py` (`record_position_opened`/`record_position_closed`/
+`fetch_position_opened_at`, upsert-not-overwrite semantics, exception-swallowing) and
+`tests/floor_broker/test_execution.py` (`check_eod_flatten()` conditional aggregate-UP/DOWN
+branches, force-flatten past `max_days_held_loss`, `reconcile_tracked_state_once()` backfill and
+its failure isolation) and `tests/floor_broker/test_floor_broker_main.py`
+(`poll_pending_fills()` records position open/close on BUY/SELL fills).
+
+---
+
 # P2 — Platform maturity
 
 P2 begins after the execution path is safe and the strategy is measurable.

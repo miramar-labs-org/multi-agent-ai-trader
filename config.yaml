@@ -48,6 +48,14 @@ eod_flatten:
   minutes_before_close: 10   # start flattening open stock positions once Alpaca's live clock
                               # reports this many minutes (or fewer) until market close. Crypto is
                               # 24/7 and untouched by this feature.
+  conditional: false   # when true: only flatten if aggregate unrealized P&L across open stock
+                        # positions is >= 0 ("UP"); when P&L is negative ("DOWN"), hold everything
+                        # overnight instead -- except any position held >= max_days_held_loss days,
+                        # which is force-flattened regardless of the aggregate sign. When false
+                        # (default), behaves exactly as today: always flattens everything.
+  max_days_held_loss: 5   # only consulted when conditional: true -- caps how long a losing
+                           # position can ride through consecutive DOWN days before being
+                           # force-flattened regardless of the aggregate P&L sign.
 
 eod_report:
   schedule: "30 17 * * *"   # informational copy of the CronJob's own spec.schedule — 17:30 America/New_York

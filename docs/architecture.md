@@ -614,13 +614,17 @@ same deploy workflow; the connection string is `DATABASE_URL` in the `mlabs-api-
 (see [Secrets](#secrets)).
 
 `src/common/db.py` uses `psycopg[binary,pool]` directly — no ORM, no migration framework.
-Schema is three tables (`analyst_picks`, `dealer_decisions`, `floor_broker_events`), created
-idempotently (`CREATE TABLE IF NOT EXISTS`) by `db.py` itself on first use — there is no
-separate migrations step or Job. `dealer_decisions` records the Dealer's decision only, with
-no execution-outcome columns; `/analyst-explain` correlates it to `floor_broker_events` at
-query time by symbol + same-day timestamp proximity, not a shared foreign key — deliberately,
-since a decision and its downstream execution event are written by two different processes
-(Dealer, Floor Broker) that don't share a request context.
+Schema is four tables (`analyst_picks`, `dealer_decisions`, `floor_broker_events`,
+`position_opens`), created idempotently (`CREATE TABLE IF NOT EXISTS`) by `db.py` itself on
+first use — there is no separate migrations step or Job. `dealer_decisions` records the
+Dealer's decision only, with no execution-outcome columns; `/analyst-explain` correlates it to
+`floor_broker_events` at query time by symbol + same-day timestamp proximity, not a shared
+foreign key — deliberately, since a decision and its downstream execution event are written by
+two different processes (Dealer, Floor Broker) that don't share a request context.
+`position_opens` is different in kind from the other three — not an append-only event log, but
+a single current-state row per open symbol (`symbol` primary key, `opened_at`), upserted on a
+BUY fill and deleted on a SELL fill; it exists purely to answer "how long has this position
+been open" for `check_eod_flatten()`'s conditional mode (below), not as a historical record.
 
 **Write functions are fire-and-forget**, mirroring `slack.py::_post()`'s contract exactly:
 they catch and log any exception, never raise. A Postgres outage must never block a trading
@@ -639,6 +643,13 @@ Write sites:
 - `src/floor_broker/main.py`'s two background poll loops (`poll_bracket_fills`,
   `poll_pending_fills`) — a `record_floor_broker_event()` call alongside each of their
   `slack.notify_floor_broker_result()` sites (fill, no-fill, synthetic crypto stop).
+- `src/floor_broker/main.py::poll_pending_fills()` — additionally calls
+  `record_position_opened()`/`record_position_closed()` on every BUY/SELL fill respectively,
+  keeping `position_opens` in sync. `src/floor_broker/execution.py::reconcile_tracked_state_once()`
+  also backfills it from `trading_client.get_all_positions()` on every process start (best-effort,
+  `ON CONFLICT DO NOTHING` so it never overwrites an already-tracked symbol's `opened_at`) —
+  this is how a position that predates the feature, or was opened in a restart gap, still ends up
+  tracked.
 
 There is no historical backfill — the tables start empty at deploy time; decisions made before
 v0.6.1 are unrecoverable, same limitation as the Slack-only trail it replaces. (v0.6.0 shipped
@@ -704,6 +715,8 @@ isn't purely for human/skill consumption.
 | `trading` | `crypto_taapi_exchange` | TAAPI venue name (e.g. `"binance"`) used as the `exchange` for crypto positions merged in by `merge_held_positions()` — TAAPI's `/bulk` API requires an actual venue, not the literal word "crypto" |
 | `eod_flatten` | `enabled` | feature gate for `poll_eod_flatten()` (`src/floor_broker/main.py`) — when false (default), `check_eod_flatten()` short-circuits before touching the clock or Alpaca positions; opt-in "day trading mode" that closes every open stock position near market close instead of holding overnight |
 | `eod_flatten` | `minutes_before_close` | how close (by Alpaca's live clock) to market close before `check_eod_flatten()` starts selling open stock positions (default 10) — crypto is 24/7 and untouched |
+| `eod_flatten` | `conditional` | when true, `check_eod_flatten()` only flattens everything if the aggregate unrealized P&L across open stock positions is >= 0; when negative, positions are held overnight instead except any past `max_days_held_loss`. When false (default), always flattens everything, same as pre-`conditional` behavior |
+| `eod_flatten` | `max_days_held_loss` | only consulted when `conditional: true` — a position held this many days or more is force-flattened regardless of the aggregate P&L sign, so a single loser can't ride indefinitely (default 5) |
 | `eod_report` | `schedule` | informational copy of the CronJob's own `spec.schedule` — not templated, must be kept in sync manually |
 | `analyst` | `schedule` | informational copy of the CronJob's own `spec.schedule` — not templated, must be kept in sync manually |
 | `analyst` | `enable_midday_run` | feature gate for the optional `analyst-midday` CronJob (12:30pm ET) — when false (default), `main()` exits immediately on a midday-labeled run before `build_graph()` is called |
@@ -742,6 +755,12 @@ isn't purely for human/skill consumption.
   the market is within `eod_flatten.minutes_before_close` minutes of closing, so the bot never
   carries overnight stock risk. Crypto is 24/7 and excluded. Off by default, config-only toggle
   (no redeploy).
+  - **Conditional variant** — `eod_flatten.conditional` (default false); when on, the flatten
+    decision is gated on the aggregate unrealized P&L across all open stock positions: `>= 0`
+    flattens everything (unchanged from the base behavior), negative holds everything overnight
+    instead. `max_days_held_loss` caps how many days an individual losing position can be held
+    this way before it's force-flattened regardless of the aggregate sign — backed by the new
+    `position_opens` table (see [Persistence](#persistence)).
 - **TAAPI stays inside its rate limit** — Dealer fetches all of a symbol's indicators in one
   `/bulk` POST instead of one GET per indicator (up to 9 individual calls per symbol would blow
   through TAAPI's per-15s rate limit — even on the Pro plan — the moment two symbols overlapped),

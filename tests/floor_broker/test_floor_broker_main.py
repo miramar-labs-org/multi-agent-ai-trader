@@ -158,6 +158,66 @@ def test_poll_pending_fills_posts_slack_notification_for_each_event(monkeypatch)
     assert kwargs["tp_price"] == 10.5
 
 
+def test_poll_pending_fills_records_position_opened_on_a_buy_fill(monkeypatch):
+    monkeypatch.setattr(
+        fb_main.execution,
+        "check_pending_fills",
+        lambda: [
+            {
+                "kind": "fill",
+                "symbol": "MGN",
+                "action": "BUY",
+                "reason": "opening_position",
+                "order_id": "order-1",
+                "fill_price": 10.05,
+                "sl_price": 9.8,
+                "tp_price": 10.5,
+            }
+        ],
+    )
+    monkeypatch.setattr(fb_main.slack, "notify_floor_broker_result", lambda *a, **k: None)
+    opened, closed = [], []
+    monkeypatch.setattr(fb_main.db, "record_position_opened", lambda symbol: opened.append(symbol))
+    monkeypatch.setattr(fb_main.db, "record_position_closed", lambda symbol: closed.append(symbol))
+    monkeypatch.setattr(fb_main.time, "sleep", lambda s: (_ for _ in ()).throw(_StopLoop))
+
+    with pytest.raises(_StopLoop):
+        fb_main.poll_pending_fills()
+
+    assert opened == ["MGN"]
+    assert closed == []
+
+
+def test_poll_pending_fills_records_position_closed_on_a_sell_fill(monkeypatch):
+    monkeypatch.setattr(
+        fb_main.execution,
+        "check_pending_fills",
+        lambda: [
+            {
+                "kind": "fill",
+                "symbol": "MGN",
+                "action": "SELL",
+                "reason": "dealer_signal",
+                "order_id": "order-1",
+                "fill_price": 10.05,
+                "sl_price": None,
+                "tp_price": None,
+            }
+        ],
+    )
+    monkeypatch.setattr(fb_main.slack, "notify_floor_broker_result", lambda *a, **k: None)
+    opened, closed = [], []
+    monkeypatch.setattr(fb_main.db, "record_position_opened", lambda symbol: opened.append(symbol))
+    monkeypatch.setattr(fb_main.db, "record_position_closed", lambda symbol: closed.append(symbol))
+    monkeypatch.setattr(fb_main.time, "sleep", lambda s: (_ for _ in ()).throw(_StopLoop))
+
+    with pytest.raises(_StopLoop):
+        fb_main.poll_pending_fills()
+
+    assert closed == ["MGN"]
+    assert opened == []
+
+
 def test_poll_pending_fills_posts_no_fill_notice_for_a_terminal_event(monkeypatch):
     monkeypatch.setattr(
         fb_main.execution,

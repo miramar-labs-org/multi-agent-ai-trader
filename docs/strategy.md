@@ -232,8 +232,25 @@ Off by default; toggling is a config-only change (no rebuild/redeploy), same liv
 `analyst.enable_midday_run`. See `docs/ROADMAP.md` P1.10 and `docs/architecture.md`'s config
 reference / Risk controls section for implementation details.
 
+## 2026-08-05 — Conditional (aggregate-P&L-gated) EOD flatten
+
+Layered on top of P1.10: new `eod_flatten.conditional` flag (default `false`). When `true`, the
+flatten decision at `minutes_before_close` is gated on the **aggregate** unrealized P&L across all
+open stock positions, not evaluated per symbol — confirmed explicitly with the strategy owner
+that this should be a whole-account call, not per-position. Aggregate `>= 0` flattens everything
+(unchanged from P1.10); aggregate `< 0` holds everything overnight instead, except any individual
+position held `>= eod_flatten.max_days_held_loss` days (default `5`, configurable), which is
+force-flattened regardless of the aggregate sign so a single loser can't ride indefinitely through
+consecutive down days.
+
+Required new days-held bookkeeping (`position_opens` table, `src/common/db.py`) since Alpaca
+exposes no entry-date on `Position` and the installed SDK has no activities endpoint to derive one
+— populated from the existing fill-observation path in `poll_pending_fills()`, backfilled for
+pre-existing positions on Floor Broker startup. See `docs/ROADMAP.md` P1.11 and
+`docs/architecture.md` for implementation details.
+
 ---
 *This file is a live scratchpad for the strategy conversation, updated as the discussion
-progresses. Reflected in `docs/ROADMAP.md` (P0.4/P0.6/P1.8/P1.10) and `docs/architecture.md`
+progresses. Reflected in `docs/ROADMAP.md` (P0.4/P0.6/P1.8/P1.10/P1.11) and `docs/architecture.md`
 (Floor Broker section — daily halt, crypto synthetic stop-loss/take-profit, and end-of-day
 flatten) as of 2026-08-05.*
