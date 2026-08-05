@@ -41,7 +41,7 @@ strategy:
   max_concurrent_positions: 10    # recorded intent only -- analyst.max_universe_size already caps concurrent picks
 
 eod_flatten:
-  enabled: false   # feature gate: when false, poll_eod_flatten() (src/floor_broker/main.py) short-
+  enabled: true   # feature gate: when false, poll_eod_flatten() (src/floor_broker/main.py) short-
                    # circuits every iteration before touching the clock or Alpaca positions -- off
                    # by default, opt-in "day trading mode". Toggling this is a config-only change --
                    # no rebuild/redeploy needed, see src/common/config.py.
