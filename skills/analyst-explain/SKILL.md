@@ -3,16 +3,20 @@ name: analyst-explain
 description: >
   Explains why today's paper-trading account is up or down, by combining live
   Alpaca P&L with the Analyst's picks, the Dealer's BUY/HOLD/SELL reasoning,
-  and Floor Broker's execution outcomes recorded in Postgres. Read-only, no
-  changes made. Trigger on /analyst-explain, "why is the account up/down
-  today", "explain today's trades", "what did the Dealer do today and why".
+  and Floor Broker's execution outcomes recorded in Postgres. No trading
+  state is touched; the narrative is appended to docs/analysis.md. Trigger on
+  /analyst-explain, "why is the account up/down today", "explain today's
+  trades", "what did the Dealer do today and why".
 ---
 
 # Explain today's account performance
 
-Read-only — no file is written, no order is placed, no confirmation step is
-needed (unlike `/configure-strategy` or `/revert-strategy`, which mutate
-state).
+No order is placed and no confirmation step is needed (unlike
+`/configure-strategy` or `/revert-strategy`, which mutate trading state) —
+but this skill does write one file: every run appends its Step 3 narrative to
+`docs/analysis.md` (see that file's own header for the format), dated/timed
+with the ET date and time the run happened. Always append, never overwrite
+or edit a prior entry.
 
 This only works for **today**, and only for activity that happened after
 Postgres persistence actually started writing (`src/common/db.py`, added in
@@ -113,6 +117,11 @@ any `error`/`no_fill` events today that a human should probably look into.
 
 Do not fabricate rationale for a symbol that has no matching DB row — say
 "no recorded Dealer decision for this symbol today" instead.
+
+Present the narrative in chat, then append it to `docs/analysis.md` under a
+new `## <YYYY-MM-DD HH:MM ET>` heading (current ET date/time when the run
+happened), same content as shown in chat. Create the file with a short header
+comment if it doesn't exist yet.
 
 ## Step 4 — Posting to Slack (only if explicitly asked)
 
