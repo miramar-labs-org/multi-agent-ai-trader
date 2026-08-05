@@ -545,9 +545,8 @@ see [`docs/backtesting.md`](backtesting.md) for the full design and documented a
   returns `unrealized_pl`, `avg_entry_price`, and `current_price` — the EOD Slack reports still
   only read the original four fields, but the Analyst's `fetch_position_pnl` node consumes all
   three of these for its live P&L snapshot (see [Agent 1 — Analyst](#agent-1--analyst)).
-  `unrealized_pl` and
-  `current_price` are `Optional[str]` on Alpaca's own `Position` model and pass through as `None`
-  when absent rather than raising on `float(None)`.
+  `unrealized_pl` and `current_price` are `Optional[str]` on Alpaca's own `Position` model and
+  pass through as `None` when absent rather than raising on `float(None)`.
 
 ## Persistence
 
