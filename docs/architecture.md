@@ -124,7 +124,7 @@ off to the Dealer.
 
 | Node | What it does |
 |---|---|
-| `discover_candidates` | when `cfg.trading.enable_stocks` **and** `state["stock_market_open"]` (set once in `main.py`, see above), `sources.fetch_screener_candidates(screener_top_n=20)` — raw REST calls (not wrapped by `alpaca-py`) to Alpaca's `/v1beta1/screener/stocks/most-actives` and `/movers` endpoints, merged into a symbol→{volume, change_pct} dict, each tagged `market: "stocks"`. When `cfg.trading.enable_crypto`, also `sources.fetch_crypto_candidates(...)` — a fixed watchlist (`BTC/USD`, `ETH/USD`, `SOL/USD`; Alpaca's crypto screener has no most-actives equivalent) merged with `/v1beta1/screener/crypto/movers`, tagged `market: cfg.trading.crypto_taapi_exchange`. Crypto discovery is **not** gated on the stock-market-open flag — it always runs when enabled |
+| `discover_candidates` | when `cfg.trading.enable_stocks` **and** `state["stock_market_open"]` (set once in `main.py`, see above), `sources.fetch_screener_candidates(screener_top_n=20)` — raw REST calls (not wrapped by `alpaca-py`) to Alpaca's `/v1beta1/screener/stocks/most-actives` and `/movers` endpoints, merged into a symbol→{volume, change_pct} dict, each tagged `market: "stocks"`. When `cfg.earnings_blackout.enabled` (default false), the stock candidate list is further filtered through `sources.fetch_earnings_calendar()` — a single market-wide Finnhub free-tier call (Alpaca has no earnings-calendar data, only Corporate Actions for splits/dividends/mergers) — dropping any symbol reporting earnings within `earnings_blackout.days_before`/`days_after` calendar days of today; fails soft to an unfiltered list on any Finnhub error. When `cfg.trading.enable_crypto`, also `sources.fetch_crypto_candidates(...)` — a fixed watchlist (`BTC/USD`, `ETH/USD`, `SOL/USD`; Alpaca's crypto screener has no most-actives equivalent) merged with `/v1beta1/screener/crypto/movers`, tagged `market: cfg.trading.crypto_taapi_exchange`. Crypto discovery is **not** gated on the stock-market-open flag or the earnings blackout (no earnings dates apply to crypto) — it always runs when enabled |
 | `fetch_research` | gated on `cfg.analyst.enable_news` (short-circuits before any network call when false) — `sources.fetch_news(news_days=2)` (Alpaca News API, HTML stripped via BeautifulSoup) + `sources.fetch_yahoo_rss_headlines(...)` (Yahoo Finance RSS), concatenated into plain text |
 | `fetch_indicators` | gated on `cfg.analyst.enable_indicators` (short-circuits before any TAAPI call when false) — ranks `raw_candidates` by `abs(change_pct)` (missing values sort last) and calls `src.common.indicators.fetch_indicators_bulk` (shared with the Dealer) for the top `cfg.analyst.indicator_fetch_limit` (default 15) — one TAAPI `/bulk` POST per symbol covering `rsi, macd, vwap, bbands, sma, ema`, sleeping `cfg.taapi.min_request_interval_secs` between calls to respect TAAPI's free-tier 1-req/15s cap. At the default limit this adds ~3.5 minutes to the once-daily run — accepted as a fixed cost of a pre-market CronJob, unlike the Dealer's 10-minute poll cycle where the same rate limit is a tighter constraint. Not every candidate gets indicator data; only the top movers by size do |
 | `fetch_track_record` | gated on `cfg.analyst.enable_track_record` (short-circuits before any DB call when false) — reads the Analyst's own pick history plus matching Dealer decisions and Floor Broker events from Postgres via `db.fetch_analyst_picks_since()`/`fetch_dealer_decisions_since()`/`fetch_floor_broker_events_since()` for the last `cfg.analyst.track_record_days` (default 5) calendar days, formatted as plain text (qualitative sequence only — no computed P&L; see [Persistence](#persistence)). Runs before `write_portfolio` records this run's own picks, so a symbol picked *this* run never appears in its own track record |
@@ -233,7 +233,7 @@ distinguishable from Slack alone.
 |---|---|
 | `fetch_indicators` | fetches every indicator configured for the symbol (or all of `cfg.indicators` if the entry says `["ALL"]`) from **TAAPI.io** — a third-party technical-analysis API, unrelated to any Miramar platform service — in a single `/bulk` POST request (`indicators.py`), and builds a natural-language indicator text block |
 | `llm_call` | the decision LLM call — see below |
-| `call_floor_broker` | HTTP POST to Floor Broker if action != HOLD |
+| `call_floor_broker` | HTTP POST to Floor Broker if action != HOLD; a BUY is additionally refused locally (never forwarded) while `cfg.macro_blackout.enabled` and today matches either a `macro_blackout.dates` entry or an auto-computed quad witching day — see [Risk controls](#risk-controls-and-failure-handling) |
 
 ```mermaid
 flowchart TD
@@ -736,6 +736,11 @@ isn't purely for human/skill consumption.
 | `eod_flatten` | `minutes_before_close` | how close (by Alpaca's live clock) to market close before `check_eod_flatten()` starts selling open stock positions (default 10) — crypto is 24/7 and untouched |
 | `eod_flatten` | `conditional` | when true, `check_eod_flatten()` only flattens everything if the aggregate unrealized P&L across open stock positions is >= 0; when negative, positions are held overnight instead except any past `max_days_held_loss`. When false (default), always flattens everything, same as pre-`conditional` behavior |
 | `eod_flatten` | `max_days_held_loss` | only consulted when `conditional: true` — a position held this many days or more is force-flattened regardless of the aggregate P&L sign, so a single loser can't ride indefinitely (default 5) |
+| `earnings_blackout` | `enabled` | feature gate for the earnings-date filter in `discover_candidates` (`src/analyst/graph.py`) — when false (default), the stock screener list is unfiltered by earnings dates and Finnhub is never called; requires `FINNHUB_API_KEY` |
+| `earnings_blackout` | `days_before` | drop a screener candidate if it's reporting earnings within this many calendar days from today (default 2) — anticipation/IV-crush risk pre-report |
+| `earnings_blackout` | `days_after` | drop a screener candidate if it reported earnings within this many calendar days before today (default 1) — post-report gap risk, covers both BMO and AMC reporters without a week-long exclusion |
+| `macro_blackout` | `enabled` | feature gate for the macro-calendar check in `call_floor_broker` (`src/dealer/graph.py`) — when false (default), new BUY entries proceed as today; SELL/HOLD/`eod_flatten` are never affected regardless of this flag |
+| `macro_blackout` | `dates` | hand-maintained list of `{date, label}` scheduled macro releases (FOMC, CPI, NFP, PCE, PPI, ISM PMI, GDP, Fed Chair testimony, etc.) that can move the whole market — published months ahead by the Fed/BLS/Commerce Dept, so no API is needed; a listed date pauses new stock BUYs for the entire day. Quarterly quad witching days (3rd Friday of Mar/Jun/Sep/Dec) are auto-computed in code (`_is_quad_witching_day`) and always included when `enabled`, with no config entry needed |
 | `eod_report` | `schedule` | informational copy of the CronJob's own `spec.schedule` — not templated, must be kept in sync manually |
 | `analyst` | `schedule` | informational copy of the CronJob's own `spec.schedule` — not templated, must be kept in sync manually |
 | `analyst` | `enable_midday_run` | feature gate for the optional `analyst-midday` CronJob (12:30pm ET) — when false (default), `main()` exits immediately on a midday-labeled run before `build_graph()` is called |
@@ -780,6 +785,20 @@ isn't purely for human/skill consumption.
     instead. `max_days_held_loss` caps how many days an individual losing position can be held
     this way before it's force-flattened regardless of the aggregate sign — backed by the new
     `position_opens` table (see [Persistence](#persistence)).
+- **Per-symbol earnings blackout** — `earnings_blackout.enabled` (default false); when on,
+  `discover_candidates` drops any stock screener candidate reporting earnings within
+  `earnings_blackout.days_before`/`days_after` calendar days of today (source: a single
+  market-wide Finnhub free-tier call, since Alpaca has no earnings-calendar data). Fails soft to
+  an unfiltered candidate list on any Finnhub error (missing key, network error, non-200, 429,
+  bad JSON) — a Finnhub outage never blocks or crashes the Analyst run. Crypto candidates are
+  never filtered (no earnings dates apply). Off by default, config-only toggle (no redeploy).
+- **Market-wide macro blackout** — `macro_blackout.enabled` (default false); when on,
+  `call_floor_broker` refuses any BUY signal locally (never forwarded to Floor Broker) on a day
+  matching either a hand-maintained `macro_blackout.dates` entry (FOMC, CPI, NFP, PCE, and other
+  scheduled market-wide releases) or an auto-computed quarterly quad witching day (3rd Friday of
+  March/June/September/December — the simultaneous expiration of stock options, index options,
+  and index futures). SELL/HOLD and `eod_flatten` are never affected — only new BUY entries pause.
+  Off by default, config-only toggle (no redeploy).
 - **TAAPI stays inside its rate limit** — Dealer fetches all of a symbol's indicators in one
   `/bulk` POST instead of one GET per indicator (up to 9 individual calls per symbol would blow
   through TAAPI's per-15s rate limit — even on the Pro plan — the moment two symbols overlapped),
@@ -801,7 +820,8 @@ All credentials live in one k8s Secret, `mlabs-api-keys` (documented, not create
 `k8s/secrets.example.yaml` — deploy fails fast if it's missing): `TAAPI_API_KEY`,
 `ALPACA_PAPER_API_KEY`, `ALPACA_PAPER_API_SECRET`, `LANGCHAIN_API_KEY`, `SLACK_WEBHOOK_URL2`,
 `DATABASE_URL` (see [Persistence](#persistence) — provisioned by `miramar-platform-gcp`'s
-`deploy-postgres.yaml`, not created by this repo).
+`deploy-postgres.yaml`, not created by this repo), `FINNHUB_API_KEY` (earnings-calendar lookups
+for `earnings_blackout`, only called when that feature is enabled).
 Analyst and Dealer get it via `envFrom.secretRef` for both k8s-API access (via their shared
 ServiceAccount) and these external API keys. Floor Broker also has a ServiceAccount
 (`multi-agent-ai-trader-configmap-reader`, scoped to reading the `buy-kill-switch` ConfigMap)

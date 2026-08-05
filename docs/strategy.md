@@ -127,7 +127,8 @@ skills/revert-strategy/SKILL.md      ← source of truth
 .claude/skills/revert-strategy       → symlink
 ```
 
-## Gotcha: config.yaml is baked into images, not mounted at runtime
+## Gotcha: config.yaml is baked into images, not mounted at runtime (SUPERSEDED — see the
+## 2026-08-05 "Daily loss limit adjustments" entry below)
 
 `Dockerfile.{analyst,dealer,floor-broker,eod-report}` all `COPY config.yaml .` at
 build time — unlike the `portfolio`/`buy-kill-switch` ConfigMaps
@@ -143,6 +144,20 @@ from the k8s API on every call, nothing mounts `config.yaml` at runtime. So:
    `src/analyst`/`src/dealer`/`src/floor_broker` reads `cfg.strategy.*` (see the scope
    boundary noted above). Shipping the config via a redeploy and wiring the services
    to act on it are two separate, both-still-pending steps.
+
+**No longer accurate as of 2026-08-05** — points 1-2 above describe the state *before* the
+GitHub-fetch-at-runtime config mechanism shipped (`src/common/config.py::load_config()`,
+`docs/architecture.md`'s Shared code section): `config.yaml` is now fetched live from GitHub's
+`main` branch on a 60s in-process cache TTL, not baked into the image, so a config-only `git
+push` reaches live pods within ~60s with no rebuild/redeploy needed — `/configure-strategy` and
+`/revert-strategy` now do reach the live trader on their own. Point 3 is unaffected by this —
+still accurate. Separately, as of the same date the deploy pipeline itself also auto-chains
+(`Test and Lint` → `Build and Push` → `Deploy` off every push to `main` that passes tests, see
+`build-push.yaml`/`deploy.yaml`), so even a *code* change (not just config) no longer needs a
+manual `git tag`/`gh release`/`gh workflow run` sequence — a plain `git push` to `main` is
+sufficient for either kind of change now. Left in place as a historical record of why the
+config-delivery mechanism was redesigned; kept, not deleted, per this file's own convention (see
+footer).
 
 ## Decision: enforce the `strategy:` config, minimal scope (2026-08-04)
 
@@ -249,8 +264,38 @@ exposes no entry-date on `Position` and the installed SDK has no activities endp
 pre-existing positions on Floor Broker startup. See `docs/ROADMAP.md` P1.11 and
 `docs/architecture.md` for implementation details.
 
+## 2026-08-05 — Earnings and macro-event blackout windows
+
+Two new, independently-toggled risk controls (both default `enabled: false`), addressing gap-risk
+windows the Analyst/Dealer previously had zero structured awareness of — the only prior
+"research" input was unstructured headline text (`analyst.enable_news`).
+
+**Earnings blackout** (`earnings_blackout`, per-symbol) — `discover_candidates`
+(`src/analyst/graph.py`) drops any stock screener candidate reporting earnings within
+`days_before`/`days_after` calendar days of today. Confirmed Alpaca has no earnings-calendar data
+(Corporate Actions covers splits/dividends/mergers only), so the date source is a new Finnhub
+free-tier call (`fetch_earnings_calendar()`, `src/analyst/sources.py`) — one market-wide call per
+Analyst run, fails soft to an unfiltered list on any Finnhub error.
+
+**Macro blackout** (`macro_blackout`, market-wide) — `call_floor_broker`
+(`src/dealer/graph.py`) refuses new BUY entries locally on a day matching a hand-maintained
+`macro_blackout.dates` entry. Originally scoped to FOMC/CPI/NFP only; broadened mid-implementation
+per an explicit follow-up ask to cover "any other things that might cause ripples in the
+market" — the config's illustrative date list and documentation now also call out PCE, PPI, GDP,
+ISM PMI, FOMC minutes, and Fed Chair testimony, and an auto-computed quarterly quad witching day
+(3rd Friday of Mar/Jun/Sep/Dec — simultaneous options/futures expiration, one of the highest-volume
+sessions of the year) was added as a deterministic calendar rule requiring no config upkeep.
+SELL/HOLD/`eod_flatten` are never affected by either flag — only new BUY entries pause.
+
+Both remain off by default pending real-world verification: `earnings_blackout` needs a real
+`FINNHUB_API_KEY` and a check that Finnhub's free tier actually returns a useful market-wide
+(not just per-symbol) earnings calendar; `macro_blackout`'s placeholder dates need replacing with
+real FOMC/CPI/NFP/PCE dates from federalreserve.gov/bls.gov/bea.gov before either is flipped on in
+production. See `docs/ROADMAP.md` P1.13 and `docs/architecture.md` for implementation details.
+
 ---
 *This file is a live scratchpad for the strategy conversation, updated as the discussion
-progresses. Reflected in `docs/ROADMAP.md` (P0.4/P0.6/P1.8/P1.10/P1.11) and `docs/architecture.md`
-(Floor Broker section — daily halt, crypto synthetic stop-loss/take-profit, and end-of-day
-flatten) as of 2026-08-05.*
+progresses. Reflected in `docs/ROADMAP.md` (P0.4/P0.6/P1.8/P1.10/P1.11/P1.13) and
+`docs/architecture.md` (Floor Broker section — daily halt, crypto synthetic stop-loss/take-profit,
+end-of-day flatten; Analyst/Dealer sections and Risk controls — earnings/macro blackout) as of
+2026-08-05.*

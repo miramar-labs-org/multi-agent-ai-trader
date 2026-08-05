@@ -54,6 +54,7 @@ accounts/API keys, put them in one k8s Secret, then run the two GHA deploy workf
 | `TAAPI_API_KEY` | [TAAPI.io](https://taapi.io/) — free plan works (1 request/15s, see `config.yaml`'s `taapi.min_request_interval_secs`) | Required — Dealer's technical indicators |
 | `LANGCHAIN_API_KEY` | [smith.langchain.com](https://smith.langchain.com/) | Optional — only if `config.yaml`'s `langsmith.enabled: true` |
 | `SLACK_WEBHOOK_URL2` | An [incoming webhook](https://api.slack.com/messaging/webhooks) for whatever channel you want notifications in | Optional — only if `config.yaml`'s `slack.enabled: true` |
+| `FINNHUB_API_KEY` | [Finnhub](https://finnhub.io/) — free tier works (250 calls/day) | Optional — only if `config.yaml`'s `earnings_blackout.enabled: true` |
 
 No LLM API key is needed — the LLM is self-hosted (next step).
 

@@ -1,5 +1,7 @@
+from datetime import datetime
 from typing import TypedDict
 
+import pytz
 import requests
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -57,6 +59,35 @@ def llm_call(state: DealerState, cfg) -> DealerState:
     return {**state, "signal": signal.model_dump()}
 
 
+def _is_quad_witching_day(d) -> bool:
+    """Third Friday of March/June/September/December -- the quarterly simultaneous expiration of
+    stock options, index options, and index futures, historically one of the highest-volume,
+    highest-volatility sessions of the year for the broad market. Computed directly rather than
+    requiring a config.yaml entry since it's a fixed calendar rule, not an externally-published
+    date like FOMC/CPI/NFP -- it can't drift or need quarterly upkeep."""
+    if d.month not in (3, 6, 9, 12) or d.weekday() != 4:  # Friday
+        return False
+    return 15 <= d.day <= 21  # the only possible day-of-month range for a third Friday
+
+
+def _macro_blackout_active(cfg) -> str | None:
+    """Returns the matching event label if today (America/New_York calendar date) is either a
+    hand-maintained macro_blackout.dates entry (FOMC, CPI, PPI, PCE, NFP, ISM PMI, GDP, Fed Chair
+    testimony, or any other scheduled market-wide macro release) or an auto-computed quad
+    witching day, else None. Whole-trading-day granularity, not hours-based -- see
+    docs/architecture.md Risk controls for why."""
+    if not cfg.macro_blackout.enabled:
+        return None
+    today = datetime.now(pytz.timezone("US/Eastern")).date()
+    if _is_quad_witching_day(today):
+        return "Quad witching (quarterly options/futures expiration)"
+    today_str = today.isoformat()
+    for entry in cfg.macro_blackout.dates:
+        if entry["date"] == today_str:
+            return entry.get("label", entry["date"])
+    return None
+
+
 def call_floor_broker(state: DealerState, cfg) -> DealerState:
     signal = state["signal"]
     slack.notify_dealer_signal(state["symbol"], signal["action"], signal["reasoning"])
@@ -64,6 +95,19 @@ def call_floor_broker(state: DealerState, cfg) -> DealerState:
 
     if signal["action"] == "HOLD":
         return {**state, "execution_result": {"status": "skipped", "detail": "HOLD"}}
+
+    if signal["action"] == "BUY":
+        blackout_label = _macro_blackout_active(cfg)
+        if blackout_label:
+            log(f"⏭️  BUY for {state['symbol']} skipped -- macro blackout ({blackout_label})")
+            result = {
+                "status": "skipped",
+                "reason": "macro_blackout",
+                "detail": f"new BUY entries paused for macro blackout: {blackout_label}",
+            }
+            slack.notify_floor_broker_result(state["symbol"], signal["action"], result["status"], result["detail"])
+            db.record_floor_broker_event(state["symbol"], "skip", result["detail"])
+            return {**state, "execution_result": result}
 
     if signal["action"] == "BUY" and state["budget"] <= 0:
         # A held-only position (merge_held_positions()) carries budget=0 -- its market value is

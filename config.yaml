@@ -57,6 +57,46 @@ eod_flatten:
                            # position can ride through consecutive DOWN days before being
                            # force-flattened regardless of the aggregate P&L sign.
 
+earnings_blackout:
+  enabled: false   # feature gate: when false, discover_candidates() never calls Finnhub and the
+                   # stock screener list is unfiltered by earnings dates -- off by default, same
+                   # config-only-toggle story as eod_flatten.enabled. Requires FINNHUB_API_KEY in
+                   # the mlabs-api-keys secret. Toggling this is a config-only change -- no
+                   # rebuild/redeploy needed, see src/common/config.py.
+  days_before: 2   # drop a screener candidate if it's reporting earnings within this many
+                   # calendar days from today (anticipation/IV-crush risk pre-report)
+  days_after: 1    # drop a screener candidate if it reported earnings within this many calendar
+                   # days before today (post-report gap risk) -- covers both BMO and AMC
+                   # reporters without permanently excluding a symbol for a full week
+
+macro_blackout:
+  enabled: false   # feature gate: when false, call_floor_broker() never checks the macro
+                   # calendar and BUY entries proceed as today -- off by default. SELL/HOLD/
+                   # eod_flatten are never affected by this flag, only new BUY entries. Toggling
+                   # this is a config-only change -- no rebuild/redeploy needed. Quarterly quad
+                   # witching days (3rd Friday of Mar/Jun/Sep/Dec) are auto-detected in code
+                   # (src/dealer/graph.py:_is_quad_witching_day) and always included when this
+                   # is enabled -- no config entry needed for those.
+  dates:           # hand-maintained list of other major scheduled macro releases that can move
+                   # the whole market, not just individual stocks -- these are published by the
+                   # Fed/BLS/Commerce Dept months ahead, so no API is needed; update this list
+                   # quarterly. Whole-trading-day granularity -- a listed date pauses BUY entries
+                   # for the entire day, not just around the release hour. Candidates worth
+                   # tracking beyond the illustrative examples below: FOMC meeting minutes (3wk
+                   # after each decision), PPI, PCE (the Fed's preferred inflation gauge), ISM
+                   # Manufacturing/Services PMI, GDP (advance/preliminary/final), and the Fed
+                   # Chair's semiannual (Humphrey-Hawkins) testimony. Placeholder dates below
+                   # MUST be replaced with real dates from federalreserve.gov / bls.gov / bea.gov
+                   # before enabled is ever set to true.
+    - date: "2026-09-16"
+      label: "FOMC rate decision"
+    - date: "2026-09-11"
+      label: "CPI release"
+    - date: "2026-09-04"
+      label: "NFP / jobs report"
+    - date: "2026-09-26"
+      label: "PCE release"
+
 eod_report:
   schedule: "30 17 * * *"   # informational copy of the CronJob's own spec.schedule — 17:30 America/New_York
                             # daily (spec.timeZone), ~90min after the 4pm ET close; runs every day so closed

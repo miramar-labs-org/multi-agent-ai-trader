@@ -965,6 +965,53 @@ files on an open one).
 
 ---
 
+## P1.13 — Earnings and macro-event blackout windows
+
+**Done.** Two independent, config-gated risk controls addressing gap-risk windows the Analyst/
+Dealer previously had zero structured awareness of (the only prior "research" input was
+unstructured headline text, `analyst.enable_news`).
+
+**Per-symbol earnings blackout** — new `earnings_blackout` block (`config.yaml`, default
+`enabled: false`). When on, `discover_candidates` (`src/analyst/graph.py`) drops any stock
+screener candidate reporting earnings within `days_before`/`days_after` calendar days of today.
+Alpaca has no earnings-calendar data (its Corporate Actions API covers splits/dividends/mergers
+only), so the date source is a single market-wide Finnhub free-tier call
+(`sources.fetch_earnings_calendar()`, `src/analyst/sources.py`) — one call per Analyst run, not
+per symbol, well inside the free tier's 250 calls/day. Fails soft (returns an empty set, logs a
+warning) on a missing `FINNHUB_API_KEY`, network error, non-200, 429, or bad JSON, so a Finnhub
+outage degrades to "no earnings filter this run" rather than a crashed CronJob or fully blocked
+picks. Crypto candidates are never filtered (no earnings dates apply).
+
+**Market-wide macro blackout** — new `macro_blackout` block (`config.yaml`, default
+`enabled: false`). When on, `call_floor_broker` (`src/dealer/graph.py`) refuses any BUY signal
+locally — never forwarded to Floor Broker — on a day matching either a hand-maintained
+`macro_blackout.dates` entry (FOMC, CPI, NFP, PCE, PPI, ISM PMI, GDP, Fed Chair testimony, and
+other scheduled market-wide releases published by the Fed/BLS/Commerce Dept months ahead, so no
+API is needed) or an auto-computed quarterly quad witching day — the 3rd Friday of March/June/
+September/December, the simultaneous expiration of stock options, index options, and index
+futures, historically one of the highest-volume, highest-volatility sessions of the year
+(`_is_quad_witching_day()`, a fixed calendar rule computed directly in code rather than a
+config.yaml entry, since it can't drift or need quarterly upkeep). Whole-trading-day granularity
+— a listed date pauses new BUY entries for the entire day. SELL/HOLD and `eod_flatten` are never
+affected, only new BUY entries.
+
+Both ship off by default, same config-only-toggle story as `eod_flatten.enabled` — no rebuild/
+redeploy needed to flip either flag. `earnings_blackout.enabled: true` additionally requires a
+real `FINNHUB_API_KEY` in the `mlabs-api-keys` secret, and `macro_blackout`'s placeholder dates
+must be replaced with real FOMC (federalreserve.gov) / CPI+NFP+PCE (bls.gov, bea.gov) dates
+before that flag is ever flipped on.
+
+Tests: `tests/analyst/test_sources.py` (`fetch_earnings_calendar()` — blackout-window matching,
+fails soft on missing key/no symbols/request exception/non-200/429) and
+`tests/analyst/test_graph.py` (`discover_candidates()` drops earnings-blackout symbols when
+enabled, never calls Finnhub when disabled) and `tests/dealer/test_call_floor_broker.py`
+(`call_floor_broker()` skips BUY on a matching `macro_blackout.dates` entry and on a forced quad
+witching day, forwards BUY normally when no date matches, forwards SELL unconditionally even
+during a blackout; `_is_quad_witching_day()` matches the third Friday of each quarter-end month
+and rejects other Fridays/months).
+
+---
+
 # P2 — Platform maturity
 
 P2 begins after the execution path is safe and the strategy is measurable.

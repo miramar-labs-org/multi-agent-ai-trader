@@ -88,3 +88,71 @@ def test_fetch_screener_candidates_defaults_to_no_price_filtering():
     """Backward-compat: callers that don't pass min_price (default 0.0) get every symbol
     regardless of price."""
     assert sources.fetch_screener_candidates.__defaults__ == (0.0,)
+
+
+def test_fetch_earnings_calendar_returns_symbols_in_blackout_window(monkeypatch):
+    """Report date is computed relative to `datetime.now()`, matching what the production code
+    itself uses to build its from/to window, so this test never goes stale."""
+    monkeypatch.setattr(sources.os, "getenv", lambda key, default="": "fake-token" if key == "FINNHUB_API_KEY" else default)
+    tomorrow = (sources.datetime.now() + sources.timedelta(days=1)).date().isoformat()
+
+    def fake_get(url, params=None, timeout=None):
+        return FakeResponse(
+            {
+                "earningsCalendar": [
+                    {"symbol": "NVDA", "date": tomorrow},
+                    {"symbol": "OTHER", "date": tomorrow},
+                ]
+            }
+        )
+
+    monkeypatch.setattr(sources.requests, "get", fake_get)
+
+    blackout = sources.fetch_earnings_calendar(["NVDA", "MGN"], days_before=2, days_after=1)
+
+    assert blackout == {"NVDA"}
+
+
+def test_fetch_earnings_calendar_returns_empty_set_without_api_key(monkeypatch):
+    monkeypatch.setattr(sources.os, "getenv", lambda key, default="": default)
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("Finnhub must not be called without an API key")
+
+    monkeypatch.setattr(sources.requests, "get", _fail_if_called)
+
+    assert sources.fetch_earnings_calendar(["NVDA"], days_before=2, days_after=1) == set()
+
+
+def test_fetch_earnings_calendar_returns_empty_set_for_no_symbols(monkeypatch):
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("Finnhub must not be called with an empty symbol list")
+
+    monkeypatch.setattr(sources.requests, "get", _fail_if_called)
+
+    assert sources.fetch_earnings_calendar([], days_before=2, days_after=1) == set()
+
+
+def test_fetch_earnings_calendar_fails_soft_on_request_exception(monkeypatch):
+    monkeypatch.setattr(sources.os, "getenv", lambda key, default="": "fake-token" if key == "FINNHUB_API_KEY" else default)
+
+    def fake_get(url, params=None, timeout=None):
+        raise sources.requests.RequestException("boom")
+
+    monkeypatch.setattr(sources.requests, "get", fake_get)
+
+    assert sources.fetch_earnings_calendar(["NVDA"], days_before=2, days_after=1) == set()
+
+
+def test_fetch_earnings_calendar_fails_soft_on_non_200(monkeypatch):
+    monkeypatch.setattr(sources.os, "getenv", lambda key, default="": "fake-token" if key == "FINNHUB_API_KEY" else default)
+    monkeypatch.setattr(sources.requests, "get", lambda url, params=None, timeout=None: FakeResponse({}, status_code=500))
+
+    assert sources.fetch_earnings_calendar(["NVDA"], days_before=2, days_after=1) == set()
+
+
+def test_fetch_earnings_calendar_fails_soft_on_rate_limit(monkeypatch):
+    monkeypatch.setattr(sources.os, "getenv", lambda key, default="": "fake-token" if key == "FINNHUB_API_KEY" else default)
+    monkeypatch.setattr(sources.requests, "get", lambda url, params=None, timeout=None: FakeResponse({}, status_code=429))
+
+    assert sources.fetch_earnings_calendar(["NVDA"], days_before=2, days_after=1) == set()

@@ -14,6 +14,7 @@ log = get_logger("ANALYST")
 SCREENER_BASE_URL = "https://data.alpaca.markets/v1beta1/screener/stocks"
 CRYPTO_SCREENER_BASE_URL = "https://data.alpaca.markets/v1beta1/screener/crypto"
 CRYPTO_WATCHLIST = ["BTC/USD", "ETH/USD", "SOL/USD"]
+FINNHUB_EARNINGS_URL = "https://finnhub.io/api/v1/calendar/earnings"
 
 
 def html_to_text(html_content):
@@ -141,6 +142,55 @@ def fetch_news(days: int, limit: int = 20) -> str:
 
     log(f"📰 fetched {len(articles)} news items")
     return feed
+
+
+def fetch_earnings_calendar(symbols: list[str], days_before: int, days_after: int) -> set[str]:
+    """Returns the subset of `symbols` currently inside their earnings blackout window, i.e. any
+    symbol with a scheduled Finnhub earnings report date R such that today is in
+    [R - days_after, R + days_before]. Queries Finnhub's free-tier calendar/earnings endpoint
+    once per call (no `symbol` param -- the market-wide calendar for the date window), rather
+    than once per candidate, to stay well inside the free tier's 250 calls/day budget (this runs
+    once per Analyst invocation, so ~1-2 calls/day at the default schedule). Fails soft on
+    any error (missing key, network error, non-200, rate limit, bad JSON): logs a warning and
+    returns an empty set, so a Finnhub outage degrades to "no earnings filter this run," never a
+    crashed CronJob or a fully blocked pick list."""
+    if not symbols:
+        return set()
+
+    api_key = os.getenv("FINNHUB_API_KEY", "")
+    if not api_key:
+        log("⚠️ FINNHUB_API_KEY not set -- skipping earnings blackout filter")
+        return set()
+
+    today = datetime.now().date()
+    from_date = today - timedelta(days=days_after)
+    to_date = today + timedelta(days=days_before)
+    params = {"from": from_date.isoformat(), "to": to_date.isoformat(), "token": api_key}
+
+    try:
+        resp = requests.get(FINNHUB_EARNINGS_URL, params=params, timeout=10)
+    except requests.RequestException as exc:
+        log(f"⚠️ finnhub earnings-calendar request failed: {exc}")
+        return set()
+
+    if resp.status_code == 429:
+        log("⚠️ finnhub earnings-calendar rate-limited -- skipping earnings blackout filter for this run")
+        return set()
+    if resp.status_code != 200:
+        log(f"⚠️ finnhub earnings-calendar returned {resp.status_code}: {resp.text[:200]}")
+        return set()
+
+    try:
+        payload = resp.json()
+    except ValueError as exc:
+        log(f"⚠️ finnhub earnings-calendar returned invalid JSON: {exc}")
+        return set()
+
+    wanted = set(symbols)
+    blackout = {e["symbol"] for e in payload.get("earningsCalendar", []) if e.get("symbol") in wanted}
+    if blackout:
+        log(f"📅 {len(blackout)}/{len(wanted)} candidate(s) in earnings blackout window ({from_date}..{to_date})")
+    return blackout
 
 
 def fetch_yahoo_rss_headlines(url: str, limit: int = 10) -> str:

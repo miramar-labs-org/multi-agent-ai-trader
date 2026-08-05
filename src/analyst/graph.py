@@ -40,6 +40,15 @@ def discover_candidates(state: AnalystState, cfg) -> AnalystState:
 
     if cfg.trading.enable_stocks and state["stock_market_open"]:
         stock_candidates = sources.fetch_screener_candidates(cfg.analyst.screener_top_n, cfg.analyst.min_price_usd)
+        if cfg.earnings_blackout.enabled:
+            blackout_symbols = sources.fetch_earnings_calendar(
+                [c["symbol"] for c in stock_candidates],
+                cfg.earnings_blackout.days_before,
+                cfg.earnings_blackout.days_after,
+            )
+            if blackout_symbols:
+                log(f"📅 dropping {len(blackout_symbols)} candidate(s) in earnings blackout: {sorted(blackout_symbols)}")
+            stock_candidates = [c for c in stock_candidates if c["symbol"] not in blackout_symbols]
         for c in stock_candidates:
             c["market"] = "stocks"
         candidates.extend(stock_candidates)

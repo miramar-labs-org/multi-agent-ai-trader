@@ -26,6 +26,7 @@ def test_discover_candidates_skips_stocks_when_market_closed(monkeypatch):
         {
             "trading": {"enable_stocks": True, "enable_crypto": True, "crypto_taapi_exchange": "binance"},
             "analyst": {"screener_top_n": 20},
+            "earnings_blackout": {"enabled": False},
         }
     )
     state = {
@@ -49,6 +50,7 @@ def test_discover_candidates_includes_stocks_when_market_open(monkeypatch):
         {
             "trading": {"enable_stocks": True, "enable_crypto": False, "crypto_taapi_exchange": "binance"},
             "analyst": {"screener_top_n": 20, "min_price_usd": 1.0},
+            "earnings_blackout": {"enabled": False},
         }
     )
     state = {
@@ -62,6 +64,62 @@ def test_discover_candidates_includes_stocks_when_market_open(monkeypatch):
     result = graph.discover_candidates(state, cfg)
 
     assert [c["symbol"] for c in result["raw_candidates"]] == ["MGN"]
+
+
+def test_discover_candidates_drops_earnings_blackout_symbols(monkeypatch):
+    monkeypatch.setattr(
+        graph.sources, "fetch_screener_candidates", lambda n, min_price: [{"symbol": "MGN"}, {"symbol": "NVDA"}]
+    )
+    monkeypatch.setattr(graph.sources, "fetch_crypto_candidates", lambda n: [])
+    monkeypatch.setattr(graph.sources, "fetch_earnings_calendar", lambda symbols, days_before, days_after: {"NVDA"})
+    cfg = OmegaConf.create(
+        {
+            "trading": {"enable_stocks": True, "enable_crypto": False, "crypto_taapi_exchange": "binance"},
+            "analyst": {"screener_top_n": 20, "min_price_usd": 1.0},
+            "earnings_blackout": {"enabled": True, "days_before": 2, "days_after": 1},
+        }
+    )
+    state = {
+        "raw_candidates": [],
+        "research_text": "",
+        "indicator_text": "",
+        "selection": None,
+        "stock_market_open": True,
+    }
+
+    result = graph.discover_candidates(state, cfg)
+
+    assert [c["symbol"] for c in result["raw_candidates"]] == ["MGN"]
+
+
+def test_discover_candidates_skips_earnings_filter_when_disabled_via_config(monkeypatch):
+    monkeypatch.setattr(
+        graph.sources, "fetch_screener_candidates", lambda n, min_price: [{"symbol": "MGN"}, {"symbol": "NVDA"}]
+    )
+    monkeypatch.setattr(graph.sources, "fetch_crypto_candidates", lambda n: [])
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("fetch_earnings_calendar must not be called when earnings_blackout.enabled is False")
+
+    monkeypatch.setattr(graph.sources, "fetch_earnings_calendar", _fail_if_called)
+    cfg = OmegaConf.create(
+        {
+            "trading": {"enable_stocks": True, "enable_crypto": False, "crypto_taapi_exchange": "binance"},
+            "analyst": {"screener_top_n": 20, "min_price_usd": 1.0},
+            "earnings_blackout": {"enabled": False},
+        }
+    )
+    state = {
+        "raw_candidates": [],
+        "research_text": "",
+        "indicator_text": "",
+        "selection": None,
+        "stock_market_open": True,
+    }
+
+    result = graph.discover_candidates(state, cfg)
+
+    assert {c["symbol"] for c in result["raw_candidates"]} == {"MGN", "NVDA"}
 
 
 class FakeAccountForPortfolio:
