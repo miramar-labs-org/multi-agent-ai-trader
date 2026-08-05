@@ -54,6 +54,24 @@ def test_fetch_indicators_bulk_skips_indicator_that_returned_errors(monkeypatch)
     assert "MACD 1.1" in text
 
 
+def test_fetch_indicators_bulk_skips_indicator_result_missing_expected_field(monkeypatch):
+    """Regression for a live Analyst crash: TAAPI can return a result missing an expected field
+    (e.g. insufficient historical bars for a thinly-traded symbol) without populating `errors` --
+    this must skip just that one indicator, not raise and take down the whole run."""
+    payload = {
+        "data": [
+            {"id": "macd", "result": {"valueMACD": 1.1}},  # missing valueMACDSignal/valueMACDHist
+            {"id": "rsi", "result": {"value": 71.2}},
+        ]
+    }
+    monkeypatch.setattr(indicators.requests, "post", lambda *a, **k: FakeResponse(payload=payload))
+
+    text = indicators.fetch_indicators_bulk(_INDICATORS_CFG, "MGN", "stocks", ["rsi", "macd"], log=lambda *a: None)
+
+    assert "MACD" not in text
+    assert "Relative Strength Index (RSI) for MGN is 71.2" in text
+
+
 def test_fetch_indicators_bulk_returns_empty_string_on_non_200_response(monkeypatch):
     monkeypatch.setattr(indicators.requests, "post", lambda *a, **k: FakeResponse(status_code=500, text="boom"))
 

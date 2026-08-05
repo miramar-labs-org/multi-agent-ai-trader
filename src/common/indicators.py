@@ -147,7 +147,16 @@ def fetch_indicators_bulk(indicators_cfg, symbol: str, exchange: str, names: lis
         if item.get("errors"):
             log(f"⚠️ {indicator_id} error for {symbol}: {item['errors']}")
             continue
-        log_lines, text_line = formatter(item["result"], symbol)
+        try:
+            log_lines, text_line = formatter(item["result"], symbol)
+        except KeyError as exc:
+            # TAAPI can return a result missing an expected field (e.g. insufficient historical
+            # bars for a thinly-traded symbol to compute the indicator) without populating
+            # `errors` -- the "errors" guard above doesn't catch this. Indicators are supplementary
+            # LLM context, not a trading-money gate, so skip just this one indicator rather than
+            # letting it crash the whole fetch_indicators node (and with it, the entire run).
+            log(f"⚠️ {indicator_id} result for {symbol} missing expected field {exc} -- skipping")
+            continue
         for line in log_lines:
             log(line)
         lines.append(text_line)
