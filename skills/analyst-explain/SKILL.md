@@ -123,6 +123,12 @@ new `## <YYYY-MM-DD HH:MM ET>` heading (current ET date/time when the run
 happened), same content as shown in chat. Create the file with a short header
 comment if it doesn't exist yet.
 
+Escape every literal `$` as `\$` in the file version (the chat version can
+stay unescaped). `docs/analysis.md` is viewed in Obsidian, whose KaTeX math
+renderer treats a bare `$...$` pair as an inline math span — this file is
+dense with dollar amounts, so two on the same line (e.g. `$500` and
+`$2,500`) reliably trip a parse error otherwise.
+
 ## Step 4 — Posting to Slack (only if explicitly asked)
 
 This skill is chat-only by default — the narrative from Step 3 is not posted
