@@ -23,7 +23,7 @@ set -euo pipefail
 NAMESPACE="multi-agent-ai-trader"
 SECRET_NAME="mlabs-api-keys"
 KNOWN_KEYS=(TAAPI_API_KEY ALPACA_PAPER_API_KEY ALPACA_PAPER_API_SECRET LANGCHAIN_API_KEY SLACK_WEBHOOK_URL DATABASE_URL)
-RESTART=false
+RESTART=true
 
 if [[ "${1:-}" == "--restart" ]]; then
   RESTART=true
