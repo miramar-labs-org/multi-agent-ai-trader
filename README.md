@@ -115,58 +115,6 @@ kubectl logs -n multi-agent-ai-trader job/analyst-test
 A successful run ends with `wrote portfolio with N symbols` and, if Slack is enabled, a morning
 report in your configured channel. To tear everything down: `gh workflow run "Undeploy" --ref main`.
 
-## Releases
-
-Every `Build and Push` run tags each image with `:latest` and the 8-char commit SHA (e.g.
-`:a1b2c3d4`) — so any past build is already individually pinned and deployable via `Deploy`'s
-`image_tag` input, with no separate release process required.
-
-Pushing a `v*` git tag additionally triggers `Build and Push` and tags the images with that
-version (e.g. `:v0.1.0`), for a human-readable pin instead of a raw SHA. To cut a release:
-
-```sh
-git tag v0.1.0            # on the commit you want to release
-git push origin v0.1.0    # triggers Build and Push automatically
-gh release create v0.1.0 --generate-notes
-```
-
-Then deploy that exact version with `gh workflow run "Deploy" --ref main -f image_tag=v0.1.0`.
-
-Versioning is semver by convention (no enforcement tooling): PATCH for bug fixes, MINOR for new
-features, MAJOR reserved for a breaking config/behavior change.
-
-## Development
-
-Supported Python version: **3.12** (matches every `Dockerfile.*`'s `python:3.12-slim` base and
-the DGX host's pyenv-managed interpreter).
-
-```sh
-python3.12 -m venv .venv
-.venv/bin/pip install -r requirements-dev.txt
-.venv/bin/ruff check .
-.venv/bin/pytest -q
-```
-
-`.github/workflows/test-lint.yaml` runs the same two checks — `ruff check` then `pytest -q` —
-on every push and pull request, on the `[self-hosted, dgx]` runner (the only registered runner
-for this org; a GitHub-hosted runner would avoid tying up the DGX for CI, but self-hosted was
-chosen to match the other 3 workflows here). It installs its own throwaway venv from
-`requirements-dev.txt` rather than depending on anything pre-installed on the runner, so it's
-reproducible independent of how the host happens to be provisioned.
-
-**Known gap:** CI actually runs on **Python 3.11**, not 3.12 — the runner container
-(`ghcr.io/miramar-labs-org/mlabs-runner`) is Debian 12 bookworm, which only ships 3.11 in its
-apt repos. Nothing in this codebase currently depends on a 3.12-only feature, so this hasn't
-caused a real bug, but it means CI isn't testing the exact interpreter version production runs
-on. Fixing this properly means baking Python 3.12 into the shared `mlabs-runner` image — that
-image is used by every repo in the org, so it's out of scope for this repo alone and hasn't
-been done yet.
-
-`ruff format --check` is **not** enforced in CI yet — there's pre-existing formatting drift
-across the repo (see `docs/ROADMAP.md`'s P0.12) that hasn't been cleaned up, so gating on it
-would fail on unrelated files. `ruff check` (lint rules, not formatting) has no such drift and
-is safe to gate on.
-
 ## How it decides trades
 
 Both Analyst and Dealer make their decisions the same way: gather data, hand it to an LLM as
@@ -174,17 +122,49 @@ context, and parse the response into a strict structured-output schema (via Lang
 `.with_structured_output()` — no hand-rolled JSON parsing). Both are implemented as small
 [LangGraph](https://langchain-ai.github.io/langgraph/) state machines:
 
-- **Analyst** (8 nodes): discover screener candidates (stocks and/or a fixed crypto watchlist,
+- **Analyst** (9 nodes): discover screener candidates (stocks and/or a fixed crypto watchlist,
   per `trading.enable_stocks`/`enable_crypto`) → fetch news/RSS research → fetch real TAAPI
   indicators for the top candidates by move size → fetch its own recent track record (past
-  picks, Dealer decisions, Floor Broker outcomes, read from Postgres) → LLM picks up to 10
-  symbols with a budget and rationale each → validate each pick's exchange against the actual
-  candidate it came from (dropping any hallucinated symbol) → write the `portfolio` ConfigMap →
-  if crypto is enabled, post a crypto-only EOD report to Slack. News, indicators, and track
-  record are each individually feature-gated (`analyst.enable_news`/`enable_indicators`/
-  `enable_track_record`).
+  picks, Dealer decisions, Floor Broker outcomes, read from Postgres) → fetch a live unrealized
+  P&L snapshot of currently-open positions → LLM picks up to 10 symbols with a budget and
+  rationale each → validate each pick's exchange against the actual candidate it came from
+  (dropping any hallucinated symbol) → write the `portfolio` ConfigMap → if crypto is enabled,
+  post a crypto-only EOD report to Slack. News, indicators, track record, and the P&L snapshot
+  are each individually feature-gated (`analyst.enable_news`/`enable_indicators`/
+  `enable_track_record`/`enable_position_pnl`).
 - **Dealer** (3 nodes, per symbol per poll): fetch technical indicators → LLM decides
   BUY/HOLD/SELL → if not HOLD, dispatch to Floor Broker over HTTP.
+
+```mermaid
+flowchart TD
+    subgraph Analyst["Analyst — once daily, before market open"]
+        direction TB
+        A1[discover_candidates] --> A2[fetch_research]
+        A2 --> A3[fetch_indicators]
+        A3 --> A4[fetch_track_record]
+        A4 --> A5[fetch_position_pnl]
+        A5 --> A6[llm_select]
+        A6 --> A7[validate_selection]
+        A7 --> A8[write_portfolio]
+        A8 --> A9[crypto_eod_report]
+    end
+
+    subgraph Dealer["Dealer — every 10 min while market is open, per symbol"]
+        direction TB
+        D1[fetch_indicators] --> D2[llm_call]
+        D2 --> D3{call_floor_broker}
+        D3 -->|HOLD| D4[skipped — no order]
+        D3 -->|BUY / SELL| D5[POST /execute]
+    end
+
+    A8 -.->|portfolio ConfigMap| D1
+    D5 -.->|HTTP| FB[[Floor Broker]]
+
+    classDef gated stroke-dasharray: 4 3
+    class A2,A3,A4,A5,A9 gated
+```
+
+*Dashed nodes are individually feature-gated and no-op when disabled in `config.yaml`.*
 
 Both LLM calls go through `langchain_openai.ChatOpenAI` against a single OpenAI-compatible
 `base_url` shared by the whole system (`config.yaml`'s `llm.base_url`) — this points at a

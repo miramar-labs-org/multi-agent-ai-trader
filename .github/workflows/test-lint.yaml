@@ -17,8 +17,8 @@ name: Test and Lint
 # Runs on Python 3.11, NOT 3.12 — the [self-hosted, dgx] runner container
 # (ghcr.io/miramar-labs-org/mlabs-runner) only ships 3.11 (Debian 12 bookworm's default;
 # 3.12 isn't in bookworm's apt repos at all). This is a real, documented gap vs. the 3.12
-# every Dockerfile.* and the local dev pyenv environment actually run — see README.md's
-# Development section and docs/ROADMAP.md's P0.12 entry.
+# every Dockerfile.* and the local dev pyenv environment actually run — see
+# docs/ROADMAP.md's P0.12 entry.
 
 on:
   push:
