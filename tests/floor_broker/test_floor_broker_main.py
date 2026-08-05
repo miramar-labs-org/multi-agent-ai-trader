@@ -214,6 +214,60 @@ def test_poll_pending_fills_survives_an_exception_and_reaches_the_next_sleep(mon
         fb_main.poll_pending_fills()
 
 
+def test_poll_eod_flatten_posts_slack_notification_for_each_event(monkeypatch):
+    monkeypatch.setattr(
+        fb_main.execution,
+        "check_eod_flatten",
+        lambda: [
+            {
+                "symbol": "MGN",
+                "reason": "eod_flatten",
+                "sell_result": {"status": "submitted", "detail": "sell order submitted: order-1"},
+            }
+        ],
+    )
+    posted = []
+    monkeypatch.setattr(fb_main.slack, "notify_floor_broker_result", lambda *a, **k: posted.append((a, k)))
+    monkeypatch.setattr(fb_main.time, "sleep", lambda s: (_ for _ in ()).throw(_StopLoop))
+
+    with pytest.raises(_StopLoop):
+        fb_main.poll_eod_flatten()
+
+    assert len(posted) == 1
+    args, kwargs = posted[0]
+    assert args[0] == "MGN"
+    assert args[1] == "SELL"
+    assert args[2] == "submitted"
+    assert "order-1" in args[3]
+    assert kwargs["reason"] == "eod_flatten"
+
+
+def test_poll_eod_flatten_posts_nothing_when_no_events(monkeypatch):
+    monkeypatch.setattr(fb_main.execution, "check_eod_flatten", lambda: [])
+    posted = []
+    monkeypatch.setattr(fb_main.slack, "notify_floor_broker_result", lambda *a, **k: posted.append((a, k)))
+    monkeypatch.setattr(fb_main.time, "sleep", lambda s: (_ for _ in ()).throw(_StopLoop))
+
+    with pytest.raises(_StopLoop):
+        fb_main.poll_eod_flatten()
+
+    assert posted == []
+
+
+def test_poll_eod_flatten_survives_an_exception_and_reaches_the_next_sleep(monkeypatch):
+    """A transient Alpaca error inside one poll iteration must not kill the background thread --
+    it should be caught, logged, and the loop must still reach time.sleep() to try again."""
+
+    def _raise():
+        raise RuntimeError("alpaca unavailable")
+
+    monkeypatch.setattr(fb_main.execution, "check_eod_flatten", _raise)
+    monkeypatch.setattr(fb_main.time, "sleep", lambda s: (_ for _ in ()).throw(_StopLoop))
+
+    with pytest.raises(_StopLoop):
+        fb_main.poll_eod_flatten()
+
+
 def test_poll_reconciliation_exits_once_state_is_reconciled(monkeypatch):
     """poll_reconciliation() only exists to retry reconciliation after startup's bounded attempts
     were all exhausted -- once execution.is_state_reconciled() flips True (whether from this loop

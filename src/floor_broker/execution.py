@@ -2,7 +2,7 @@ import json
 import time
 
 from alpaca.common.exceptions import APIError
-from alpaca.trading.enums import OrderClass, OrderSide, OrderStatus, OrderType, TimeInForce
+from alpaca.trading.enums import AssetClass, OrderClass, OrderSide, OrderStatus, OrderType, TimeInForce
 from alpaca.trading.requests import (
     GetOrderByIdRequest,
     GetOrdersRequest,
@@ -193,6 +193,36 @@ def check_crypto_stops() -> list[dict]:
             result = sell(symbol, reason=reason)
             events.append({"symbol": symbol, "reason": reason, "bid_price": bid, "sell_result": result})
 
+    return events
+
+
+def check_eod_flatten() -> list[dict]:
+    """Feature-gated (strategy config eod_flatten.enabled, off by default). When enabled and
+    Alpaca's live clock reports the market is within eod_flatten.minutes_before_close minutes of
+    closing, sells every open stock position -- crypto is 24/7 so "end of day" doesn't apply to
+    it. Uses the live clock (not a fixed schedule) so early/half-trading-close days are handled
+    correctly with no special-casing. No "already flattened today" bookkeeping is needed: once a
+    symbol is sold, trading_client.get_all_positions() simply stops returning it, so later polls
+    within the same closing window are cheap no-ops."""
+    cfg = load_config()  # fresh (within its own refresh window), same live-reload pattern buy() uses
+    if not cfg.eod_flatten.enabled:
+        return []
+
+    clock = trading_client.get_clock()
+    if not clock.is_open:
+        return []
+
+    minutes_to_close = (clock.next_close - clock.timestamp).total_seconds() / 60
+    if minutes_to_close > cfg.eod_flatten.minutes_before_close:
+        return []
+
+    events = []
+    for position in trading_client.get_all_positions():
+        if position.asset_class != AssetClass.US_EQUITY:
+            continue  # crypto is 24/7 -- "end of day" doesn't apply, leave it alone
+        result = sell(position.symbol, reason="eod_flatten")
+        if result["status"] != "skipped":
+            events.append({"symbol": position.symbol, "reason": "eod_flatten", "sell_result": result})
     return events
 
 

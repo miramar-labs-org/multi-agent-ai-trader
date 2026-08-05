@@ -40,6 +40,15 @@ strategy:
   risk_per_trade_usd: null        # recorded intent only -- see position_sizing note above
   max_concurrent_positions: 10    # recorded intent only -- analyst.max_universe_size already caps concurrent picks
 
+eod_flatten:
+  enabled: false   # feature gate: when false, poll_eod_flatten() (src/floor_broker/main.py) short-
+                   # circuits every iteration before touching the clock or Alpaca positions -- off
+                   # by default, opt-in "day trading mode". Toggling this is a config-only change --
+                   # no rebuild/redeploy needed, see src/common/config.py.
+  minutes_before_close: 10   # start flattening open stock positions once Alpaca's live clock
+                              # reports this many minutes (or fewer) until market close. Crypto is
+                              # 24/7 and untouched by this feature.
+
 eod_report:
   schedule: "30 17 * * *"   # informational copy of the CronJob's own spec.schedule — 17:30 America/New_York
                             # daily (spec.timeZone), ~90min after the 4pm ET close; runs every day so closed

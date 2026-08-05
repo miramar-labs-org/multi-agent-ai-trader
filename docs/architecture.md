@@ -702,6 +702,8 @@ isn't purely for human/skill consumption.
 | `trading` | `enable_stocks` | when true, Analyst screens/picks equities, and Dealer processes/merges stock symbols; set false to pause equities handling entirely |
 | `trading` | `enable_crypto` | when true, Analyst also screens/picks from a fixed crypto watchlist (`BTC/USD`, `ETH/USD`, `SOL/USD`) via `fetch_crypto_candidates()`, Dealer also polls merged-in crypto positions, and `merge_held_positions()` folds pre-existing crypto positions into the watchlist |
 | `trading` | `crypto_taapi_exchange` | TAAPI venue name (e.g. `"binance"`) used as the `exchange` for crypto positions merged in by `merge_held_positions()` — TAAPI's `/bulk` API requires an actual venue, not the literal word "crypto" |
+| `eod_flatten` | `enabled` | feature gate for `poll_eod_flatten()` (`src/floor_broker/main.py`) — when false (default), `check_eod_flatten()` short-circuits before touching the clock or Alpaca positions; opt-in "day trading mode" that closes every open stock position near market close instead of holding overnight |
+| `eod_flatten` | `minutes_before_close` | how close (by Alpaca's live clock) to market close before `check_eod_flatten()` starts selling open stock positions (default 10) — crypto is 24/7 and untouched |
 | `eod_report` | `schedule` | informational copy of the CronJob's own `spec.schedule` — not templated, must be kept in sync manually |
 | `analyst` | `schedule` | informational copy of the CronJob's own `spec.schedule` — not templated, must be kept in sync manually |
 | `analyst` | `enable_midday_run` | feature gate for the optional `analyst-midday` CronJob (12:30pm ET) — when false (default), `main()` exits immediately on a midday-labeled run before `build_graph()` is called |
@@ -735,6 +737,11 @@ isn't purely for human/skill consumption.
 - **Sell-side retry logic** — Floor Broker explicitly handles Alpaca's "conflicting orders"
   error by cancelling blockers and re-fetching the current quantity before resubmitting,
   rather than failing the sell outright.
+- **Optional end-of-day flatten ("day trading mode")** — `eod_flatten.enabled` (default false);
+  when on, `poll_eod_flatten()` sells every open stock position once Alpaca's live clock reports
+  the market is within `eod_flatten.minutes_before_close` minutes of closing, so the bot never
+  carries overnight stock risk. Crypto is 24/7 and excluded. Off by default, config-only toggle
+  (no redeploy).
 - **TAAPI stays inside its rate limit** — Dealer fetches all of a symbol's indicators in one
   `/bulk` POST instead of one GET per indicator (up to 9 individual calls per symbol would blow
   through TAAPI's per-15s rate limit — even on the Pro plan — the moment two symbols overlapped),

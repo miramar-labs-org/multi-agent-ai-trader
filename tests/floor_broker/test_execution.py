@@ -1,9 +1,10 @@
 import json
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from alpaca.common.exceptions import APIError
-from alpaca.trading.enums import OrderSide, OrderStatus, OrderType
+from alpaca.trading.enums import AssetClass, OrderSide, OrderStatus, OrderType
 from omegaconf import OmegaConf
 
 from src.floor_broker import execution
@@ -20,6 +21,10 @@ _FAKE_CFG = OmegaConf.create(
             "daily_loss_limit_usd": 500,
             "crypto_slP": 0.98,
             "crypto_tpP": 1.03,
+        },
+        "eod_flatten": {
+            "enabled": False,
+            "minutes_before_close": 10,
         },
     }
 )
@@ -681,6 +686,124 @@ def test_check_crypto_stops_keeps_tracking_symbol_on_transient_price_fetch_error
 
     assert events == []
     assert execution._crypto_stops["BTC/USD"] == (98.0, 103.0)
+
+
+class FakeClock:
+    def __init__(self, is_open, minutes_to_close=5):
+        self.is_open = is_open
+        self.timestamp = datetime(2026, 8, 5, 15, 0, tzinfo=timezone.utc)
+        self.next_close = self.timestamp + timedelta(minutes=minutes_to_close)
+
+
+class FakeEodPosition:
+    def __init__(self, symbol, asset_class, qty="1"):
+        self.symbol = symbol
+        self.asset_class = asset_class
+        self.qty = qty
+
+
+class FakeEodFlattenTradingClient:
+    """Stands in for alpaca-py's TradingClient for check_eod_flatten() -- also backs the real
+    sell() it calls per-symbol, so get_open_position() must resolve every symbol get_all_positions()
+    returns."""
+
+    def __init__(self, clock, positions):
+        self._clock = clock
+        self._positions = positions
+        self.submitted = []
+
+    def get_clock(self):
+        return self._clock
+
+    def get_all_positions(self):
+        return self._positions
+
+    def get_open_position(self, symbol):
+        for position in self._positions:
+            if position.symbol.replace("/", "") == symbol:
+                return position
+        raise APIError("no position")
+
+    def submit_order(self, req):
+        self.submitted.append(req)
+        return type("Order", (), {"id": f"order-{req.symbol}"})()
+
+
+def _eod_flatten_cfg(enabled=True, minutes_before_close=10):
+    return OmegaConf.create(
+        {
+            "strategy": _FAKE_CFG.strategy,
+            "eod_flatten": {"enabled": enabled, "minutes_before_close": minutes_before_close},
+        }
+    )
+
+
+def test_check_eod_flatten_is_a_noop_when_disabled_by_config(monkeypatch):
+    monkeypatch.setattr(execution, "load_config", lambda: _eod_flatten_cfg(enabled=False))
+    fake_client = FakeEodFlattenTradingClient(FakeClock(is_open=True), [FakeEodPosition("MGN", AssetClass.US_EQUITY)])
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    events = execution.check_eod_flatten()
+
+    assert events == []
+    assert fake_client.submitted == []
+
+
+def test_check_eod_flatten_is_a_noop_when_market_is_closed(monkeypatch):
+    monkeypatch.setattr(execution, "load_config", lambda: _eod_flatten_cfg())
+    fake_client = FakeEodFlattenTradingClient(FakeClock(is_open=False), [FakeEodPosition("MGN", AssetClass.US_EQUITY)])
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    events = execution.check_eod_flatten()
+
+    assert events == []
+    assert fake_client.submitted == []
+
+
+def test_check_eod_flatten_is_a_noop_when_not_yet_within_the_closing_window(monkeypatch):
+    monkeypatch.setattr(execution, "load_config", lambda: _eod_flatten_cfg(minutes_before_close=10))
+    fake_client = FakeEodFlattenTradingClient(
+        FakeClock(is_open=True, minutes_to_close=30), [FakeEodPosition("MGN", AssetClass.US_EQUITY)]
+    )
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    events = execution.check_eod_flatten()
+
+    assert events == []
+    assert fake_client.submitted == []
+
+
+def test_check_eod_flatten_sells_stock_positions_and_skips_crypto(monkeypatch):
+    monkeypatch.setattr(execution, "load_config", lambda: _eod_flatten_cfg(minutes_before_close=10))
+    fake_client = FakeEodFlattenTradingClient(
+        FakeClock(is_open=True, minutes_to_close=5),
+        [FakeEodPosition("MGN", AssetClass.US_EQUITY), FakeEodPosition("BTC/USD", AssetClass.CRYPTO)],
+    )
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    events = execution.check_eod_flatten()
+
+    assert len(events) == 1
+    assert events[0]["symbol"] == "MGN"
+    assert events[0]["reason"] == "eod_flatten"
+    assert events[0]["sell_result"]["status"] == "submitted"
+    assert [req.symbol for req in fake_client.submitted] == ["MGN"]
+
+
+def test_check_eod_flatten_excludes_a_skipped_sell_from_the_returned_events(monkeypatch):
+    """sell() returns status="skipped" when get_open_position() resolves to qty<=0 -- shouldn't
+    happen for a symbol get_all_positions() itself just returned, but if it does (e.g. a race with
+    a fill that already closed it), it must not be reported as a flatten event."""
+    monkeypatch.setattr(execution, "load_config", lambda: _eod_flatten_cfg(minutes_before_close=10))
+    fake_client = FakeEodFlattenTradingClient(
+        FakeClock(is_open=True, minutes_to_close=5), [FakeEodPosition("MGN", AssetClass.US_EQUITY, qty="0")]
+    )
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    events = execution.check_eod_flatten()
+
+    assert events == []
+    assert fake_client.submitted == []
 
 
 def test_check_bracket_fills_reports_take_profit_leg_filled(monkeypatch):

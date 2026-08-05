@@ -216,8 +216,24 @@ still restores the original baseline. As of the GitHub-fetch-at-runtime feature 
 rather than baked into the Docker image — a config-only `git push` takes effect within ~60s, no
 rebuild/redeploy needed, and the same applies in reverse for `/revert-strategy`.
 
+## 2026-08-05 — Optional end-of-day position flatten ("day trading mode")
+
+New, independently-toggled `eod_flatten.enabled` config flag (default `false`) makes
+`strategy.halt_behavior`'s `flatten_positions` value real, enforced behavior for the first time
+— previously it was recorded intent only (see the `halt_behavior` note above), and it's still
+only ever read as informational text, not wired to this feature. When `eod_flatten.enabled` is
+`true`, a new Floor Broker daemon thread (`poll_eod_flatten()`) sells every open **stock**
+position once Alpaca's live clock reports the market is within `eod_flatten.minutes_before_close`
+minutes (default `10`) of closing. Crypto is 24/7 and explicitly excluded — "end of day" doesn't
+apply to it. Scoped independently of `halt_behavior`: this isn't a halt condition, it's an
+always-evaluated opt-in schedule that runs regardless of daily profit/loss state.
+
+Off by default; toggling is a config-only change (no rebuild/redeploy), same live-reload story as
+`analyst.enable_midday_run`. See `docs/ROADMAP.md` P1.10 and `docs/architecture.md`'s config
+reference / Risk controls section for implementation details.
+
 ---
 *This file is a live scratchpad for the strategy conversation, updated as the discussion
-progresses. Reflected in `docs/ROADMAP.md` (P0.4/P0.6/P1.8) and `docs/architecture.md`
-(Floor Broker section — daily halt and crypto synthetic stop-loss/take-profit) as of
-2026-08-04.*
+progresses. Reflected in `docs/ROADMAP.md` (P0.4/P0.6/P1.8/P1.10) and `docs/architecture.md`
+(Floor Broker section — daily halt, crypto synthetic stop-loss/take-profit, and end-of-day
+flatten) as of 2026-08-05.*

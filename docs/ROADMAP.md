@@ -882,6 +882,30 @@ Do not expose secrets, prompts containing sensitive data, or raw account identif
 
 ---
 
+## P1.10 — Optional end-of-day position flatten ("day trading mode")
+
+**Done.** `eod_flatten.enabled` (`config.yaml`, default `false`) gates a 5th Floor Broker daemon
+thread, `poll_eod_flatten()` (`src/floor_broker/main.py`), which calls
+`execution.check_eod_flatten()` on a 60s cadence. When enabled and Alpaca's live clock reports
+the market is within `eod_flatten.minutes_before_close` minutes (default 10) of closing, it sells
+every open stock position via the existing `sell()` path — crypto is 24/7 and explicitly excluded
+(`AssetClass.US_EQUITY` filter). This is the first time `strategy.halt_behavior`'s
+`flatten_positions` value becomes real, enforced behavior rather than recorded intent only (see
+`docs/strategy.md`); it's a separate, independently-toggled feature, not wired to
+`halt_behavior`.
+
+Runs entirely in-process so the eventual fill is picked up automatically by the already-running
+`poll_pending_fills()` thread, the same way it already handles Dealer-initiated sells — no new
+CronJob, image, or deploy manifest needed. Off by default; toggling is a config-only change (no
+rebuild/redeploy), same live-reload story as `analyst.enable_midday_run`.
+
+Tests: `tests/floor_broker/test_execution.py` (`check_eod_flatten()` — disabled/closed-market/
+not-yet-in-window no-ops, sells stocks and skips crypto, excludes a `skipped` sell from returned
+events) and `tests/floor_broker/test_floor_broker_main.py` (`poll_eod_flatten()` — Slack
+notification per event, no-op with no events, survives an exception).
+
+---
+
 # P2 — Platform maturity
 
 P2 begins after the execution path is safe and the strategy is measurable.

@@ -13,6 +13,7 @@ BRACKET_FILL_POLL_INTERVAL_S = 30
 KILL_SWITCH_POLL_INTERVAL_S = 30
 PENDING_FILL_POLL_INTERVAL_S = 30
 RECONCILIATION_RETRY_INTERVAL_S = 60
+EOD_FLATTEN_POLL_INTERVAL_S = 60
 
 
 def poll_bracket_fills():
@@ -118,6 +119,30 @@ def poll_pending_fills():
         time.sleep(PENDING_FILL_POLL_INTERVAL_S)
 
 
+def poll_eod_flatten():
+    """Runs for the lifetime of the process. When strategy config enables eod_flatten and Alpaca's
+    live clock reports the market is close to closing, sells every open stock position (crypto is
+    24/7 and excluded, see execution.check_eod_flatten()). The immediate submit is reported here,
+    the same way poll_bracket_fills() reports a triggered synthetic crypto stop -- the eventual
+    fill/no-fill is reported separately by poll_pending_fills(), which already tracks every order
+    sell() submits."""
+    while True:
+        try:
+            for event in execution.check_eod_flatten():
+                log(f"🌇 eod-flatten selling {event['symbol']}: {event['sell_result']['detail']}")
+                slack.notify_floor_broker_result(
+                    event["symbol"],
+                    "SELL",
+                    event["sell_result"]["status"],
+                    event["sell_result"]["detail"],
+                    reason=event["reason"],
+                )
+                db.record_floor_broker_event(event["symbol"], "eod_flatten", event["sell_result"]["detail"])
+        except Exception as exc:
+            log(f"💥 eod-flatten poll failed: {exc}")
+        time.sleep(EOD_FLATTEN_POLL_INTERVAL_S)
+
+
 def poll_kill_switch():
     """Watches the buy-kill-switch ConfigMap for a state change (ROADMAP P0.5) and posts a Slack
     notice only on transition, not on every poll -- `/execute` itself already re-checks the
@@ -157,6 +182,7 @@ def main():
     threading.Thread(target=poll_bracket_fills, daemon=True).start()
     threading.Thread(target=poll_pending_fills, daemon=True).start()
     threading.Thread(target=poll_kill_switch, daemon=True).start()
+    threading.Thread(target=poll_eod_flatten, daemon=True).start()
     uvicorn.run("src.floor_broker.app:app", host="0.0.0.0", port=8000)
 
 
