@@ -3,13 +3,21 @@ name: Build and Push
 # Builds the 3 microservice images (Analyst, Dealer, Floor Broker) and pushes
 # them to GHCR. CPU-only, DGX self-hosted runner — no GPU node/registry logic.
 #
-# Run this after any change to src/, requirements.txt, or the Dockerfiles.
+# Auto-chains off "Test and Lint" (workflow_run) for every push to main that
+# passes tests -- deploy.yaml then auto-chains off this workflow in turn, so
+# main -> live images -> live pods happens with no manual step and nothing
+# with a red test run ever gets built. Manual workflow_dispatch and version
+# tag pushes (v*) still work as standalone triggers, unchanged.
 
 on:
   workflow_dispatch:
   push:
     tags:
       - 'v*'
+  workflow_run:
+    workflows: ["Test and Lint"]
+    types: [completed]
+    branches: [main]
 
 permissions:
   contents: read
@@ -20,6 +28,7 @@ env:
 
 jobs:
   build-push-ghcr:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: [self-hosted, dgx]
     strategy:
       matrix:
@@ -34,6 +43,8 @@ jobs:
             dockerfile: Dockerfile.eod-report
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
 
       - name: Log in to GHCR
         run: echo "${{ secrets.MIRAMAR_ORG_GHCR_PAT }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
@@ -42,7 +53,7 @@ jobs:
         id: image
         run: |
           IMAGE_URI="ghcr.io/miramar-labs-org/${PROJECT_NAME}-${{ matrix.name }}"
-          COMMIT_SHA="${{ github.sha }}"
+          COMMIT_SHA="${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}"
           echo "uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
           echo "tag=${COMMIT_SHA::8}" >> "$GITHUB_OUTPUT"
           if [[ "${{ github.ref_type }}" == "tag" ]]; then

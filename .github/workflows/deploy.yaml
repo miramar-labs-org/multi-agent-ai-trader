@@ -8,6 +8,15 @@ name: Deploy
 # it must already exist in the namespace (see k8s/secrets.example.yaml).
 # The portfolio and buy-kill-switch ConfigMaps are seeded once and never clobbered on re-deploy.
 #
+# Auto-chains off "Build and Push" (workflow_run) for every push to main that
+# passes tests and builds successfully -- deploys the exact commit's
+# <8-char-sha> image tag that build-push.yaml just pushed (not :latest, so
+# there's no race if another push lands mid-deploy). This closes the loop
+# started in test-lint.yaml: main -> tests pass -> images built -> pods
+# redeployed, with no manual step, so a merged commit can no longer sit
+# undeployed indefinitely. Manual workflow_dispatch still works standalone
+# (e.g. to roll back to an older tag or force a redeploy of :latest).
+#
 # Run undeploy.yaml to tear the whole namespace down.
 
 on:
@@ -17,6 +26,10 @@ on:
         description: "Image tag to deploy for all 3 services"
         required: false
         default: latest
+  workflow_run:
+    workflows: ["Build and Push"]
+    types: [completed]
+    branches: [main]
 
 permissions:
   contents: read
@@ -26,9 +39,12 @@ env:
 
 jobs:
   deploy-dgx:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: [self-hosted, dgx]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
 
       - name: Set up kubeconfig
         run: echo "KUBECONFIG=${HOME}/.kube/config" >> "${GITHUB_ENV}"
@@ -69,7 +85,12 @@ jobs:
       - name: Build image URIs
         id: images
         run: |
-          TAG="${{ inputs.image_tag }}"
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            FULL_SHA="${{ github.event.workflow_run.head_sha }}"
+            TAG="${FULL_SHA::8}"
+          else
+            TAG="${{ inputs.image_tag }}"
+          fi
           echo "analyst=ghcr.io/miramar-labs-org/${PROJECT_NAME}-analyst:${TAG}" >> "$GITHUB_OUTPUT"
           echo "dealer=ghcr.io/miramar-labs-org/${PROJECT_NAME}-dealer:${TAG}" >> "$GITHUB_OUTPUT"
           echo "floor_broker=ghcr.io/miramar-labs-org/${PROJECT_NAME}-floor-broker:${TAG}" >> "$GITHUB_OUTPUT"
@@ -81,7 +102,11 @@ jobs:
           DEALER_URI="${{ steps.images.outputs.dealer }}"
           FLOOR_BROKER_URI="${{ steps.images.outputs.floor_broker }}"
           EOD_REPORT_URI="${{ steps.images.outputs.eod_report }}"
-          COMMIT_SHA="${{ github.sha }}"
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            COMMIT_SHA="${{ github.event.workflow_run.head_sha }}"
+          else
+            COMMIT_SHA="${{ github.sha }}"
+          fi
 
           for MANIFEST in \
             k8s/analyst-cronjob-k3s.yaml \
