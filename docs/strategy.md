@@ -203,6 +203,17 @@ to replace today's defaults (`$1000` profit target / `$500` loss limit / `0.98`-
 crypto SL/TP) with deliberately chosen numbers rather than the placeholders currently
 in `config.yaml`.
 
+## 2026-08-05 — Temporary daily loss limit raise
+
+`strategy.daily_loss_limit_usd` raised from `500` to `3000` in `config.yaml` (ad hoc request, not
+run through the full `/configure-strategy` wizard since it was a single, unambiguous value — no
+other `strategy:` field changed). **Enforced** (`execution.py::buy()`, checked against
+`account.equity - account.last_equity` on every BUY). Explicitly temporary — `config.default.yaml`
+was left untouched at `500` so `/revert-strategy` still restores the original baseline. Since
+`config.yaml` is baked into the Docker image (not a live-patchable ConfigMap like the buy kill
+switch), this requires the normal build+deploy pipeline to take effect, and equally requires a
+redeploy to revert — it is not an instant runtime toggle.
+
 ---
 *This file is a live scratchpad for the strategy conversation, updated as the discussion
 progresses. Reflected in `docs/ROADMAP.md` (P0.4/P0.6/P1.8) and `docs/architecture.md`

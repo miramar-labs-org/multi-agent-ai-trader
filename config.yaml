@@ -31,7 +31,8 @@ trading:
 # module's buy()/check_pending_fills()/check_crypto_stops() for exactly which fields are live.
 strategy:
   daily_profit_target_usd: 1000   # blocks new BUYs once today's equity gain reaches this
-  daily_loss_limit_usd: 500       # blocks new BUYs once today's equity loss reaches this
+  daily_loss_limit_usd: 3000      # blocks new BUYs once today's equity loss reaches this -- temporarily
+                                   # raised from 500 on 2026-08-05, see docs/strategy.md
   halt_behavior: block_new_buys   # only this is enforced; flatten_positions is recorded intent only
   crypto_slP: 0.98                # synthetic stop-loss, as a fraction of crypto fill price
   crypto_tpP: 1.03                # synthetic take-profit, as a fraction of crypto fill price
