@@ -203,16 +203,18 @@ to replace today's defaults (`$1000` profit target / `$500` loss limit / `0.98`-
 crypto SL/TP) with deliberately chosen numbers rather than the placeholders currently
 in `config.yaml`.
 
-## 2026-08-05 — Temporary daily loss limit raise
+## 2026-08-05 — Daily loss limit adjustments
 
-`strategy.daily_loss_limit_usd` raised from `500` to `3000` in `config.yaml` (ad hoc request, not
-run through the full `/configure-strategy` wizard since it was a single, unambiguous value — no
-other `strategy:` field changed). **Enforced** (`execution.py::buy()`, checked against
-`account.equity - account.last_equity` on every BUY). Explicitly temporary — `config.default.yaml`
-was left untouched at `500` so `/revert-strategy` still restores the original baseline. Since
-`config.yaml` is baked into the Docker image (not a live-patchable ConfigMap like the buy kill
-switch), this requires the normal build+deploy pipeline to take effect, and equally requires a
-redeploy to revert — it is not an instant runtime toggle.
+`strategy.daily_loss_limit_usd` changed several times in `config.yaml` (ad hoc requests, not run
+through the full `/configure-strategy` wizard since each was a single, unambiguous value — no
+other `strategy:` field changed): `500` → `3000` → `2000` (the `2000` step doubled as a live
+verification of the newly-shipped GitHub-fetch-at-runtime config mechanism) → `2500`.
+**Enforced** (`execution.py::buy()`, checked against `account.equity - account.last_equity` on
+every BUY). `config.default.yaml` was left untouched at `500` throughout, so `/revert-strategy`
+still restores the original baseline. As of the GitHub-fetch-at-runtime feature (shipped
+2026-08-05, see `docs/architecture.md`), `config.yaml` is fetched live from GitHub on a 60s TTL
+rather than baked into the Docker image — a config-only `git push` takes effect within ~60s, no
+rebuild/redeploy needed, and the same applies in reverse for `/revert-strategy`.
 
 ---
 *This file is a live scratchpad for the strategy conversation, updated as the discussion
