@@ -339,6 +339,118 @@ def test_buy_reraises_on_unrelated_api_error(monkeypatch):
     assert len(fake_client.submitted) == 1, "must not retry on an unrelated rejection"
 
 
+class FakePosition:
+    def __init__(self, market_value, qty="1"):
+        self.qty = qty
+        self.market_value = market_value
+
+
+class FakeExistingPositionTradingClient(FakeTradingClient):
+    """Like FakeTradingClient, but get_open_position() returns an existing position instead of
+    raising -- used to exercise buy()'s top-up-toward-budget branch."""
+
+    def __init__(self, market_value, rejections=(), account=None):
+        super().__init__(rejections=rejections, account=account)
+        self._market_value = market_value
+
+    def get_open_position(self, symbol):
+        return FakePosition(self._market_value)
+
+
+def test_buy_skips_with_open_orders_exist_reason_when_a_matching_order_is_open(monkeypatch):
+    """An in-flight order for the symbol (BUY not yet filled, or a pending SELL) must still be a
+    hard, unconditional skip -- layering a new BUY on top of it is racy regardless of how much
+    budget headroom the caller thinks is available."""
+
+    class FakeOpenOrderTradingClient(FakeTradingClient):
+        def get_orders(self, request):
+            return [type("Order", (), {"symbol": "MGN"})()]
+
+    fake_client = FakeOpenOrderTradingClient()
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    result = execution.buy("MGN", "stocks", 5000.0, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "open_orders_exist"
+    assert fake_client.submitted == []
+
+
+def test_buy_skips_with_market_value_unavailable_reason_when_position_market_value_is_none(monkeypatch):
+    """market_value is Optional[str] on Alpaca's own Position model. This is a trading-money
+    gate, so it must fail closed (skip) rather than guess at remaining budget headroom -- the
+    opposite of the Analyst's informational P&L snapshot, which fails open on the same field."""
+    fake_client = FakeExistingPositionTradingClient(market_value=None)
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    result = execution.buy("MGN", "stocks", 5000.0, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "market_value_unavailable"
+    assert fake_client.submitted == []
+
+
+def test_buy_skips_with_budget_exhausted_reason_when_existing_position_already_meets_budget(monkeypatch):
+    fake_client = FakeExistingPositionTradingClient(market_value="5000.00")
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    result = execution.buy("MGN", "stocks", 5000.0, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "budget_exhausted"
+    assert fake_client.submitted == []
+
+
+def test_buy_tops_up_existing_stock_position_with_only_the_remaining_budget(monkeypatch):
+    """Core fix: budget=$5000, existing position worth $4000 -- buy() must submit a bracket
+    order sized off the $1000 remainder, not the full $5000 budget and not a skip."""
+    fake_client = FakeExistingPositionTradingClient(market_value="4000.00")
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+    monkeypatch.setattr(execution, "get_current_ask_price", lambda symbol: 10.0)
+
+    result = execution.buy("MGN", "stocks", 5000.0, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "submitted"
+    assert fake_client.submitted[0].qty == 100  # int(1000.0 // 10.0), not int(5000.0 // 10.0)
+
+
+def test_buy_tops_up_existing_crypto_position_with_only_the_remaining_budget(monkeypatch):
+    fake_client = FakeExistingPositionTradingClient(market_value="40.00")
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    result = execution.buy("BTC/USD", "binance", 100.0, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "submitted"
+    assert fake_client.submitted[0].notional == 60.0  # 100.0 - 40.0, not the full 100.0
+
+
+def test_buy_skips_with_insufficient_qty_reason_when_remaining_budget_affords_less_than_one_share(monkeypatch):
+    """The reduced "remaining budget" must flow into the existing InsufficientQuantity path
+    unchanged -- no new sizing logic needed for this edge case."""
+    fake_client = FakeExistingPositionTradingClient(market_value="4990.00")
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+    monkeypatch.setattr(execution, "get_current_ask_price", lambda symbol: 10000.0)
+
+    result = execution.buy("MGN", "stocks", 5000.0, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "insufficient_qty"
+    assert fake_client.submitted == []
+
+
+def test_buy_skips_with_budget_below_minimum_reason_when_remaining_budget_below_crypto_minimum(monkeypatch):
+    """Same idea for crypto: the remainder must flow into the existing MIN_CRYPTO_NOTIONAL check
+    unchanged."""
+    fake_client = FakeExistingPositionTradingClient(market_value="95.00")
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    result = execution.buy("BTC/USD", "binance", 100.0, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "budget_below_minimum"
+    assert fake_client.submitted == []
+
+
 def test_stock_buy_returns_reason_sl_tp_and_tracks_the_bracket_and_pending_fill(monkeypatch):
     fake_client = FakeTradingClient()
     monkeypatch.setattr(execution, "trading_client", fake_client)

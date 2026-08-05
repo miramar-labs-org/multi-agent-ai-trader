@@ -280,16 +280,31 @@ instead of only the request it sent. `reason` is one of `opening_position` (a BU
 (an explicit SELL from the Dealer's LLM decision), `take_profit`/`stop_loss` (an asynchronous
 bracket-leg fill for stocks, or a synthetic crypto stop/target trigger — see below — both detected
 by the pollers below), or a skipped-BUY reason (`buy_kill_switch_active`, `state_not_reconciled`,
-`budget_below_minimum`, `daily_profit_target_reached`, `daily_loss_limit_reached` — see the daily
-halt section below). As of ROADMAP P0.14, `/execute` itself never
+`budget_below_minimum`, `daily_profit_target_reached`, `daily_loss_limit_reached`,
+`open_orders_exist`, `market_value_unavailable`, `budget_exhausted` — see the daily halt section
+and `buy()` below). As of ROADMAP P0.14, `/execute` itself never
 returns `fill_price` — BUY/SELL orders are submitted and the response comes back immediately with
 `status="submitted"`; the actual fill (`opening_position`/`dealer_signal`) and bracket-leg fills
 (`take_profit`/`stop_loss`) are both reported later, asynchronously, only via the Slack posts the
 pollers below send directly.
 
 **Order logic** (`src/floor_broker/execution.py`):
-- **`buy()`** — safety gate first: if an open position or open order already exists for the
-  symbol, the buy is skipped ("aborting BUY") rather than pyramiding. For stocks, submits a
+- **`buy()`** — safety gate first: `budget` is treated as the dollar amount **authorized** for
+  the symbol, not a one-shot "open a fresh position" ticket. If an open order already exists for
+  the symbol (an in-flight BUY not yet filled, or a pending SELL), the buy is still
+  unconditionally skipped (`reason="open_orders_exist"`) — layering a new BUY on an in-flight
+  order is racy regardless of budget math. If an open **position** already exists instead, `buy()`
+  tops it up rather than skipping: it reads the position's `market_value` and, if
+  `budget - market_value > 0`, submits a smaller BUY for just the remainder — repeated BUY
+  decisions across Dealer poll cycles converge the position toward `budget` over time, with no
+  extra state needed (each call recomputes headroom off the live position). If `market_value` is
+  unavailable, the BUY is skipped (`reason="market_value_unavailable"`) rather than guessed — this
+  is a trading-money gate, so it fails **closed** on missing data, unlike the Analyst's
+  informational P&L snapshot which fails open. If the existing position's value already meets or
+  exceeds `budget`, the BUY is skipped (`reason="budget_exhausted"`). A reduced "remaining budget"
+  flows unchanged into the same sizing logic below, so a remainder too small for one share
+  (stocks) or below Alpaca's crypto minimum both fall through to the existing
+  `insufficient_qty`/`budget_below_minimum` skips automatically. For stocks, submits a
   **bracket order** (`OrderClass.BRACKET`) with computed stop-loss (`ask_price * slP`) and
   take-profit (`ask_price * tpP`) legs, `TimeInForce.DAY` — priced off the ask since that's
   where a BUY actually fills, not the bid/ask mid. TP/SL prices are rounded to 4 decimals for

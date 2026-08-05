@@ -271,16 +271,21 @@ def reconstruct_tracked_state(
     )
 
 
-def get_open_position(symbol: str) -> float:
+def _fetch_open_position(symbol: str):
     try:
-        is_stock = symbol.find("/") == -1
-        symbol = symbol.replace("/", "")
-        position = trading_client.get_open_position(symbol)
-        qty = int(float(position.qty)) if is_stock else float(position.qty)
-        log(f"📈  open position: {qty} of {symbol}")
-        return qty
+        return trading_client.get_open_position(symbol.replace("/", ""))
     except APIError:
+        return None
+
+
+def get_open_position(symbol: str) -> float:
+    is_stock = symbol.find("/") == -1
+    position = _fetch_open_position(symbol)
+    if position is None:
         return 0
+    qty = int(float(position.qty)) if is_stock else float(position.qty)
+    log(f"📈  open position: {qty} of {symbol.replace('/', '')}")
+    return qty
 
 
 def cancel_related_orders(order_ids: list[str]) -> None:
@@ -408,14 +413,45 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
             "detail": f"daily P&L ${daily_pnl:.2f} <= -limit ${cfg.strategy.daily_loss_limit_usd}",
         }
 
-    op = get_open_position(symbol)
+    position = _fetch_open_position(symbol)
 
     oo = trading_client.get_orders(GetOrdersRequest(status="open"))
     matching_orders = [order for order in oo if order.symbol == symbol]
 
-    if op != 0 or matching_orders:
-        log(f"⚠️  open orders/positions exist for {symbol} - aborting BUY")
-        return {"status": "skipped", "detail": "open orders/positions exist"}
+    if matching_orders:
+        log(f"⚠️  open orders exist for {symbol} - aborting BUY")
+        return {"status": "skipped", "reason": "open_orders_exist", "detail": "open orders exist for symbol"}
+
+    if position is not None:
+        # `budget` is the dollar amount authorized for this symbol, not a one-shot "open a fresh
+        # position" ticket -- a position sitting under its authorized budget should be allowed to
+        # grow toward it rather than getting permanently stuck at whatever the first fill landed on.
+        if position.market_value is None:
+            # Trading-money gate: fail closed on missing data, unlike the Analyst's informational
+            # P&L snapshot (summarize_positions()) which fails open -- can't safely compute
+            # remaining headroom without a market_value to subtract.
+            log(f"⚠️  {symbol} existing position market_value unavailable - aborting BUY")
+            return {
+                "status": "skipped",
+                "reason": "market_value_unavailable",
+                "detail": "existing position market_value unavailable",
+            }
+
+        existing_value = float(position.market_value)
+        if existing_value >= budget:
+            log(f"⚠️  {symbol} position (${existing_value:.2f}) already at/above budget (${budget:.2f}) - skipping BUY")
+            return {
+                "status": "skipped",
+                "reason": "budget_exhausted",
+                "detail": f"existing position value ${existing_value:.2f} >= budget ${budget:.2f}",
+            }
+
+        remaining_budget = budget - existing_value
+        log(
+            f"📈  {symbol} position (${existing_value:.2f}) below budget (${budget:.2f}) "
+            f"- topping up ${remaining_budget:.2f}"
+        )
+        budget = remaining_budget
 
     if exchange == "stocks":
         try:
