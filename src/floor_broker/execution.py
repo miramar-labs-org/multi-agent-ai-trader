@@ -540,6 +540,14 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
             log(f"⚠️  {exc} -- skipping BUY")
             return {"status": "skipped", "reason": "invalid_order_parameters", "detail": str(exc)}
     else:
+        if not symbol.upper().endswith("/USD"):
+            log(f"⚠️  crypto BUY {symbol} is not USD-quoted -- skipping")
+            return {
+                "status": "skipped",
+                "reason": "non_usd_crypto_pair",
+                "detail": f"crypto BUY {symbol} is not quoted in USD",
+            }
+
         # Alpaca rejects a crypto notional with more than 2 decimal places (code 42210000); the
         # BTCUSD failure came from a `budget` value with more precision than that (e.g. a
         # merged position's market_value), so round before submitting rather than trusting the

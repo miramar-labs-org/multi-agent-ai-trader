@@ -29,6 +29,10 @@ def _alpaca_headers() -> dict:
     }
 
 
+def _is_usd_crypto_pair(symbol: str) -> bool:
+    return symbol.upper().endswith("/USD")
+
+
 def fetch_screener_candidates(top_n: int, min_price: float = 0.0) -> list[dict]:
     # Screener endpoints aren't wrapped by alpaca-py yet, so this hits the REST API directly.
     endpoints = [
@@ -111,11 +115,13 @@ def fetch_crypto_candidates(top_n: int) -> list[dict]:
                     symbol = item.get("symbol")
                     if not symbol:
                         continue
+                    if not _is_usd_crypto_pair(symbol):
+                        continue
                     entry = by_symbol.setdefault(symbol, {"symbol": symbol})
                     if "change" in item or "percent_change" in item:
                         entry["change_pct"] = item.get("percent_change", item.get("change"))
 
-    candidates = list(by_symbol.values())
+    candidates = [c for c in by_symbol.values() if _is_usd_crypto_pair(c["symbol"])]
     log(f"📈 fetched {len(candidates)} crypto screener candidates")
     return candidates
 

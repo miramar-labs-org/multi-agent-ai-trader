@@ -368,6 +368,20 @@ def test_crypto_buy_executes_at_exactly_the_minimum_notional(monkeypatch):
     assert fake_client.submitted[0].notional == execution.MIN_CRYPTO_NOTIONAL
 
 
+def test_crypto_buy_skips_non_usd_quoted_pair(monkeypatch):
+    """Regression for live SHIB/USDT BUY errors: Alpaca paper accounts are funded in USD, so
+    submitting a USDT-quoted pair makes Alpaca reject the order for insufficient USDT balance.
+    Floor Broker must skip that stale portfolio entry before it reaches Alpaca."""
+    fake_client = FakeTradingClient()
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    result = execution.buy("SHIB/USDT", "binance", 100.0, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "non_usd_crypto_pair"
+    assert fake_client.submitted == []
+
+
 def test_buy_reraises_on_unrelated_api_error(monkeypatch):
     """buy()'s retry is specific to the base_price mismatch (code 42210000 with a base_price
     field) -- any other rejection must propagate, not be silently retried/swallowed."""

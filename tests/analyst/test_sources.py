@@ -90,6 +90,32 @@ def test_fetch_screener_candidates_defaults_to_no_price_filtering():
     assert sources.fetch_screener_candidates.__defaults__ == (0.0,)
 
 
+def test_fetch_crypto_candidates_keeps_only_usd_quoted_pairs(monkeypatch):
+    """Alpaca paper accounts are USD-funded. A live SHIB/USDT pick repeatedly failed at BUY time
+    because Alpaca tried to spend USDT, so crypto screener movers must not introduce non-USD
+    quote pairs into the tradeable universe."""
+
+    def fake_get(url, headers=None, timeout=None):
+        return FakeResponse(
+            {
+                "gainers": [
+                    {"symbol": "SHIB/USDT", "percent_change": 12.3},
+                    {"symbol": "DOGE/USD", "percent_change": 5.0},
+                ],
+                "losers": [{"symbol": "PEPE/USDT", "percent_change": -4.2}],
+            }
+        )
+
+    monkeypatch.setattr(sources.requests, "get", fake_get)
+
+    symbols = {c["symbol"] for c in sources.fetch_crypto_candidates(top_n=20)}
+
+    assert "SHIB/USDT" not in symbols
+    assert "PEPE/USDT" not in symbols
+    assert "DOGE/USD" in symbols
+    assert {"BTC/USD", "ETH/USD", "SOL/USD"}.issubset(symbols)
+
+
 def test_fetch_earnings_calendar_returns_symbols_in_blackout_window(monkeypatch):
     """Report date is computed relative to `datetime.now()`, matching what the production code
     itself uses to build its from/to window, so this test never goes stale."""
