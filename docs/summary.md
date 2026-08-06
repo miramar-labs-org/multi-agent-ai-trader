@@ -17,6 +17,22 @@ A fourth program sends a plain-English recap to Slack at the end of the day.
 Nothing here trades with real money. It's paper trading only, and that's not a setting anyone
 can flip — it's built in.
 
+## New features
+
+A running log of config-gated capabilities as they're added, newest first. "Status" reflects
+`config.yaml` as of the date shown — check there for the current live value. Updated every time
+a new feature ships.
+
+| Date | Feature | Summary | Status |
+|---|---|---|---|
+| 2026-08-05 | Earnings blackout | Drops a screener candidate from the watchlist if it's about to report earnings or just did, avoiding the price swings those reports can cause. | On |
+| 2026-08-05 | Macro-event blackout | Pauses new buys for the whole day on FOMC/CPI/jobs-report/PCE dates and quarterly "quad witching" days, when the whole market can move sharply. Selling is never paused. | On |
+| 2026-08-05 | Conditional EOD flatten | End-of-day flatten only closes everything out if today's overall unrealized P&L is break-even or better; on a down day it holds positions overnight instead (except any held too long). | Off |
+| 2026-08-05 | Midday Analyst run | A second watchlist-building run around midday, to catch stocks that moved after the morning run already happened. | On |
+| 2026-08-05 | Optional end-of-day flatten ("day trading mode") | Closes out open stock positions a few minutes before market close instead of holding them overnight. | On |
+| 2026-08-04 | Live position P&L snapshot | Gives the Analyst a live read of unrealized profit/loss on everything currently held, as one more input to its picks. | On |
+| 2026-08-04 | Track-record feedback loop | Lets the Analyst read back its own recent picks and how they turned out, so it can notice patterns instead of judging each day in isolation. | On |
+
 ## The four workers
 
 Think of this as a small trading floor with four roles, each running independently so a
