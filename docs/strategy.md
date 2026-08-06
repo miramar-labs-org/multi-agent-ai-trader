@@ -293,6 +293,22 @@ Both remain off by default pending real-world verification: `earnings_blackout` 
 real FOMC/CPI/NFP/PCE dates from federalreserve.gov/bls.gov/bea.gov before either is flipped on in
 production. See `docs/ROADMAP.md` P1.13 and `docs/architecture.md` for implementation details.
 
+**Update, later the same day**: attempted to flip both on. `earnings_blackout` stayed off at
+first — a direct `curl` against Finnhub's `/calendar/earnings` endpoint with the key from the
+DGX's local `secrets.zsh` returned `{"error": "Invalid API key"}`. Turned out that key was a
+Financial Modeling Prep key mistakenly copied instead of a Finnhub one — confirmed by testing it
+against all three Finnhub auth conventions (`?token=`, `?apikey=`, `X-Finnhub-Token` header, all
+rejected) and then against FMP's own `/stable/profile` endpoint (succeeded). A real Finnhub key
+was generated, added to `secrets.zsh` and the `mlabs-api-keys` k8s secret, and verified with a
+live market-wide `/calendar/earnings` call (HTTP 200, 1500 entries for a one-week window) before
+flipping `earnings_blackout.enabled: true`. `macro_blackout.enabled` was flipped to `true` —
+its placeholder dates were replaced with 18 real FOMC/CPI/NFP/PCE dates for the rest of 2026,
+sourced from federalreserve.gov, bls.gov, and bea.gov (bls.gov's own pages 403'd a direct fetch;
+worked around via a raw-content extraction fallback). Since the list is static and won't
+self-extend into 2027, a persistent memory note (next-refresh reminder, due ~2026-11-15) was
+recorded to re-run the sourcing process rather than having the live app scrape government
+calendar pages at runtime — see `docs/ROADMAP.md` P1.13.
+
 ---
 *This file is a live scratchpad for the strategy conversation, updated as the discussion
 progresses. Reflected in `docs/ROADMAP.md` (P0.4/P0.6/P1.8/P1.10/P1.11/P1.13) and

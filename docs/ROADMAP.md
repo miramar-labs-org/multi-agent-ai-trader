@@ -995,11 +995,19 @@ config.yaml entry, since it can't drift or need quarterly upkeep). Whole-trading
 — a listed date pauses new BUY entries for the entire day. SELL/HOLD and `eod_flatten` are never
 affected, only new BUY entries.
 
-Both ship off by default, same config-only-toggle story as `eod_flatten.enabled` — no rebuild/
-redeploy needed to flip either flag. `earnings_blackout.enabled: true` additionally requires a
-real `FINNHUB_API_KEY` in the `mlabs-api-keys` secret, and `macro_blackout`'s placeholder dates
-must be replaced with real FOMC (federalreserve.gov) / CPI+NFP+PCE (bls.gov, bea.gov) dates
-before that flag is ever flipped on.
+Both shipped off by default, same config-only-toggle story as `eod_flatten.enabled` — no rebuild/
+redeploy needed to flip either flag. Both were flipped to `true` on 2026-08-05.
+`earnings_blackout.enabled` required a real, working `FINNHUB_API_KEY` in the `mlabs-api-keys`
+secret — the key first tried during pre-enable verification turned out to be a Financial Modeling
+Prep key mistakenly copied instead of a Finnhub one (rejected by every Finnhub auth method:
+`?token=`, `?apikey=`, and the `X-Finnhub-Token` header); a real Finnhub key was generated and
+verified with a live `/calendar/earnings` call (HTTP 200, 1500 market-wide entries) before
+enabling. `macro_blackout.enabled` was flipped to `true` with its date list replaced by 18 real
+FOMC (federalreserve.gov) / CPI+NFP (bls.gov) / PCE (bea.gov) dates covering the remainder of
+2026 — see `config.yaml`'s `macro_blackout.dates` comment for the sourcing note and quarterly
+update reminder. The list does not self-extend past its last entry (`2026-12-23`); nothing
+auto-generates new dates, so it needs a manual refresh once 2027's schedules are published (quad
+witching days are the exception — those are computed in code, not listed, and need no upkeep).
 
 Tests: `tests/analyst/test_sources.py` (`fetch_earnings_calendar()` — blackout-window matching,
 fails soft on missing key/no symbols/request exception/non-200/429) and

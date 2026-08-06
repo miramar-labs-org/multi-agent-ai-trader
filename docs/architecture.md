@@ -736,11 +736,11 @@ isn't purely for human/skill consumption.
 | `eod_flatten` | `minutes_before_close` | how close (by Alpaca's live clock) to market close before `check_eod_flatten()` starts selling open stock positions (default 10) — crypto is 24/7 and untouched |
 | `eod_flatten` | `conditional` | when true, `check_eod_flatten()` only flattens everything if the aggregate unrealized P&L across open stock positions is >= 0; when negative, positions are held overnight instead except any past `max_days_held_loss`. When false (default), always flattens everything, same as pre-`conditional` behavior |
 | `eod_flatten` | `max_days_held_loss` | only consulted when `conditional: true` — a position held this many days or more is force-flattened regardless of the aggregate P&L sign, so a single loser can't ride indefinitely (default 5) |
-| `earnings_blackout` | `enabled` | feature gate for the earnings-date filter in `discover_candidates` (`src/analyst/graph.py`) — when false (default), the stock screener list is unfiltered by earnings dates and Finnhub is never called; requires `FINNHUB_API_KEY` |
+| `earnings_blackout` | `enabled` | feature gate for the earnings-date filter in `discover_candidates` (`src/analyst/graph.py`) — `true` as of 2026-08-05; when false, the stock screener list is unfiltered by earnings dates and Finnhub is never called; requires `FINNHUB_API_KEY` (verified working 2026-08-05) |
 | `earnings_blackout` | `days_before` | drop a screener candidate if it's reporting earnings within this many calendar days from today (default 2) — anticipation/IV-crush risk pre-report |
 | `earnings_blackout` | `days_after` | drop a screener candidate if it reported earnings within this many calendar days before today (default 1) — post-report gap risk, covers both BMO and AMC reporters without a week-long exclusion |
-| `macro_blackout` | `enabled` | feature gate for the macro-calendar check in `call_floor_broker` (`src/dealer/graph.py`) — when false (default), new BUY entries proceed as today; SELL/HOLD/`eod_flatten` are never affected regardless of this flag |
-| `macro_blackout` | `dates` | hand-maintained list of `{date, label}` scheduled macro releases (FOMC, CPI, NFP, PCE, PPI, ISM PMI, GDP, Fed Chair testimony, etc.) that can move the whole market — published months ahead by the Fed/BLS/Commerce Dept, so no API is needed; a listed date pauses new stock BUYs for the entire day. Quarterly quad witching days (3rd Friday of Mar/Jun/Sep/Dec) are auto-computed in code (`_is_quad_witching_day`) and always included when `enabled`, with no config entry needed |
+| `macro_blackout` | `enabled` | feature gate for the macro-calendar check in `call_floor_broker` (`src/dealer/graph.py`) — `true` as of 2026-08-05; when false, new BUY entries proceed as today; SELL/HOLD/`eod_flatten` are never affected regardless of this flag |
+| `macro_blackout` | `dates` | hand-maintained list of `{date, label}` scheduled macro releases (FOMC, CPI, NFP, PCE) that can move the whole market — published months ahead by the Fed/BLS/Commerce Dept, so no API is needed; a listed date pauses new stock BUYs for the entire day. Currently 18 real dates covering the rest of 2026 (sourced 2026-08-05); does not self-extend past its last entry, refreshed quarterly via a persistent memory reminder (next due ~2026-11-15) rather than a live lookup. Quarterly quad witching days (3rd Friday of Mar/Jun/Sep/Dec) are auto-computed in code (`_is_quad_witching_day`) and always included when `enabled`, with no config entry needed |
 | `eod_report` | `schedule` | informational copy of the CronJob's own `spec.schedule` — not templated, must be kept in sync manually |
 | `analyst` | `schedule` | informational copy of the CronJob's own `spec.schedule` — not templated, must be kept in sync manually |
 | `analyst` | `enable_midday_run` | feature gate for the optional `analyst-midday` CronJob (12:30pm ET) — when false (default), `main()` exits immediately on a midday-labeled run before `build_graph()` is called |
@@ -785,20 +785,25 @@ isn't purely for human/skill consumption.
     instead. `max_days_held_loss` caps how many days an individual losing position can be held
     this way before it's force-flattened regardless of the aggregate sign — backed by the new
     `position_opens` table (see [Persistence](#persistence)).
-- **Per-symbol earnings blackout** — `earnings_blackout.enabled` (default false); when on,
+- **Per-symbol earnings blackout** — `earnings_blackout.enabled: true` as of 2026-08-05; when on,
   `discover_candidates` drops any stock screener candidate reporting earnings within
   `earnings_blackout.days_before`/`days_after` calendar days of today (source: a single
-  market-wide Finnhub free-tier call, since Alpaca has no earnings-calendar data). Fails soft to
-  an unfiltered candidate list on any Finnhub error (missing key, network error, non-200, 429,
-  bad JSON) — a Finnhub outage never blocks or crashes the Analyst run. Crypto candidates are
-  never filtered (no earnings dates apply). Off by default, config-only toggle (no redeploy).
-- **Market-wide macro blackout** — `macro_blackout.enabled` (default false); when on,
+  market-wide Finnhub free-tier call, since Alpaca has no earnings-calendar data — verified live
+  with a real key on 2026-08-05, 1500 market-wide entries returned for a one-week window). Fails
+  soft to an unfiltered candidate list on any Finnhub error (missing key, network error, non-200,
+  429, bad JSON) — a Finnhub outage never blocks or crashes the Analyst run. Crypto candidates
+  are never filtered (no earnings dates apply). Config-only toggle (no redeploy).
+- **Market-wide macro blackout** — `macro_blackout.enabled: true` as of 2026-08-05; when on,
   `call_floor_broker` refuses any BUY signal locally (never forwarded to Floor Broker) on a day
-  matching either a hand-maintained `macro_blackout.dates` entry (FOMC, CPI, NFP, PCE, and other
-  scheduled market-wide releases) or an auto-computed quarterly quad witching day (3rd Friday of
-  March/June/September/December — the simultaneous expiration of stock options, index options,
-  and index futures). SELL/HOLD and `eod_flatten` are never affected — only new BUY entries pause.
-  Off by default, config-only toggle (no redeploy).
+  matching either a hand-maintained `macro_blackout.dates` entry (FOMC, CPI, NFP, PCE — 18 real
+  dates covering the rest of 2026, sourced from federalreserve.gov/bls.gov/bea.gov) or an
+  auto-computed quarterly quad witching day (3rd Friday of March/June/September/December — the
+  simultaneous expiration of stock options, index options, and index futures). SELL/HOLD and
+  `eod_flatten` are never affected — only new BUY entries pause. Config-only toggle (no
+  redeploy). The date list is static and does not self-extend past 2026 — a persistent memory
+  note (next refresh due ~2026-11-15) re-runs the sourcing process each quarter (see
+  `docs/ROADMAP.md`'s P1.13 entry) rather than the live app scraping government calendar pages
+  at runtime.
 - **TAAPI stays inside its rate limit** — Dealer fetches all of a symbol's indicators in one
   `/bulk` POST instead of one GET per indicator (up to 9 individual calls per symbol would blow
   through TAAPI's per-15s rate limit — even on the Pro plan — the moment two symbols overlapped),

@@ -200,13 +200,13 @@ its output reliably machine-usable.
 - **Indicator-service rate limits are respected** — indicator lookups are throttled so the
   system stays inside the third-party indicator provider's request-rate limit rather than
   risking getting throttled or blocked mid-day.
-- **Earnings blackout** (off by default) — when turned on, a stock due to report earnings in
-  the next couple of days, or that just reported, is left off the watchlist entirely, avoiding
-  the price swings those reports can cause.
-- **Macro-event blackout** (off by default) — when turned on, new buys pause for the whole day
-  on dates with a major scheduled economic release (Fed rate decisions, inflation/jobs reports,
-  and similar) or on quarterly "quad witching" days, when the whole market — not just one
-  stock — tends to move sharply. Selling out of existing positions is never paused by this.
+- **Earnings blackout** — a stock due to report earnings in the next couple of days, or that
+  just reported, is left off the watchlist entirely, avoiding the price swings those reports can
+  cause.
+- **Macro-event blackout** — new buys pause for the whole day on dates with a major scheduled
+  economic release (Fed rate decisions, inflation/jobs reports, and similar) or on quarterly
+  "quad witching" days, when the whole market — not just one stock — tends to move sharply.
+  Selling out of existing positions is never paused by this.
 
 ## What this system is not (yet)
 

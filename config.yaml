@@ -58,11 +58,11 @@ eod_flatten:
                            # force-flattened regardless of the aggregate P&L sign.
 
 earnings_blackout:
-  enabled: false   # feature gate: when false, discover_candidates() never calls Finnhub and the
-                   # stock screener list is unfiltered by earnings dates -- off by default, same
-                   # config-only-toggle story as eod_flatten.enabled. Requires FINNHUB_API_KEY in
-                   # the mlabs-api-keys secret. Toggling this is a config-only change -- no
-                   # rebuild/redeploy needed, see src/common/config.py.
+  enabled: true    # feature gate: when false, discover_candidates() never calls Finnhub and the
+                   # stock screener list is unfiltered by earnings dates -- same config-only-
+                   # toggle story as eod_flatten.enabled. Requires FINNHUB_API_KEY in the
+                   # mlabs-api-keys secret (verified working 2026-08-05). Toggling this is a
+                   # config-only change -- no rebuild/redeploy needed, see src/common/config.py.
   days_before: 2   # drop a screener candidate if it's reporting earnings within this many
                    # calendar days from today (anticipation/IV-crush risk pre-report)
   days_after: 1    # drop a screener candidate if it reported earnings within this many calendar
@@ -70,31 +70,58 @@ earnings_blackout:
                    # reporters without permanently excluding a symbol for a full week
 
 macro_blackout:
-  enabled: false   # feature gate: when false, call_floor_broker() never checks the macro
-                   # calendar and BUY entries proceed as today -- off by default. SELL/HOLD/
-                   # eod_flatten are never affected by this flag, only new BUY entries. Toggling
-                   # this is a config-only change -- no rebuild/redeploy needed. Quarterly quad
-                   # witching days (3rd Friday of Mar/Jun/Sep/Dec) are auto-detected in code
+  enabled: true    # feature gate: when false, call_floor_broker() never checks the macro
+                   # calendar and BUY entries proceed as today. SELL/HOLD/eod_flatten are never
+                   # affected by this flag, only new BUY entries. Toggling this is a config-only
+                   # change -- no rebuild/redeploy needed. Quarterly quad witching days (3rd
+                   # Friday of Mar/Jun/Sep/Dec) are auto-detected in code
                    # (src/dealer/graph.py:_is_quad_witching_day) and always included when this
                    # is enabled -- no config entry needed for those.
   dates:           # hand-maintained list of other major scheduled macro releases that can move
-                   # the whole market, not just individual stocks -- these are published by the
-                   # Fed/BLS/Commerce Dept months ahead, so no API is needed; update this list
-                   # quarterly. Whole-trading-day granularity -- a listed date pauses BUY entries
-                   # for the entire day, not just around the release hour. Candidates worth
-                   # tracking beyond the illustrative examples below: FOMC meeting minutes (3wk
-                   # after each decision), PPI, PCE (the Fed's preferred inflation gauge), ISM
-                   # Manufacturing/Services PMI, GDP (advance/preliminary/final), and the Fed
-                   # Chair's semiannual (Humphrey-Hawkins) testimony. Placeholder dates below
-                   # MUST be replaced with real dates from federalreserve.gov / bls.gov / bea.gov
-                   # before enabled is ever set to true.
-    - date: "2026-09-16"
-      label: "FOMC rate decision"
-    - date: "2026-09-11"
+                   # the whole market, not just individual stocks. Whole-trading-day granularity
+                   # -- a listed date pauses BUY entries for the entire day, not just around the
+                   # release hour. Sourced 2026-08-05 from federalreserve.gov (FOMC),
+                   # bls.gov/schedule (CPI, Employment Situation/NFP), and bea.gov/news/schedule
+                   # (Personal Income and Outlays/PCE) -- covers the remainder of 2026. Update
+                   # quarterly from those same three sites; also worth adding in a future pass:
+                   # FOMC meeting minutes (3wk after each decision), PPI, ISM Manufacturing/
+                   # Services PMI, GDP (advance/preliminary/final), and the Fed Chair's
+                   # semiannual (Humphrey-Hawkins) testimony.
+    - date: "2026-08-07"
+      label: "NFP / jobs report"
+    - date: "2026-08-12"
       label: "CPI release"
+    - date: "2026-08-26"
+      label: "PCE release"
     - date: "2026-09-04"
       label: "NFP / jobs report"
-    - date: "2026-09-26"
+    - date: "2026-09-11"
+      label: "CPI release"
+    - date: "2026-09-16"
+      label: "FOMC rate decision"
+    - date: "2026-09-30"
+      label: "PCE release"
+    - date: "2026-10-02"
+      label: "NFP / jobs report"
+    - date: "2026-10-14"
+      label: "CPI release"
+    - date: "2026-10-28"
+      label: "FOMC rate decision"
+    - date: "2026-10-29"
+      label: "PCE release"
+    - date: "2026-11-06"
+      label: "NFP / jobs report"
+    - date: "2026-11-10"
+      label: "CPI release"
+    - date: "2026-11-25"
+      label: "PCE release"
+    - date: "2026-12-04"
+      label: "NFP / jobs report"
+    - date: "2026-12-09"
+      label: "FOMC rate decision"
+    - date: "2026-12-10"
+      label: "CPI release"
+    - date: "2026-12-23"
       label: "PCE release"
 
 eod_report:
