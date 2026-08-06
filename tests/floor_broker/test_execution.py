@@ -177,11 +177,26 @@ def test_bracket_buy_uses_a_single_quote_for_qty_and_prices(monkeypatch):
 
 
 def test_bracket_buy_raises_on_zero_price_quote(monkeypatch):
-    """P0.9: a zero-price quote must not produce an order."""
+    """A zero-price quote means Alpaca has no executable ask; it must not be reported as an
+    invalid order-parameter bug."""
     monkeypatch.setattr(execution, "get_current_ask_price", lambda symbol: 0.0)
 
-    with pytest.raises(execution.InvalidOrderParameters):
+    with pytest.raises(execution.NoAskQuote):
         execution.bracket_buy_with_SLTP("MGN", budget=5000.0, slP=0.98, tpP=1.05)
+
+
+def test_buy_skips_with_no_ask_quote_reason_when_quote_is_zero(monkeypatch):
+    """Regression for live TDCL Slack BUY noise: Alpaca returned ask_price=0.0, which used to be
+    surfaced as invalid_order_parameters. It should be a clean no-quote skip instead."""
+    fake_client = FakeTradingClient()
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+    monkeypatch.setattr(execution, "get_current_ask_price", lambda symbol: 0.0)
+
+    result = execution.buy("TDCL", "stocks", 5000.0, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "no_ask_quote"
+    assert fake_client.submitted == []
 
 
 def test_bracket_buy_raises_when_stop_loss_goes_non_positive(monkeypatch):

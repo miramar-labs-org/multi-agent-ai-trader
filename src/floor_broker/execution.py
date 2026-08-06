@@ -39,6 +39,11 @@ class InsufficientQuantity(InvalidOrderParameters):
     share at the reference price -- not a bug, just too little budget for the current price, so
     buy() turns this into a normal status="skipped" outcome rather than propagating."""
 
+
+class NoAskQuote(Exception):
+    """Raised when Alpaca has no executable ask for a symbol. This is a market-data/no-liquidity
+    condition, not a malformed order parameter."""
+
 # Tracks the parent order id of each open bracket BUY, keyed by symbol, so the fill-watcher
 # (check_bracket_fills) can later find out which of its TP/SL legs eventually filled. Value is
 # either a plain order-id string (the normal case) or, once a poll has hit a transient error for
@@ -402,6 +407,8 @@ def bracket_buy_with_SLTP(
     # fresh client-side quote, which can diverge from Alpaca's reference on thin, low-priced
     # symbols (e.g. our free-tier IEX-only feed missing the true NBBO).
     ask = base_price if base_price is not None else get_current_ask_price(symbol)
+    if ask <= 0:
+        raise NoAskQuote(f"no executable ask quote for {symbol}: {ask}")
 
     # Alpaca also enforces an absolute $0.01 minimum distance between TP/SL and base_price,
     # regardless of stock price -- on sub-~$0.50 stocks, slP/tpP's percentage move (e.g. 2%/5%)
@@ -519,6 +526,9 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
     if exchange == "stocks":
         try:
             req = bracket_buy_with_SLTP(symbol, budget, slP, tpP)
+        except NoAskQuote as exc:
+            log(f"⚠️  {exc} -- skipping BUY")
+            return {"status": "skipped", "reason": "no_ask_quote", "detail": str(exc)}
         except InsufficientQuantity as exc:
             log(f"⚠️  {exc} -- skipping BUY")
             return {"status": "skipped", "reason": "insufficient_qty", "detail": str(exc)}
@@ -575,6 +585,9 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
         log(f"🔄  retrying BUY {symbol} priced off Alpaca's own base_price {base_price} ...")
         try:
             req = bracket_buy_with_SLTP(symbol, budget, slP, tpP, base_price=float(base_price))
+        except NoAskQuote as retry_exc:
+            log(f"⚠️  {retry_exc} -- skipping BUY on retry")
+            return {"status": "skipped", "reason": "no_ask_quote", "detail": str(retry_exc)}
         except InsufficientQuantity as retry_exc:
             log(f"⚠️  {retry_exc} -- skipping BUY on retry")
             return {"status": "skipped", "reason": "insufficient_qty", "detail": str(retry_exc)}
