@@ -27,9 +27,9 @@ agents talk to each other):
                                                                 ▼
                                                         Alpaca paper account
 
-21:30 UTC CronJob (independent of the above)
+13:30-16:30 ET :30 checks (independent of the above)
 ┌─────────────┐
-│  EOD Report  │  reads Alpaca directly, posts a Slack recap
+│  EOD Report  │  reads Alpaca directly, posts once at close+30min
 └─────────────┘
 ```
 
@@ -223,10 +223,12 @@ kubectl patch configmap buy-kill-switch -n multi-agent-ai-trader --type merge -p
 
 ## EOD Report — read-only recap
 
-Entrypoint: `python -m src.eod_report.main`, `batch/v1 CronJob` `30 21 * * *`, runs daily
-(including weekends) so its own Alpaca-calendar check can post a "market was closed" notice
-rather than silently doing nothing. No dependency on the `portfolio` ConfigMap or on
-Dealer/Floor Broker — it reads Alpaca's account/positions/fills directly and formats a Slack
+Entrypoint: `python -m src.eod_report.main`, `batch/v1 CronJob` `30 13-16 * * *` with
+`timeZone: America/New_York`, runs daily (including weekends). Each run asks Alpaca for the
+official market close and sends exactly once when close+30min has passed, so normal close days
+report at 16:30 ET and 13:00 early closes report at 13:30 ET. Closed days post a "market was
+closed" notice rather than silently doing nothing. No dependency on the `portfolio` ConfigMap or
+on Dealer/Floor Broker — it reads Alpaca's account/positions/fills directly and formats a Slack
 summary via `src/common/eod.py`'s `fetch_fills()`/`summarize_positions()`.
 
 ## Shared code (`src/common/`)

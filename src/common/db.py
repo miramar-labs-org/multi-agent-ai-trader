@@ -48,6 +48,11 @@ CREATE TABLE IF NOT EXISTS position_opens (
     opened_at TIMESTAMPTZ NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS eod_report_runs (
+    report_date DATE PRIMARY KEY,
+    sent_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE INDEX IF NOT EXISTS idx_dealer_decisions_symbol_date ON dealer_decisions (symbol, decided_at);
 CREATE INDEX IF NOT EXISTS idx_floor_broker_events_symbol_date ON floor_broker_events (symbol, occurred_at);
 """
@@ -166,6 +171,36 @@ def record_position_closed(symbol: str) -> None:
             conn.execute("DELETE FROM position_opens WHERE symbol = %s", (symbol,))
     except Exception as exc:
         log(f"⚠️ record_position_closed failed: {exc}")
+
+
+def eod_report_already_sent(report_date: date) -> bool:
+    """Best-effort duplicate check. A DB outage must not prevent the Slack recap from posting."""
+    try:
+        _ensure_schema()
+        with _get_pool().connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("SELECT 1 FROM eod_report_runs WHERE report_date = %s", (report_date,))
+                return cur.fetchone() is not None
+    except Exception as exc:
+        log(f"⚠️ eod_report_already_sent failed: {exc}")
+        return False
+
+
+def record_eod_report_sent(report_date: date) -> None:
+    """Fire-and-forget marker -- never raises, so a DB outage can't block the EOD report."""
+    try:
+        _ensure_schema()
+        with _get_pool().connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO eod_report_runs (report_date)
+                VALUES (%s)
+                ON CONFLICT (report_date) DO NOTHING
+                """,
+                (report_date,),
+            )
+    except Exception as exc:
+        log(f"⚠️ record_eod_report_sent failed: {exc}")
 
 
 def fetch_position_opened_at(symbol: str) -> datetime | None:

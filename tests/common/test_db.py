@@ -129,6 +129,45 @@ def test_record_position_closed_deletes_expected_row(monkeypatch):
     assert params == ("MGN",)
 
 
+def test_record_eod_report_sent_inserts_expected_row(monkeypatch):
+    conn = FakeConnection()
+    _patch_pool(monkeypatch, conn)
+    report_date = date(2026, 8, 6)
+
+    db.record_eod_report_sent(report_date)
+
+    sql, params = conn.executed[0]
+    assert "INSERT INTO eod_report_runs" in sql
+    assert "ON CONFLICT (report_date) DO NOTHING" in sql
+    assert params == (report_date,)
+
+
+def test_eod_report_already_sent_returns_true_when_row_exists(monkeypatch):
+    conn = FakeConnection(rows=[{"?column?": 1}])
+    _patch_pool(monkeypatch, conn)
+
+    result = db.eod_report_already_sent(date(2026, 8, 6))
+
+    assert result is True
+
+
+def test_eod_report_already_sent_returns_false_when_no_row_exists(monkeypatch):
+    conn = FakeConnection(rows=[])
+    _patch_pool(monkeypatch, conn)
+
+    result = db.eod_report_already_sent(date(2026, 8, 6))
+
+    assert result is False
+
+
+def test_eod_report_already_sent_fails_open_on_db_error(monkeypatch):
+    monkeypatch.setattr(db, "_ensure_schema", lambda: (_ for _ in ()).throw(RuntimeError("db is down")))
+
+    result = db.eod_report_already_sent(date(2026, 8, 6))
+
+    assert result is False
+
+
 def test_fetch_position_opened_at_returns_timestamp_when_tracked(monkeypatch):
     opened_at = datetime(2026, 8, 1, 9, 30)
     conn = FakeConnection(rows=[{"opened_at": opened_at}])
@@ -156,6 +195,7 @@ def test_fetch_position_opened_at_returns_none_when_untracked(monkeypatch):
         (db.record_floor_broker_event, ("MGN", "error", "boom")),
         (db.record_position_opened, ("MGN",)),
         (db.record_position_closed, ("MGN",)),
+        (db.record_eod_report_sent, (date(2026, 8, 6),)),
     ],
 )
 def test_write_functions_swallow_exceptions(monkeypatch, record_fn, args):

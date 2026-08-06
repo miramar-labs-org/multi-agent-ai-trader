@@ -51,10 +51,10 @@ close and posts a summary to Slack — it has no dependency on the ConfigMap or 
 Broker's HTTP hop:
 
 ```
-                     17:30 America/New_York daily (k8s CronJob)
+               13:30-16:30 America/New_York :30 checks (k8s CronJob)
                          ┌─────────────────────────┐
                          │       EOD Report        │
-                         │ account + fills → Slack │
+                         │ close+30 → Slack recap  │
                          └─────────────────────────┘
 ```
 
@@ -495,16 +495,18 @@ never double-sells.
 
 ## EOD Report (`src/eod_report/`)
 
-**Workload:** `batch/v1 CronJob`, schedule `30 17 * * *` with `timeZone: America/New_York`
-(17:30 ET **daily** — ~90min after the 4pm ET close), `concurrencyPolicy: Forbid`,
-`backoffLimit: 1`. No ServiceAccount —
+**Workload:** `batch/v1 CronJob`, schedule `30 13-16 * * *` with
+`timeZone: America/New_York` (daily :30 checks from 13:30 through 16:30 ET), `concurrencyPolicy:
+Forbid`, `backoffLimit: 1`. No ServiceAccount —
 unlike Floor Broker (which has one, scoped to reading the kill-switch ConfigMap — see below), EOD
 Report never touches the k8s API at all. Entrypoint: `python -m src.eod_report.main`. The
-schedule runs every day rather than `1-5` (Mon-Fri) specifically so `main()`'s own
-Alpaca-calendar check (below) gets a chance to fire and post a Slack notice on weekends/holidays
-— previously the cron schedule itself silently excluded weekends, and a weekday holiday made
-`main()` log locally and return with no Slack post at all, so a closed market was
-indistinguishable from the CronJob never running.
+schedule checks several possible close+30min slots and `main()` sends only once after Alpaca's
+official close has passed by 30 minutes: normal 16:00 closes report at 16:30 ET, while 13:00
+early closes report at 13:30 ET. The schedule runs every day rather than `1-5` (Mon-Fri)
+specifically so `main()`'s own Alpaca-calendar check (below) gets a chance to fire and post a
+Slack notice on weekends/holidays — previously the cron schedule itself silently excluded
+weekends, and a weekday holiday made `main()` log locally and return with no Slack post at all,
+so a closed market was indistinguishable from the CronJob never running.
 
 **Purpose:** once a day after market close, post a plain-language summary of the day — account
 equity/cash/P&L and every fill across all three trading agents — to `#miramar-trading-floor`. It
@@ -512,15 +514,22 @@ makes no trading decisions (no LLM, no LangGraph); it only reads state that alre
 Alpaca.
 
 **Logic** (`src/eod_report/main.py`):
-1. Checks `trading_client.get_calendar()` for today's date (Eastern) — if today wasn't a trading
-   day (weekend or market holiday), it posts `slack.notify_market_closed("EOD", ...)` and exits
-   without the rest of the report, so a closed market is always visibly reported, not silent.
-2. `trading_client.get_account()` — equity, cash, buying power, and `last_equity` (prior close)
+1. Checks Postgres' best-effort `eod_report_runs` marker for today's date. If already sent,
+   exits before touching Alpaca; if Postgres is unavailable, it fails open so Slack is not
+   blocked.
+2. Checks `trading_client.get_calendar()` for today's date (Eastern) — if today wasn't a trading
+   day (weekend or market holiday), it posts `slack.notify_market_closed("EOD", ...)`, records
+   the best-effort run marker, and exits without the rest of the report, so a closed market is
+   always visibly reported, not silent.
+3. If today is a trading day but the official close+30min has not passed yet, exits silently so
+   an earlier check slot does not post prematurely.
+4. `trading_client.get_account()` — equity, cash, buying power, and `last_equity` (prior close)
    to compute the day's P&L.
-3. `trading_client.get_all_positions()` — current open positions and their unrealized P&L.
-4. `src.common.eod.fetch_fills(today)` — a raw REST call under the hood (no dedicated `alpaca-py`
+5. `trading_client.get_all_positions()` — current open positions and their unrealized P&L.
+6. `src.common.eod.fetch_fills(today)` — a raw REST call under the hood (no dedicated `alpaca-py`
    method exists for `/account/activities`) for every fill executed that day, across all assets.
-5. `slack.notify_eod_report(...)` formats and posts all of the above as one message.
+7. `slack.notify_eod_report(...)` formats and posts all of the above as one message, then records
+   the best-effort run marker to prevent later check slots from duplicating it.
 
 Errors call `slack.notify_error("EOD", ...)` before re-raising, same convention as the other
 three components.
@@ -711,7 +720,8 @@ isn't purely for human/skill consumption.
 7. Repeat step 3 until market close; the cycle restarts fresh at 08:55 America/New_York the next day using
    whatever portfolio the Analyst produces (or the prior day's, if the Analyst hasn't run yet
    or failed — the Dealer has no fallback logic here, it just reads whatever ConfigMap exists).
-8. **17:30 America/New_York daily** — independently of the above cycle, the EOD Report CronJob
+8. **13:30-16:30 America/New_York daily, at :30** — independently of the above cycle, the EOD
+   Report CronJob checks Alpaca's official close and posts once when close+30min has passed. It
    queries Alpaca directly for the day's account state and fills, and posts a summary to Slack —
    or, on a weekend/holiday, posts a market-closed notice instead and skips the rest of the report.
 
@@ -741,7 +751,7 @@ isn't purely for human/skill consumption.
 | `earnings_blackout` | `days_after` | drop a screener candidate if it reported earnings within this many calendar days before today (default 1) — post-report gap risk, covers both BMO and AMC reporters without a week-long exclusion |
 | `macro_blackout` | `enabled` | feature gate for the macro-calendar check in `call_floor_broker` (`src/dealer/graph.py`) — `true` as of 2026-08-05; when false, new BUY entries proceed as today; SELL/HOLD/`eod_flatten` are never affected regardless of this flag |
 | `macro_blackout` | `dates` | hand-maintained list of `{date, label}` scheduled macro releases (FOMC, CPI, NFP, PCE) that can move the whole market — published months ahead by the Fed/BLS/Commerce Dept, so no API is needed; a listed date pauses new stock BUYs for the entire day. Currently 18 real dates covering the rest of 2026 (sourced 2026-08-05); does not self-extend past its last entry, refreshed quarterly via a persistent memory reminder (next due ~2026-11-15) rather than a live lookup. Quarterly quad witching days (3rd Friday of Mar/Jun/Sep/Dec) are auto-computed in code (`_is_quad_witching_day`) and always included when `enabled`, with no config entry needed |
-| `eod_report` | `schedule` | informational copy of the CronJob's own `spec.schedule` — not templated, must be kept in sync manually |
+| `eod_report` | `schedule` | informational copy of the CronJob's own `spec.schedule` — daily check slots only; `src/eod_report/main.py` sends once at Alpaca official close+30min. Not templated, must be kept in sync manually |
 | `analyst` | `schedule` | informational copy of the CronJob's own `spec.schedule` — not templated, must be kept in sync manually |
 | `analyst` | `enable_midday_run` | feature gate for the optional `analyst-midday` CronJob (12:30pm ET) — when false (default), `main()` exits immediately on a midday-labeled run before `build_graph()` is called |
 | `analyst` | `midday_schedule` | informational copy of `k8s/analyst-midday-cronjob-k3s.yaml`'s own `spec.schedule` — not templated, must be kept in sync manually |

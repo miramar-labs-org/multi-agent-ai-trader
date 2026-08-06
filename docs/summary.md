@@ -143,7 +143,10 @@ actually did, not just what it decided.
 
 ### 4. The EOD Report — the daily recap
 
-Runs once a day after market close (9:30pm UTC, which covers the 4pm ET close year-round).
+Runs once a day 30 minutes after Alpaca's official market close. The CronJob checks several
+possible close times through the afternoon, then the report code sends exactly once when the
+real close+30min moment has passed — for example, 4:30pm Eastern on normal close days and
+1:30pm Eastern on 1pm early-close days.
 Makes no trading decisions at all — it just reads the account's current state and posts a
 plain-English summary to Slack: today's equity, cash, buying power, profit/loss versus
 yesterday's close, open positions and their unrealized P&L, and every fill that happened that

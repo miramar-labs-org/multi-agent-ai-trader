@@ -125,9 +125,10 @@ macro_blackout:
       label: "PCE release"
 
 eod_report:
-  schedule: "30 17 * * *"   # informational copy of the CronJob's own spec.schedule — 17:30 America/New_York
-                            # daily (spec.timeZone), ~90min after the 4pm ET close; runs every day so closed
-                            # days get a Slack notice, not silence
+  schedule: "30 13-16 * * *"   # informational copy of the CronJob's own spec.schedule — checks
+                               # hourly at :30 from 13:30 through 16:30 America/New_York. The
+                               # EOD code uses Alpaca's official close and posts once at close+30min.
+                               # Runs every day so closed days get one Slack notice, not silence.
 
 analyst:
   schedule: "55 8 * * *"      # informational copy of the CronJob's own spec.schedule — 08:55 America/New_York

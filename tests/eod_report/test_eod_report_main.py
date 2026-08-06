@@ -1,3 +1,7 @@
+from datetime import datetime, timedelta
+
+import pytz
+
 from src.common import eod
 from src.eod_report import main
 
@@ -52,29 +56,55 @@ def _silence_slack(monkeypatch):
     return calls
 
 
+def _today():
+    return datetime.now(pytz.timezone("US/Eastern")).date()
+
+
+def _close_at(hour: int, minute: int = 0):
+    eastern = pytz.timezone("US/Eastern")
+    return eastern.localize(datetime.combine(_today(), datetime.min.time()).replace(hour=hour, minute=minute))
+
+
+def _set_now(monkeypatch, dt):
+    monkeypatch.setattr(main, "_now_eastern", lambda: dt)
+
+
+def _not_sent(monkeypatch):
+    sent = []
+    monkeypatch.setattr(main.db, "eod_report_already_sent", lambda report_date: False)
+    monkeypatch.setattr(main.db, "record_eod_report_sent", lambda report_date: sent.append(report_date))
+    return sent
+
+
 def test_market_closed_posts_notification_and_skips_report(monkeypatch):
     """Regression: previously main() only logged locally on a closed market and returned -- a
     weekend/holiday CronJob run produced zero visible signal that anything happened at all."""
-    monkeypatch.setattr(main, "is_stock_market_open", lambda day: False)
+    monkeypatch.setattr(main, "get_stock_market_close", lambda day: None)
+    sent = _not_sent(monkeypatch)
     calls = _silence_slack(monkeypatch)
 
     main.main()
 
     assert "market_closed" in calls
     assert "eod_report" not in calls
+    assert sent == [_today()]
 
 
 def test_open_market_sends_full_eod_report(monkeypatch):
     fake_client = FakeTradingClient(activities=[])
     monkeypatch.setattr(main, "trading_client", fake_client)
     monkeypatch.setattr(eod, "trading_client", fake_client)
-    monkeypatch.setattr(main, "is_stock_market_open", lambda day: True)
+    close = _close_at(16)
+    _set_now(monkeypatch, close + timedelta(minutes=30))
+    monkeypatch.setattr(main, "get_stock_market_close", lambda day: close)
+    sent = _not_sent(monkeypatch)
     calls = _silence_slack(monkeypatch)
 
     main.main()
 
     assert "eod_report" in calls
     assert "market_closed" not in calls
+    assert sent == [_today()]
     args, _ = calls["eod_report"]
     _report_date, account_summary, fills, position_summaries = args
     assert account_summary["equity"] == 1050.0
@@ -92,6 +122,54 @@ def test_open_market_sends_full_eod_report(monkeypatch):
     ]
 
 
+def test_open_market_skips_until_thirty_minutes_after_close(monkeypatch):
+    close = _close_at(16)
+    _set_now(monkeypatch, close + timedelta(minutes=29))
+    monkeypatch.setattr(main, "get_stock_market_close", lambda day: close)
+    sent = _not_sent(monkeypatch)
+    calls = _silence_slack(monkeypatch)
+
+    main.main()
+
+    assert calls == {}
+    assert sent == []
+
+
+def test_eod_report_sends_at_early_close_plus_thirty(monkeypatch):
+    fake_client = FakeTradingClient(activities=[])
+    monkeypatch.setattr(main, "trading_client", fake_client)
+    monkeypatch.setattr(eod, "trading_client", fake_client)
+    close = _close_at(13)
+    _set_now(monkeypatch, close + timedelta(minutes=30))
+    monkeypatch.setattr(main, "get_stock_market_close", lambda day: close)
+    sent = _not_sent(monkeypatch)
+    calls = _silence_slack(monkeypatch)
+
+    main.main()
+
+    assert "eod_report" in calls
+    assert sent == [_today()]
+
+
+def test_eod_report_only_sends_once_per_day(monkeypatch):
+    monkeypatch.setattr(main.db, "eod_report_already_sent", lambda report_date: True)
+    monkeypatch.setattr(
+        main.db,
+        "record_eod_report_sent",
+        lambda report_date: (_ for _ in ()).throw(AssertionError("must not record twice")),
+    )
+    monkeypatch.setattr(
+        main,
+        "get_stock_market_close",
+        lambda day: (_ for _ in ()).throw(AssertionError("must not fetch calendar after sent")),
+    )
+    calls = _silence_slack(monkeypatch)
+
+    main.main()
+
+    assert calls == {}
+
+
 def test_alpaca_failure_notifies_error_and_reraises(monkeypatch):
     class FailingTradingClient(FakeTradingClient):
         def get_account(self):
@@ -99,7 +177,10 @@ def test_alpaca_failure_notifies_error_and_reraises(monkeypatch):
 
     fake_client = FailingTradingClient()
     monkeypatch.setattr(main, "trading_client", fake_client)
-    monkeypatch.setattr(main, "is_stock_market_open", lambda day: True)
+    close = _close_at(16)
+    _set_now(monkeypatch, close + timedelta(minutes=30))
+    monkeypatch.setattr(main, "get_stock_market_close", lambda day: close)
+    _not_sent(monkeypatch)
     calls = _silence_slack(monkeypatch)
 
     try:
