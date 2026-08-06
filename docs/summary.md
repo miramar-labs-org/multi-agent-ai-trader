@@ -5,7 +5,7 @@ jargon. It assumes you know trading concepts (RSI, MACD, bracket orders, stop-lo
 paper trading) but not programming. For the technical version, see
 [architecture.md](architecture.md).
 
-## The one-sentence version
+## The Executive Summary
 
 Every morning before the market opens, a program builds a short watchlist of stocks (and
 optionally crypto) worth trading that day. Then, every ten minutes while the market is open,
