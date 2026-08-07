@@ -15,16 +15,15 @@ def fetch_pl_summary() -> dict:
 
     base_value comes back None for an account with no equity snapshot yet at the requested start
     date -- observed right after an account reset, where Alpaca hasn't recorded any Jan-1-to-now
-    history for the new account state. Treat that as "no YTD history yet" (ytd_pl = 0.0, current
-    equity is its own baseline) rather than crashing."""
+    history for the new account state. In that case, fall back to today's known P&L rather than
+    showing a misleading $0.00 YTD."""
     account = trading_client.get_account()
     equity = float(account.equity)
-    today_pl = equity - float(account.last_equity)
+    today_pl = round(equity - float(account.last_equity), 2)
 
     year_start = date(date.today().year, 1, 1)
     history = trading_client.get_portfolio_history(GetPortfolioHistoryRequest(start=year_start, timeframe="1D"))
-    base_value = equity if history.base_value is None else float(history.base_value)
-    ytd_pl = equity - base_value
+    ytd_pl = today_pl if history.base_value is None else round(equity - float(history.base_value), 2)
 
     return {"equity": equity, "today_pl": today_pl, "ytd_pl": ytd_pl}
 
