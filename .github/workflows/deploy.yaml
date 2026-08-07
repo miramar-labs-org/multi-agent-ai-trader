@@ -1,8 +1,8 @@
 name: Deploy
 
 # Deploys the trading system (Analyst CronJob, Dealer Deployment,
-# Floor Broker Deployment+Service, EOD Report CronJob) to K3s on the DGX. CPU-only — no GPU node
-# handling, no cloud registry, no WIF.
+# Floor Broker Deployment+Service, EOD Report CronJob, Power Scheduler CronJob) to K3s on the
+# DGX. CPU-only — no GPU node handling, no cloud registry, no WIF.
 #
 # The mlabs-api-keys secret (broker/LLM API credentials) is NOT created here —
 # it must already exist in the namespace (see k8s/secrets.example.yaml).
@@ -109,6 +109,7 @@ jobs:
           echo "dealer=ghcr.io/miramar-labs-org/${PROJECT_NAME}-dealer:${TAG}" >> "$GITHUB_OUTPUT"
           echo "floor_broker=ghcr.io/miramar-labs-org/${PROJECT_NAME}-floor-broker:${TAG}" >> "$GITHUB_OUTPUT"
           echo "eod_report=ghcr.io/miramar-labs-org/${PROJECT_NAME}-eod-report:${TAG}" >> "$GITHUB_OUTPUT"
+          echo "power_scheduler=ghcr.io/miramar-labs-org/${PROJECT_NAME}-power-scheduler:${TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Substitute and apply k3s manifests
         run: |
@@ -116,6 +117,7 @@ jobs:
           DEALER_URI="${{ steps.images.outputs.dealer }}"
           FLOOR_BROKER_URI="${{ steps.images.outputs.floor_broker }}"
           EOD_REPORT_URI="${{ steps.images.outputs.eod_report }}"
+          POWER_SCHEDULER_URI="${{ steps.images.outputs.power_scheduler }}"
           if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
             COMMIT_SHA="${{ github.event.workflow_run.head_sha }}"
           else
@@ -128,13 +130,15 @@ jobs:
             k8s/dealer-deployment-k3s.yaml \
             k8s/floor-broker-deployment-k3s.yaml \
             k8s/floor-broker-service-k3s.yaml \
-            k8s/eod-report-cronjob-k3s.yaml
+            k8s/eod-report-cronjob-k3s.yaml \
+            k8s/power-scheduler-cronjob-k3s.yaml
           do
             echo "Applying ${MANIFEST}..."
             sed "s|GHCR_IMAGE_ANALYST_PLACEHOLDER|${ANALYST_URI}|g" "${MANIFEST}" \
               | sed "s|GHCR_IMAGE_DEALER_PLACEHOLDER|${DEALER_URI}|g" \
               | sed "s|GHCR_IMAGE_FLOOR_BROKER_PLACEHOLDER|${FLOOR_BROKER_URI}|g" \
               | sed "s|GHCR_IMAGE_EOD_REPORT_PLACEHOLDER|${EOD_REPORT_URI}|g" \
+              | sed "s|GHCR_IMAGE_POWER_SCHEDULER_PLACEHOLDER|${POWER_SCHEDULER_URI}|g" \
               | sed "s|DEPLOY_SHA_PLACEHOLDER|${COMMIT_SHA}|g" \
               | kubectl apply --validate=false -f -
           done
@@ -165,6 +169,7 @@ jobs:
             echo "| Dealer | \`${{ steps.images.outputs.dealer }}\` |"
             echo "| Floor Broker | \`${{ steps.images.outputs.floor_broker }}\` |"
             echo "| EOD Report | \`${{ steps.images.outputs.eod_report }}\` |"
+            echo "| Power Scheduler | \`${{ steps.images.outputs.power_scheduler }}\` |"
             echo ""
             echo "Namespace: \`$PROJECT_NAME\`"
           } >> "$GITHUB_STEP_SUMMARY"

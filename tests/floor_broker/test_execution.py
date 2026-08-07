@@ -948,6 +948,51 @@ def test_check_eod_flatten_conditional_force_flattens_a_position_past_the_days_h
     assert [req.symbol for req in fake_client.submitted] == ["MGN"]
 
 
+def test_flatten_all_crypto_sells_crypto_positions_and_skips_stock(monkeypatch):
+    fake_client = FakeEodFlattenTradingClient(
+        FakeClock(is_open=True),
+        [FakeEodPosition("BTC/USD", AssetClass.CRYPTO), FakeEodPosition("MGN", AssetClass.US_EQUITY)],
+    )
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    events = execution.flatten_all_crypto()
+
+    assert len(events) == 1
+    assert events[0]["symbol"] == "BTC/USD"
+    assert events[0]["reason"] == "power_down_flatten"
+    assert events[0]["sell_result"]["status"] == "submitted"
+    assert [req.symbol for req in fake_client.submitted] == ["BTC/USD"]
+
+
+def test_flatten_all_crypto_is_a_noop_with_no_open_crypto_positions(monkeypatch):
+    fake_client = FakeEodFlattenTradingClient(FakeClock(is_open=True), [FakeEodPosition("MGN", AssetClass.US_EQUITY)])
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    events = execution.flatten_all_crypto()
+
+    assert events == []
+    assert fake_client.submitted == []
+
+
+def test_flatten_all_crypto_excludes_a_skipped_sell_from_the_returned_events(monkeypatch):
+    fake_client = FakeEodFlattenTradingClient(FakeClock(is_open=True), [FakeEodPosition("BTC/USD", AssetClass.CRYPTO, qty="0")])
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    events = execution.flatten_all_crypto()
+
+    assert events == []
+    assert fake_client.submitted == []
+
+
+def test_flatten_all_crypto_uses_a_custom_reason(monkeypatch):
+    fake_client = FakeEodFlattenTradingClient(FakeClock(is_open=True), [FakeEodPosition("BTC/USD", AssetClass.CRYPTO)])
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    events = execution.flatten_all_crypto(reason="test_reason")
+
+    assert events[0]["reason"] == "test_reason"
+
+
 def test_check_bracket_fills_reports_take_profit_leg_filled(monkeypatch):
     execution._tracked_brackets["MGN"] = "parent-1"
     tp_leg = FakeLeg("tp-leg-1", OrderStatus.FILLED, OrderType.LIMIT, filled_avg_price="13.50", filled_qty="10")

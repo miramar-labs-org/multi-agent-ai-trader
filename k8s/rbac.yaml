@@ -33,3 +33,36 @@ roleRef:
   kind: Role
   name: multi-agent-ai-trader-configmap-reader
   apiGroup: rbac.authorization.k8s.io
+---
+# Dedicated to the Power Scheduler CronJob -- kept separate from the configmap-reader
+# ServiceAccount above rather than widening its scope, since scaling Deployments is a
+# different (and more sensitive) capability than reading/writing ConfigMaps.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: multi-agent-ai-trader-power-scheduler
+  namespace: multi-agent-ai-trader
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: multi-agent-ai-trader-power-scheduler
+  namespace: multi-agent-ai-trader
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/scale"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: multi-agent-ai-trader-power-scheduler
+  namespace: multi-agent-ai-trader
+subjects:
+  - kind: ServiceAccount
+    name: multi-agent-ai-trader-power-scheduler
+    namespace: multi-agent-ai-trader
+roleRef:
+  kind: Role
+  name: multi-agent-ai-trader-power-scheduler
+  apiGroup: rbac.authorization.k8s.io

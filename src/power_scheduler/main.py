@@ -1,0 +1,142 @@
+import time
+from datetime import datetime, timedelta
+
+import pytz
+import requests
+from alpaca.trading.enums import AssetClass
+from kubernetes import client as k8s_client
+from kubernetes import config as k8s_config
+
+from src.common import slack
+from src.common.alpaca_client import trading_client
+from src.common.config import load_config
+from src.common.logging import get_logger
+from src.common.market_calendar import get_stock_market_hours
+
+log = get_logger("POWER")
+
+NAMESPACE = "multi-agent-ai-trader"
+POLL_INTERVAL_S = 5
+CRYPTO_FLAT_TIMEOUT_S = 60
+FLOOR_BROKER_READY_TIMEOUT_S = 60
+
+
+def _now_eastern() -> datetime:
+    return datetime.now(pytz.timezone("US/Eastern"))
+
+
+def _target_replica_count(now: datetime, hours: tuple[datetime, datetime] | None, cfg) -> int:
+    """1 if `now` falls inside today's [open - minutes_before_open, close + minutes_after_close]
+    window, else 0 -- including when `hours` is None (today isn't a trading day at all)."""
+    if hours is None:
+        return 0
+    open_dt, close_dt = hours
+    window_start = open_dt - timedelta(minutes=cfg.power_schedule.minutes_before_open)
+    window_end = close_dt + timedelta(minutes=cfg.power_schedule.minutes_after_close)
+    return 1 if window_start <= now <= window_end else 0
+
+
+def _apps_v1():
+    k8s_config.load_incluster_config()
+    return k8s_client.AppsV1Api()
+
+
+def _get_replica_count(apps_v1, name: str) -> int:
+    deployment = apps_v1.read_namespaced_deployment(name, NAMESPACE)
+    return deployment.spec.replicas
+
+
+def _scale(apps_v1, name: str, replicas: int) -> None:
+    apps_v1.patch_namespaced_deployment_scale(name, NAMESPACE, {"spec": {"replicas": replicas}})
+    log(f"⚙️  scaled {name} to {replicas} replica(s)")
+
+
+def _wait_until_crypto_flat(timeout_s: int = CRYPTO_FLAT_TIMEOUT_S) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while True:
+        positions = [p for p in trading_client.get_all_positions() if p.asset_class == AssetClass.CRYPTO]
+        if not positions:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(POLL_INTERVAL_S)
+
+
+def _wait_until_floor_broker_ready(cfg, timeout_s: int = FLOOR_BROKER_READY_TIMEOUT_S) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            resp = requests.get(f"{cfg.floor_broker.base_url}/healthz", timeout=5)
+            if resp.status_code == 200:
+                return True
+        except requests.RequestException:
+            pass
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(POLL_INTERVAL_S)
+
+
+def _power_down(apps_v1, cfg) -> None:
+    """Dealer stops first (no state/positions, safe to kill immediately) so it can't fire a new
+    BUY mid-flatten. Floor Broker stays up until crypto is confirmed flat -- it's the only thing
+    enforcing crypto's synthetic stop-loss/take-profit, so scaling it to 0 with a position still
+    open would leave that position completely unprotected overnight."""
+    _scale(apps_v1, "dealer", 0)
+
+    events = []
+    if cfg.power_schedule.flatten_crypto_before_powerdown:
+        try:
+            resp = requests.post(f"{cfg.floor_broker.base_url}/flatten-crypto", timeout=30)
+            resp.raise_for_status()
+            events = resp.json().get("events", [])
+        except requests.RequestException as exc:
+            log(f"💥  flatten-crypto request failed: {exc}")
+            slack.notify_error("POWER", f"power-down aborted -- flatten-crypto request failed: {exc}")
+            return
+
+    if not _wait_until_crypto_flat():
+        log("💥  crypto positions still open after flatten timeout -- aborting power-down")
+        slack.notify_error("POWER", "power-down aborted -- crypto positions still open after flatten timeout")
+        return
+
+    _scale(apps_v1, "floor-broker", 0)
+    slack.notify_power_state("powered_down", f"{len(events)} crypto position(s) flattened first.")
+    log(f"✅ powered down ({len(events)} crypto position(s) flattened)")
+
+
+def _power_up(apps_v1, cfg) -> None:
+    _scale(apps_v1, "floor-broker", 1)
+    if not _wait_until_floor_broker_ready(cfg):
+        log("💥  floor-broker not ready after timeout -- dealer left at 0")
+        slack.notify_error("POWER", "power-up incomplete -- floor-broker not ready after timeout, dealer left at 0")
+        return
+
+    _scale(apps_v1, "dealer", 1)
+    slack.notify_power_state("powered_up", "")
+    log("✅ powered up")
+
+
+def main():
+    cfg = load_config()
+    if not cfg.power_schedule.enabled:
+        log("⏭️  power_schedule disabled")
+        return
+
+    now = _now_eastern()
+    hours = get_stock_market_hours(now.date())
+    target = _target_replica_count(now, hours, cfg)
+
+    apps_v1 = _apps_v1()
+    current = _get_replica_count(apps_v1, "floor-broker")
+    if current == target:
+        log(f"⏭️  no-op (current={current}, target={target})")
+        return
+
+    if target == 0:
+        _power_down(apps_v1, cfg)
+    else:
+        _power_up(apps_v1, cfg)
+
+
+if __name__ == "__main__":
+    main()

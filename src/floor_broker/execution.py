@@ -331,6 +331,21 @@ def check_eod_flatten() -> list[dict]:
     return events
 
 
+def flatten_all_crypto(reason: str = "power_down_flatten") -> list[dict]:
+    """Force-sells every open crypto position, no market-clock gating (crypto is 24/7). Used by
+    power_scheduler right before it scales floor-broker to 0 -- crypto's stop-loss/take-profit is
+    only enforced by this process's own check_crypto_stops() poll loop, so an open crypto position
+    left behind while the pod is scaled down would be completely unprotected overnight."""
+    positions = [p for p in trading_client.get_all_positions() if _is_crypto_position(p)]
+
+    events = []
+    for position in positions:
+        result = sell(position.symbol, reason=reason)
+        if result["status"] != "skipped":
+            events.append({"symbol": position.symbol, "reason": reason, "sell_result": result})
+    return events
+
+
 def is_state_reconciled() -> bool:
     with _state_lock:
         return _state_reconciled

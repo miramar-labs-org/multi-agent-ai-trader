@@ -65,14 +65,15 @@ multi-agent-ai-trader/
 ├── config.yaml                  # single source of config for all agents + EOD report -- fetched
 │                                  # live from GitHub at runtime (main branch), not baked into images
 ├── notebook.ipynb                # bare JupyterLab entry point (no pipeline logic — see below)
-├── Dockerfile.analyst/.dealer/.floor-broker/.eod-report
-├── k8s/                          # 3 CronJobs, 2 Deployments, 1 Service, RBAC, namespace, secrets doc
+├── Dockerfile.analyst/.dealer/.floor-broker/.eod-report/.power-scheduler
+├── k8s/                          # 4 CronJobs, 2 Deployments, 1 Service, RBAC, namespace, secrets doc
 └── src/
     ├── common/                   # shared: Alpaca clients, config loader, logger, portfolio I/O, Slack
     ├── analyst/                  # CronJob — picks the tradeable universe, posts the morning report
     ├── dealer/                   # Deployment — decides BUY/HOLD/SELL per symbol
     ├── floor_broker/             # Deployment+Service — executes orders on Alpaca
-    └── eod_report/                # CronJob — posts a daily account/trade summary to Slack
+    ├── eod_report/                # CronJob — posts a daily account/trade summary to Slack
+    └── power_scheduler/          # CronJob — scales dealer/floor-broker to 0 outside trading hours
 ```
 
 Each agent is its own Docker image and k8s workload — they scale, restart, and fail
@@ -534,6 +535,56 @@ Alpaca.
 Errors call `slack.notify_error("EOD", ...)` before re-raising, same convention as the other
 three components.
 
+## Power Scheduler (`src/power_scheduler/`)
+
+**Workload:** `batch/v1 CronJob`, schedule `*/15 * * * *` with `timeZone: America/New_York`,
+`concurrencyPolicy: Forbid`, `backoffLimit: 1`. Has its own ServiceAccount
+(`multi-agent-ai-trader-power-scheduler`), scoped only to `apps/deployments` (and its `/scale`
+subresource) `get`/`patch` in this namespace — deliberately kept separate from the
+configmap-reader ServiceAccount the other three components share, since scaling Deployments is a
+different (and more sensitive) capability than reading/writing ConfigMaps. Entrypoint: `python -m
+src.power_scheduler.main`.
+
+**Purpose:** scales the `dealer` and `floor-broker` Deployments to 0 replicas outside trading
+hours (plus a configurable buffer) to save the always-on inference/polling cost of a system that's
+only useful ~6.5 hours a day, and scales them back to 1 before the next session.
+
+**Logic** (`src/power_scheduler/main.py`), gated entirely by `power_schedule.enabled`
+(config-only toggle, no redeploy):
+1. `get_stock_market_hours(today)` — a single Alpaca calendar lookup for *today's own* entry
+   (not a "gap between two adjacent trading days" search, which incorrectly reports the system as
+   powered-down during a mid-session lookup on some edge cases). Returns `None` on a
+   weekend/holiday.
+2. `_target_replica_count()` — 0 if today isn't a trading day, or `now` falls outside
+   `[open - power_schedule.minutes_before_open, close + power_schedule.minutes_after_close]`;
+   else 1.
+3. Compares against the live replica count read straight from k8s (`floor-broker`'s Deployment
+   spec) — a no-op if they already match. No database state at all: because the target is a pure
+   function of the live calendar and clock, and the current state is read straight from k8s, this
+   design is self-healing. Every 15-minute tick re-derives and re-applies the correct state, so
+   e.g. a mid-day deploy resetting both Deployments back to `replicas: 1` (see the k3s manifests,
+   which hardcode `replicas: 1`) is corrected on the very next tick rather than requiring separate
+   bookkeeping to stay in sync.
+4. **Power-down order** (minimizes the window where Dealer could fire a new BUY mid-flatten):
+   scale `dealer` to 0 first (it holds no state/positions, safe to stop immediately); if
+   `power_schedule.flatten_crypto_before_powerdown` (default true), `POST
+   {floor_broker.base_url}/flatten-crypto` and poll Alpaca directly (read-only) for up to 60s for
+   zero open crypto positions; only once confirmed flat, scale `floor-broker` to 0 and
+   `slack.notify_power_state`. If crypto never flattens in time, abort loudly
+   (`slack.notify_error`) and leave `floor-broker` at 1 — the next tick retries the whole sequence
+   from scratch (idempotent: `execution.sell()` already no-ops on a zero-qty symbol).
+5. **Power-up order** (reverse, so Dealer's first poll never hits a not-yet-ready Floor Broker):
+   scale `floor-broker` to 1, poll its `/healthz` for up to 60s, then scale `dealer` to 1 and
+   `slack.notify_power_state`.
+
+**Why crypto needs special handling:** crypto trades 24/7, and its stop-loss/take-profit is
+*synthetic* — enforced only by Floor Broker's own `poll_bracket_fills` → `check_crypto_stops()`
+loop (Alpaca has no server-side bracket order support for crypto). Scaling Floor Broker to 0 with
+an open crypto position would leave it completely unprotected until the next power-up, hence the
+mandatory flatten-and-verify step above. Stock positions need no equivalent handling: `eod_flatten`
+(when enabled) already unconditionally flattens them near close, well before the power-down
+window arrives.
+
 ## Backtesting harness (`src/backtest/`)
 
 **Not a k8s workload** — a local CLI tool: `python -m src.backtest.main`. Runs deterministic
@@ -750,6 +801,10 @@ isn't purely for human/skill consumption.
 | `eod_flatten` | `minutes_before_close` | how close (by Alpaca's live clock) to market close before `check_eod_flatten()` starts selling open stock positions (default 10) — crypto is 24/7 and untouched |
 | `eod_flatten` | `conditional` | when true, `check_eod_flatten()` only flattens everything if the aggregate unrealized P&L across open stock positions is >= 0; when negative, positions are held overnight instead except any past `max_days_held_loss`. When false (default), always flattens everything, same as pre-`conditional` behavior |
 | `eod_flatten` | `max_days_held_loss` | only consulted when `conditional: true` — a position held this many days or more is force-flattened regardless of the aggregate P&L sign, so a single loser can't ride indefinitely (default 5) |
+| `power_schedule` | `enabled` | feature gate for `src/power_scheduler/main.py` — when false, it exits immediately every tick without touching k8s or Alpaca (default true) |
+| `power_schedule` | `minutes_after_close` | scale `dealer`/`floor-broker` to 0 replicas this many minutes after today's official market close (default 60) |
+| `power_schedule` | `minutes_before_open` | scale back to 1 replica this many minutes before the next trading day's official open (default 60) |
+| `power_schedule` | `flatten_crypto_before_powerdown` | when true (default), force-sells every open crypto position and verifies it's flat before scaling `floor-broker` down — crypto's stop-loss/take-profit is only enforced by that pod's own poll loop, so an open position would otherwise be unprotected while it's scaled to 0 |
 | `earnings_blackout` | `enabled` | feature gate for the earnings-date filter in `discover_candidates` (`src/analyst/graph.py`) — `true` as of 2026-08-05; when false, the stock screener list is unfiltered by earnings dates and Finnhub is never called; requires `FINNHUB_API_KEY` (verified working 2026-08-05) |
 | `earnings_blackout` | `days_before` | drop a screener candidate if it's reporting earnings within this many calendar days from today (default 2) — anticipation/IV-crush risk pre-report |
 | `earnings_blackout` | `days_after` | drop a screener candidate if it reported earnings within this many calendar days before today (default 1) — post-report gap risk, covers both BMO and AMC reporters without a week-long exclusion |
@@ -826,6 +881,14 @@ isn't purely for human/skill consumption.
 - **LangSmith trace volume is sampled** — `langsmith.sampling_rate` (0.5) keeps Dealer's
   poll-driven trace count under the free Developer plan's 5k traces/month allowance; set via
   `LANGSMITH_TRACING_SAMPLING_RATE`, wired centrally in `src/common/langsmith.py`.
+- **Nightly power-down/power-up** — `power_schedule.enabled` (default true); the Power Scheduler
+  CronJob scales `dealer`/`floor-broker` to 0 replicas ~1 hour (configurable) after market close
+  and back to 1 ~1 hour before the next open, to save compute overnight. Flattens all open crypto
+  positions and verifies they're actually flat before scaling Floor Broker down — crypto's
+  stop-loss/take-profit is synthetic and only enforced while Floor Broker is running, so an open
+  position at power-down would otherwise be unprotected overnight (see
+  [Power Scheduler](#power-scheduler-src_power_scheduler) for the full ordering and abort logic).
+  Config-only toggle (no redeploy).
 - **Deploys always force a rollout** — `deploy.yaml` always resolves images to the same
   `:latest` tag string, so `kubectl apply` alone would see no pod-template diff and silently
   leave Dealer/Floor Broker pods on stale code. The `dealer`/`floor-broker` k3s manifests carry

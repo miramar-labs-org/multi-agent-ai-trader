@@ -109,6 +109,13 @@ def notify_buy_kill_switch(active: bool) -> None:
         _post(f"✅ *Floor Broker* — BUY kill switch DEACTIVATED. BUY orders resumed. _{_timestamp()}_")
 
 
+def notify_power_state(action: str, detail: str) -> None:
+    if action == "powered_down":
+        _post(f"🌙 *Power Scheduler* — dealer/floor-broker scaled to 0. {detail} _{_timestamp()}_")
+    else:
+        _post(f"☀️ *Power Scheduler* — dealer/floor-broker scaled to 1. {detail} _{_timestamp()}_")
+
+
 def notify_error(component: str, text: str) -> None:
     _post(f"🚨 *ERROR [{component}]* {text} _{_timestamp()}_")
 

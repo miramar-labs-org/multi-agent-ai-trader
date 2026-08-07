@@ -82,6 +82,22 @@ eod_flatten:
                            # position can ride through consecutive DOWN days before being
                            # force-flattened regardless of the aggregate P&L sign.
 
+power_schedule:
+  enabled: true   # feature gate: when false, src/power_scheduler/main.py exits immediately every
+                   # tick without touching k8s or Alpaca -- config-only change, no redeploy needed.
+  minutes_after_close: 60    # scale dealer/floor-broker to 0 replicas this many minutes after
+                              # today's official market close (early closes handled correctly via
+                              # Alpaca's calendar, not a fixed 4pm assumption)
+  minutes_before_open: 60    # scale back to 1 replica this many minutes before the next trading
+                              # day's official open
+  flatten_crypto_before_powerdown: true   # crypto trades 24/7 and its stop-loss/take-profit is
+                                           # synthetic (Floor Broker's own poll loop, no Alpaca
+                                           # server-side bracket support for crypto) -- an open
+                                           # crypto position would be completely unprotected while
+                                           # floor-broker is scaled to 0, so it's force-sold first.
+                                           # Stocks need no equivalent flag: eod_flatten already
+                                           # unconditionally flattens them near close.
+
 earnings_blackout:
   enabled: true    # feature gate: when false, discover_candidates() never calls Finnhub and the
                    # stock screener list is unfiltered by earnings dates -- same config-only-

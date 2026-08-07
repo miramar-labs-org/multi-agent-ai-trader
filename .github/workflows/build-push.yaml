@@ -1,6 +1,6 @@
 name: Build and Push
 
-# Builds the service images (Analyst, Dealer, Floor Broker, EOD Report) and pushes
+# Builds the service images (Analyst, Dealer, Floor Broker, EOD Report, Power Scheduler) and pushes
 # them to GHCR. CPU-only, DGX self-hosted runner — no GPU node/registry logic.
 #
 # Auto-chains off "Test and Lint" (workflow_run) for every push to main that
@@ -41,6 +41,8 @@ jobs:
             dockerfile: Dockerfile.floor-broker
           - name: eod-report
             dockerfile: Dockerfile.eod-report
+          - name: power-scheduler
+            dockerfile: Dockerfile.power-scheduler
     steps:
       - uses: actions/checkout@v4
         with:

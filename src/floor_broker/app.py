@@ -75,6 +75,12 @@ class ExecuteResponse(BaseModel):
     tp_price: float | None = None
 
 
+class FlattenCryptoResponse(BaseModel):
+    status: Literal["ok", "error"]
+    events: list[dict] = Field(default_factory=list)
+    detail: str | None = None
+
+
 app = FastAPI()
 
 
@@ -97,4 +103,21 @@ def execute(req: ExecuteRequest):
     except Exception as exc:
         log(f"💥  unexpected error on {req.action} {req.symbol}: {exc}")
         slack.notify_error("FLOOR", f"unexpected error on {req.action} {req.symbol}: {exc}")
+        raise
+
+
+@app.post("/flatten-crypto", response_model=FlattenCryptoResponse)
+def flatten_crypto():
+    """Called by power_scheduler right before it scales this pod to 0 -- force-sells every open
+    crypto position since crypto's stop-loss/take-profit is only enforced by this process's own
+    poll loop (no Alpaca server-side bracket support for crypto)."""
+    try:
+        events = execution.flatten_all_crypto()
+        return FlattenCryptoResponse(status="ok", events=events)
+    except APIError as exc:
+        log(f"💥  flatten-crypto failed: {exc}")
+        return FlattenCryptoResponse(status="error", detail=str(exc))
+    except Exception as exc:
+        log(f"💥  unexpected error on flatten-crypto: {exc}")
+        slack.notify_error("FLOOR", f"unexpected error on flatten-crypto: {exc}")
         raise

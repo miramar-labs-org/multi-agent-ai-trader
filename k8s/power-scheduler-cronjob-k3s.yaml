@@ -1,0 +1,37 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: power-scheduler
+  namespace: multi-agent-ai-trader
+spec:
+  # Every 15 minutes, all day, every day -- main() is a pure reconcile (compares today's
+  # calendar-derived target replica count against the live count) so it self-heals any drift,
+  # e.g. a mid-day deploy resetting dealer/floor-broker back to 1 replica.
+  schedule: "*/15 * * * *"
+  timeZone: "America/New_York"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 1  # a failed reconcile should surface, not silently retry-storm
+      template:
+        metadata:
+          labels:
+            app: power-scheduler
+        spec:
+          serviceAccountName: multi-agent-ai-trader-power-scheduler
+          imagePullSecrets:
+            - name: ghcr-pull
+          restartPolicy: Never
+          containers:
+            - name: power-scheduler
+              image: GHCR_IMAGE_POWER_SCHEDULER_PLACEHOLDER
+              envFrom:
+                - secretRef:
+                    name: mlabs-api-keys
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: "256Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "512Mi"

@@ -139,6 +139,25 @@ def test_notify_buy_kill_switch_deactivated_mentions_resumed(monkeypatch):
     assert "resumed" in posted["text"]
 
 
+def test_notify_power_state_powered_down_mentions_scaled_to_zero(monkeypatch):
+    posted = {}
+    monkeypatch.setattr(slack, "_post", lambda text: posted.update(text=text))
+
+    slack.notify_power_state("powered_down", "2 crypto position(s) flattened first.")
+
+    assert "scaled to 0" in posted["text"]
+    assert "2 crypto position(s) flattened first." in posted["text"]
+
+
+def test_notify_power_state_powered_up_mentions_scaled_to_one(monkeypatch):
+    posted = {}
+    monkeypatch.setattr(slack, "_post", lambda text: posted.update(text=text))
+
+    slack.notify_power_state("powered_up", "")
+
+    assert "scaled to 1" in posted["text"]
+
+
 def test_notify_floor_broker_result_omits_extra_line_when_no_optional_fields_given(monkeypatch):
     posted = {}
     monkeypatch.setattr(slack, "_post", lambda text: posted.update(text=text))
