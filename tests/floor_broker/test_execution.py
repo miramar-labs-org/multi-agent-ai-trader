@@ -343,6 +343,17 @@ def test_crypto_buy_rounds_notional_to_2_decimal_places(monkeypatch):
     assert fake_client.submitted[0].notional == 123.46
 
 
+def test_crypto_buy_canonicalizes_live_alpaca_position_symbol_shape(monkeypatch):
+    fake_client = FakeTradingClient()
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    result = execution.buy("BTCUSD", "binance", 123.45, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "submitted"
+    assert fake_client.submitted[0].symbol == "BTC/USD"
+    assert execution._pending_fills["order-123"]["symbol"] == "BTC/USD"
+
+
 def test_crypto_buy_skips_notional_below_alpacas_minimum(monkeypatch):
     """A budget below Alpaca's crypto minimum notional (code 40310000, "cost basis must be >=
     minimal amount of order 10") must be skipped, not clamped up -- clamping would silently
@@ -718,6 +729,24 @@ def test_check_crypto_stops_keeps_tracking_symbol_on_transient_price_fetch_error
     assert execution._crypto_stops["BTC/USD"] == (98.0, 103.0)
 
 
+def test_check_crypto_stops_skips_sell_if_stop_changed_after_snapshot(monkeypatch):
+    execution._crypto_stops["BTC/USD"] = (98.0, 103.0)
+
+    def _bid_after_concurrent_update(symbol):
+        execution._crypto_stops["BTC/USD"] = (90.0, 110.0)
+        return 98.0
+
+    sells = []
+    monkeypatch.setattr(execution, "get_current_bid_price", _bid_after_concurrent_update)
+    monkeypatch.setattr(execution, "sell", lambda symbol, reason: sells.append((symbol, reason)))
+
+    events = execution.check_crypto_stops()
+
+    assert events == []
+    assert sells == []
+    assert execution._crypto_stops["BTC/USD"] == (90.0, 110.0)
+
+
 class FakeClock:
     def __init__(self, is_open, minutes_to_close=5):
         self.is_open = is_open
@@ -726,11 +755,21 @@ class FakeClock:
 
 
 class FakeEodPosition:
-    def __init__(self, symbol, asset_class, qty="1", unrealized_pl=None):
+    def __init__(
+        self,
+        symbol,
+        asset_class,
+        qty="1",
+        unrealized_pl=None,
+        avg_entry_price=None,
+        current_price=None,
+    ):
         self.symbol = symbol
         self.asset_class = asset_class
         self.qty = qty
         self.unrealized_pl = unrealized_pl
+        self.avg_entry_price = avg_entry_price
+        self.current_price = current_price
 
 
 class FakeEodFlattenTradingClient:
@@ -1314,6 +1353,27 @@ def test_reconcile_tracked_state_once_backfills_position_opens_for_open_position
     assert execution.reconcile_tracked_state_once() is True
 
     assert recorded == ["MGN", "BTC/USD"]
+
+
+def test_reconcile_tracked_state_once_rebuilds_crypto_stop_from_live_alpaca_position_symbol(monkeypatch):
+    positions = [FakeEodPosition("BTCUSD", AssetClass.CRYPTO, avg_entry_price="100.0")]
+    monkeypatch.setattr(execution, "trading_client", FakeReconstructTradingClient([], positions=positions))
+    monkeypatch.setattr(db, "record_position_opened", lambda symbol: None)
+
+    assert execution.reconcile_tracked_state_once() is True
+
+    assert execution._crypto_stops["BTC/USD"] == pytest.approx((98.0, 103.0))
+
+
+def test_reconcile_tracked_state_once_does_not_rebuild_crypto_stop_for_pending_buy(monkeypatch):
+    execution._pending_fills["order-1"] = {"symbol": "BTC/USD", "action": "BUY"}
+    positions = [FakeEodPosition("BTCUSD", AssetClass.CRYPTO, avg_entry_price="100.0")]
+    monkeypatch.setattr(execution, "trading_client", FakeReconstructTradingClient([], positions=positions))
+    monkeypatch.setattr(db, "record_position_opened", lambda symbol: None)
+
+    assert execution.reconcile_tracked_state_once() is True
+
+    assert execution._crypto_stops == {}
 
 
 def test_reconcile_tracked_state_once_backfill_failure_does_not_block_reconciliation(monkeypatch):

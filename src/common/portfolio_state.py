@@ -7,6 +7,7 @@ from kubernetes import config as k8s_config
 from kubernetes.client.exceptions import ApiException
 
 from src.common.alpaca_client import trading_client
+from src.common.symbols import canonical_crypto_symbol
 
 NAMESPACE = os.getenv("POD_NAMESPACE", "multi-agent-ai-trader")
 CONFIGMAP_NAME = "portfolio"
@@ -38,7 +39,11 @@ def merge_held_positions(portfolio: dict, cfg) -> dict:
     known = {entry["symbol"] for entry in symbols}
 
     for position in trading_client.get_all_positions():
-        if position.symbol in known:
+        symbol = position.symbol
+        if position.asset_class == AssetClass.CRYPTO:
+            symbol = canonical_crypto_symbol(position.symbol)
+
+        if symbol in known:
             continue
 
         if position.asset_class == AssetClass.US_EQUITY and cfg.trading.enable_stocks:
@@ -50,7 +55,7 @@ def merge_held_positions(portfolio: dict, cfg) -> dict:
 
         symbols.append(
             {
-                "symbol": position.symbol,
+                "symbol": symbol,
                 "exchange": exchange,
                 # A merged position's current market value is observed exposure, not authorized
                 # new-BUY capital -- passing it through as `budget` would let a large held

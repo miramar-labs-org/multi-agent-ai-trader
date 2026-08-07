@@ -1,7 +1,7 @@
 name: Deploy
 
-# Deploys the 3-service trading system (Analyst CronJob, Dealer Deployment,
-# Floor Broker Deployment+Service) to K3s on the DGX. CPU-only — no GPU node
+# Deploys the trading system (Analyst CronJob, Dealer Deployment,
+# Floor Broker Deployment+Service, EOD Report CronJob) to K3s on the DGX. CPU-only — no GPU node
 # handling, no cloud registry, no WIF.
 #
 # The mlabs-api-keys secret (broker/LLM API credentials) is NOT created here —
@@ -23,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Image tag to deploy for all 3 services"
+        description: "Image tag to deploy for all services"
         required: false
         default: latest
   workflow_run:

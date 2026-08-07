@@ -1,4 +1,5 @@
 import json
+import threading
 import time
 
 from alpaca.common.exceptions import APIError
@@ -15,6 +16,7 @@ from src.common import db, kill_switch
 from src.common.alpaca_client import get_current_ask_price, get_current_bid_price, trading_client
 from src.common.config import load_config
 from src.common.logging import get_logger
+from src.common.symbols import alpaca_order_symbol, canonical_crypto_symbol, is_usd_crypto_symbol
 
 log = get_logger("FLOOR")
 
@@ -73,6 +75,7 @@ _crypto_stops: dict[str, tuple[float, float]] = {}
 # Alpaca's live open-order state has been reconciled into _pending_fills/_tracked_brackets risks
 # losing track of it exactly like the restart gap this whole mechanism exists to close.
 _state_reconciled = False
+_state_lock = threading.RLock()
 
 
 def _is_order_not_found(exc: APIError) -> bool:
@@ -86,6 +89,82 @@ def _is_order_not_found(exc: APIError) -> bool:
         return False
 
 
+def _pending_fills_snapshot() -> list[tuple[str, dict]]:
+    with _state_lock:
+        return [(order_id, ctx.copy()) for order_id, ctx in _pending_fills.items()]
+
+
+def _tracked_brackets_snapshot() -> list[tuple[str, str | dict]]:
+    with _state_lock:
+        return [(symbol, entry.copy() if isinstance(entry, dict) else entry) for symbol, entry in _tracked_brackets.items()]
+
+
+def _crypto_stops_snapshot() -> list[tuple[str, tuple[float, float]]]:
+    with _state_lock:
+        return list(_crypto_stops.items())
+
+
+def _drop_pending_fill(order_id: str) -> None:
+    with _state_lock:
+        _pending_fills.pop(order_id, None)
+
+
+def _increment_pending_poll_failures(order_id: str) -> int:
+    with _state_lock:
+        ctx = _pending_fills.get(order_id)
+        if ctx is None:
+            return 0
+        ctx["poll_failures"] = ctx.get("poll_failures", 0) + 1
+        return ctx["poll_failures"]
+
+
+def _clear_pending_poll_failures(order_id: str) -> None:
+    with _state_lock:
+        ctx = _pending_fills.get(order_id)
+        if ctx is not None:
+            ctx.pop("poll_failures", None)
+
+
+def _track_crypto_stop(symbol: str, sl_price: float, tp_price: float) -> None:
+    with _state_lock:
+        _crypto_stops[symbol] = (sl_price, tp_price)
+
+
+def _drop_crypto_stop_if_current(symbol: str, sl_price: float, tp_price: float) -> bool:
+    with _state_lock:
+        if _crypto_stops.get(symbol) != (sl_price, tp_price):
+            return False
+        _crypto_stops.pop(symbol, None)
+        return True
+
+
+def _drop_tracked_bracket(symbol: str) -> None:
+    with _state_lock:
+        _tracked_brackets.pop(symbol, None)
+
+
+def _set_tracked_bracket(symbol: str, entry: str | dict) -> None:
+    with _state_lock:
+        _tracked_brackets[symbol] = entry
+
+
+def _bracket_poll_failures(symbol: str) -> int:
+    with _state_lock:
+        entry = _tracked_brackets.get(symbol)
+        return entry["poll_failures"] if isinstance(entry, dict) else 0
+
+
+def _set_pending_fill(order_id: str, ctx: dict) -> None:
+    with _state_lock:
+        _pending_fills[order_id] = ctx
+
+
+def _stop_tracking_symbol(symbol: str) -> None:
+    with _state_lock:
+        _tracked_brackets.pop(symbol, None)
+        _crypto_stops.pop(symbol, None)
+
+
 def check_pending_fills() -> list[dict]:
     """Polls every order buy()/sell() submitted for its own fill -- /execute now returns
     status="submitted" before this is known (ROADMAP P0.14), so this is the only place a
@@ -95,30 +174,33 @@ def check_pending_fills() -> list[dict]:
     would silently stop watching a live order. Only a confirmed 404 (the order genuinely no
     longer exists) removes it without a fill ever being observed."""
     events = []
-    for order_id, ctx in list(_pending_fills.items()):
+    for order_id, ctx in _pending_fills_snapshot():
         try:
             order = trading_client.get_order_by_id(order_id)
         except APIError as exc:
             if _is_order_not_found(exc):
                 log(f"⚠️  pending order {order_id} ({ctx['symbol']}) no longer exists on Alpaca -- dropping")
-                _pending_fills.pop(order_id, None)
+                _drop_pending_fill(order_id)
             else:
-                ctx["poll_failures"] = ctx.get("poll_failures", 0) + 1
-                log(f"💥  poll failure #{ctx['poll_failures']} for pending order {order_id} ({ctx['symbol']}): {exc}")
+                failures = _increment_pending_poll_failures(order_id)
+                log(f"💥  poll failure #{failures} for pending order {order_id} ({ctx['symbol']}): {exc}")
             continue
 
+        _clear_pending_poll_failures(order_id)
         ctx.pop("poll_failures", None)
 
         if order.filled_avg_price is not None:
             fill_price = float(order.filled_avg_price)
             if ctx.get("crypto_slP") is not None:
-                _crypto_stops[ctx["symbol"]] = (fill_price * ctx["crypto_slP"], fill_price * ctx["crypto_tpP"])
-                log(f"🎯  tracking synthetic stop/target for {ctx['symbol']}: {_crypto_stops[ctx['symbol']]}")
+                sl_price = fill_price * ctx["crypto_slP"]
+                tp_price = fill_price * ctx["crypto_tpP"]
+                _track_crypto_stop(ctx["symbol"], sl_price, tp_price)
+                log(f"🎯  tracking synthetic stop/target for {ctx['symbol']}: {(sl_price, tp_price)}")
             events.append({**ctx, "kind": "fill", "order_id": order_id, "fill_price": fill_price})
-            _pending_fills.pop(order_id, None)
+            _drop_pending_fill(order_id)
         elif order.status in _TERMINAL_NO_FILL:
             events.append({**ctx, "kind": "terminal", "order_id": order_id, "order_status": order.status.value})
-            _pending_fills.pop(order_id, None)
+            _drop_pending_fill(order_id)
 
     return events
 
@@ -131,17 +213,17 @@ def check_bracket_fills() -> list[dict]:
     Same transient-vs-terminal distinction as check_pending_fills: a non-404 APIError keeps the
     symbol tracked and just records the failure."""
     events = []
-    for symbol, entry in list(_tracked_brackets.items()):
+    for symbol, entry in _tracked_brackets_snapshot():
         order_id = entry["order_id"] if isinstance(entry, dict) else entry
         try:
             order = trading_client.get_order_by_id(order_id, filter=GetOrderByIdRequest(nested=True))
         except APIError as exc:
             if _is_order_not_found(exc):
                 log(f"⚠️  tracked bracket order {order_id} ({symbol}) no longer exists on Alpaca -- dropping")
-                _tracked_brackets.pop(symbol, None)
+                _drop_tracked_bracket(symbol)
             else:
                 failures = _bracket_poll_failures(symbol) + 1
-                _tracked_brackets[symbol] = {"order_id": order_id, "poll_failures": failures}
+                _set_tracked_bracket(symbol, {"order_id": order_id, "poll_failures": failures})
                 log(f"💥  poll failure #{failures} for tracked bracket {order_id} ({symbol}): {exc}")
             continue
 
@@ -158,7 +240,7 @@ def check_bracket_fills() -> list[dict]:
                     "qty": float(filled_leg.filled_qty) if filled_leg.filled_qty else None,
                 }
             )
-            _tracked_brackets.pop(symbol, None)
+            _drop_tracked_bracket(symbol)
         elif legs and all(leg.status in _TERMINAL_NO_FILL for leg in legs):
             events.append(
                 {
@@ -168,16 +250,11 @@ def check_bracket_fills() -> list[dict]:
                     "leg_statuses": [leg.status.value for leg in legs],
                 }
             )
-            _tracked_brackets.pop(symbol, None)
+            _drop_tracked_bracket(symbol)
         else:
-            _tracked_brackets[symbol] = order_id
+            _set_tracked_bracket(symbol, order_id)
 
     return events
-
-
-def _bracket_poll_failures(symbol: str) -> int:
-    entry = _tracked_brackets.get(symbol)
-    return entry["poll_failures"] if isinstance(entry, dict) else 0
 
 
 def check_crypto_stops() -> list[dict]:
@@ -185,7 +262,7 @@ def check_crypto_stops() -> list[dict]:
     bid (the price an immediate market SELL would realize). A transient price-fetch failure just
     skips that symbol this round -- it stays tracked and gets checked again on the next poll."""
     events = []
-    for symbol, (sl_price, tp_price) in list(_crypto_stops.items()):
+    for symbol, (sl_price, tp_price) in _crypto_stops_snapshot():
         try:
             bid = get_current_bid_price(symbol)
         except APIError as exc:
@@ -194,7 +271,8 @@ def check_crypto_stops() -> list[dict]:
 
         if bid <= sl_price or bid >= tp_price:
             reason = "stop_loss" if bid <= sl_price else "take_profit"
-            _crypto_stops.pop(symbol, None)
+            if not _drop_crypto_stop_if_current(symbol, sl_price, tp_price):
+                continue
             result = sell(symbol, reason=reason)
             events.append({"symbol": symbol, "reason": reason, "bid_price": bid, "sell_result": result})
 
@@ -254,7 +332,47 @@ def check_eod_flatten() -> list[dict]:
 
 
 def is_state_reconciled() -> bool:
-    return _state_reconciled
+    with _state_lock:
+        return _state_reconciled
+
+
+def _set_state_reconciled(value: bool) -> None:
+    global _state_reconciled
+    with _state_lock:
+        _state_reconciled = value
+
+
+def _is_crypto_position(position) -> bool:
+    return position.asset_class == AssetClass.CRYPTO
+
+
+def _crypto_reference_price(position) -> float | None:
+    for attr in ("avg_entry_price", "current_price"):
+        value = getattr(position, attr, None)
+        if value is not None:
+            return float(value)
+    return None
+
+
+def _rebuild_crypto_stops_from_positions(positions, cfg) -> int:
+    restored = 0
+    for position in positions:
+        if not _is_crypto_position(position):
+            continue
+        symbol = canonical_crypto_symbol(position.symbol)
+        reference_price = _crypto_reference_price(position)
+        if reference_price is None or reference_price <= 0:
+            log(f"⚠️  cannot reconstruct crypto stop/target for {symbol}: no usable reference price")
+            continue
+        with _state_lock:
+            has_pending_buy = any(
+                ctx.get("symbol") == symbol and ctx.get("action") == "BUY" for ctx in _pending_fills.values()
+            )
+            if symbol in _crypto_stops or has_pending_buy:
+                continue
+            _crypto_stops[symbol] = (reference_price * cfg.strategy.crypto_slP, reference_price * cfg.strategy.crypto_tpP)
+        restored += 1
+    return restored
 
 
 def reconcile_tracked_state_once() -> bool:
@@ -274,7 +392,6 @@ def reconcile_tracked_state_once() -> bool:
     the gap between the pod dying and this running is a separate, narrower gap this cannot close
     -- Alpaca no longer reports it as "open" once filled -- the trade itself is still correct at
     Alpaca, only its Slack fill notice is missed."""
-    global _state_reconciled
     try:
         open_orders = trading_client.get_orders(GetOrdersRequest(status="open", nested=True))
     except APIError as exc:
@@ -284,19 +401,20 @@ def reconcile_tracked_state_once() -> bool:
     restored_pending = 0
     restored_brackets = 0
     for order in open_orders:
+        symbol = canonical_crypto_symbol(order.symbol) if "/" in order.symbol or is_usd_crypto_symbol(order.symbol) else order.symbol
         legs = order.legs or []
         if legs:
             if any(leg.status not in _TERMINAL_NO_FILL for leg in legs):
-                _tracked_brackets[order.symbol] = order.id
+                _set_tracked_bracket(symbol, order.id)
                 restored_brackets += 1
         elif order.filled_avg_price is None and order.status not in _TERMINAL_NO_FILL:
-            _pending_fills[order.id] = {
-                "symbol": order.symbol,
+            _set_pending_fill(order.id, {
+                "symbol": symbol,
                 "action": "BUY" if order.side == OrderSide.BUY else "SELL",
                 "reason": "reconstructed_after_restart",
                 "sl_price": None,
                 "tp_price": None,
-            }
+            })
             restored_pending += 1
 
     log(f"🔄  reconstructed {restored_pending} pending order(s) and {restored_brackets} bracket(s) from Alpaca")
@@ -307,12 +425,21 @@ def reconcile_tracked_state_once() -> bool:
     # opened in a gap while the pod was down). Best-effort: a failure here must not block order
     # reconciliation, which is why it's wrapped separately from the get_orders() call above.
     try:
-        for position in trading_client.get_all_positions():
-            db.record_position_opened(position.symbol)
+        positions = trading_client.get_all_positions()
+        try:
+            crypto_stops_restored = _rebuild_crypto_stops_from_positions(positions, load_config())
+        except Exception as exc:
+            crypto_stops_restored = 0
+            log(f"💥  failed to reconstruct crypto stops while reconciling tracked state: {exc}")
+        for position in positions:
+            symbol = canonical_crypto_symbol(position.symbol) if _is_crypto_position(position) else position.symbol
+            db.record_position_opened(symbol)
+        if crypto_stops_restored:
+            log(f"🔄  reconstructed {crypto_stops_restored} crypto synthetic stop/target(s) from open positions")
     except APIError as exc:
         log(f"💥  failed to fetch open positions from Alpaca while backfilling position_opens: {exc}")
 
-    _state_reconciled = True
+    _set_state_reconciled(True)
     return True
 
 
@@ -340,12 +467,13 @@ def reconstruct_tracked_state(
 
 def _fetch_open_position(symbol: str):
     try:
-        return trading_client.get_open_position(symbol.replace("/", ""))
+        return trading_client.get_open_position(alpaca_order_symbol(symbol))
     except APIError:
         return None
 
 
 def get_open_position(symbol: str) -> float:
+    symbol = canonical_crypto_symbol(symbol) if "/" in symbol or is_usd_crypto_symbol(symbol) else symbol
     is_stock = symbol.find("/") == -1
     position = _fetch_open_position(symbol)
     if position is None:
@@ -438,34 +566,19 @@ def bracket_buy_with_SLTP(
     )
 
 
-def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> dict:
-    # A restart's tracked state isn't reconciled with Alpaca yet -- submitting a fresh BUY before
-    # that finishes risks the new order never being tracked if the pod dies again in the gap, so
-    # refuse rather than race reconcile_tracked_state_once()/poll_reconciliation() in main.py.
-    if not _state_reconciled:
+def _buy_preflight_skip(symbol: str, cfg) -> dict | None:
+    if not is_state_reconciled():
         log(f"🛑  BUY {symbol} rejected -- tracked state not yet reconciled with Alpaca")
-        # "skipped", not a distinct "rejected" status -- ExecuteResponse's status Literal
-        # (src/floor_broker/app.py) only permits executed/submitted/skipped/error, and every
-        # other "chose not to submit this BUY" outcome in this function already uses "skipped";
-        # the `reason` field is what actually distinguishes this case downstream.
         return {
             "status": "skipped",
             "reason": "state_not_reconciled",
             "detail": "tracked state not yet reconciled with Alpaca after restart",
         }
 
-    # ROADMAP P0.5: an operator-controlled runtime switch, checked fresh on every BUY (never
-    # cached) so a kubectl patch takes effect on the very next request without a redeploy. SELL
-    # is deliberately untouched -- the switch only ever blocks new exposure, never an exit.
     if kill_switch.buy_kill_switch_active():
         log(f"🛑  BUY kill switch active -- skipping BUY {symbol}")
         return {"status": "skipped", "reason": "buy_kill_switch_active", "detail": "BUY kill switch is active"}
 
-    # strategy.daily_profit_target_usd/daily_loss_limit_usd (set by /configure-strategy) -- Alpaca's
-    # own account.equity/last_equity already handles the trading-day boundary, so no custom
-    # bookkeeping is needed. Only blocks new BUYs (halt_behavior: block_new_buys); SELL is
-    # unaffected, same as the kill switch above.
-    cfg = load_config()  # fresh (within its own refresh window) so a live strategy change never needs a restart
     account = trading_client.get_account()
     daily_pnl = float(account.equity) - float(account.last_equity)
     if daily_pnl >= cfg.strategy.daily_profit_target_usd:
@@ -483,98 +596,82 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
             "detail": f"daily P&L ${daily_pnl:.2f} <= -limit ${cfg.strategy.daily_loss_limit_usd}",
         }
 
+    return None
+
+
+def _remaining_budget_or_skip(symbol: str, budget: float) -> tuple[float | None, dict | None]:
     position = _fetch_open_position(symbol)
+    if position is None:
+        return budget, None
 
-    oo = trading_client.get_orders(GetOrdersRequest(status="open"))
-    matching_orders = [order for order in oo if order.symbol == symbol]
+    if position.market_value is None:
+        log(f"⚠️  {symbol} existing position market_value unavailable - aborting BUY")
+        return None, {
+            "status": "skipped",
+            "reason": "market_value_unavailable",
+            "detail": "existing position market_value unavailable",
+        }
 
-    if matching_orders:
-        log(f"⚠️  open orders exist for {symbol} - aborting BUY")
-        return {"status": "skipped", "reason": "open_orders_exist", "detail": "open orders exist for symbol"}
+    existing_value = float(position.market_value)
+    if existing_value >= budget:
+        log(f"⚠️  {symbol} position (${existing_value:.2f}) already at/above budget (${budget:.2f}) - skipping BUY")
+        return None, {
+            "status": "skipped",
+            "reason": "budget_exhausted",
+            "detail": f"existing position value ${existing_value:.2f} >= budget ${budget:.2f}",
+        }
 
-    if position is not None:
-        # `budget` is the dollar amount authorized for this symbol, not a one-shot "open a fresh
-        # position" ticket -- a position sitting under its authorized budget should be allowed to
-        # grow toward it rather than getting permanently stuck at whatever the first fill landed on.
-        if position.market_value is None:
-            # Trading-money gate: fail closed on missing data, unlike the Analyst's informational
-            # P&L snapshot (summarize_positions()) which fails open -- can't safely compute
-            # remaining headroom without a market_value to subtract.
-            log(f"⚠️  {symbol} existing position market_value unavailable - aborting BUY")
-            return {
-                "status": "skipped",
-                "reason": "market_value_unavailable",
-                "detail": "existing position market_value unavailable",
-            }
+    remaining_budget = budget - existing_value
+    log(f"📈  {symbol} position (${existing_value:.2f}) below budget (${budget:.2f}) - topping up ${remaining_budget:.2f}")
+    return remaining_budget, None
 
-        existing_value = float(position.market_value)
-        if existing_value >= budget:
-            log(f"⚠️  {symbol} position (${existing_value:.2f}) already at/above budget (${budget:.2f}) - skipping BUY")
-            return {
-                "status": "skipped",
-                "reason": "budget_exhausted",
-                "detail": f"existing position value ${existing_value:.2f} >= budget ${budget:.2f}",
-            }
 
-        remaining_budget = budget - existing_value
-        log(
-            f"📈  {symbol} position (${existing_value:.2f}) below budget (${budget:.2f}) "
-            f"- topping up ${remaining_budget:.2f}"
-        )
-        budget = remaining_budget
+def _stock_buy_request_or_skip(symbol: str, budget: float, slP: float, tpP: float, base_price: float | None = None):
+    try:
+        return bracket_buy_with_SLTP(symbol, budget, slP, tpP, base_price=base_price), None
+    except NoAskQuote as exc:
+        log(f"⚠️  {exc} -- skipping BUY")
+        return None, {"status": "skipped", "reason": "no_ask_quote", "detail": str(exc)}
+    except InsufficientQuantity as exc:
+        log(f"⚠️  {exc} -- skipping BUY")
+        return None, {"status": "skipped", "reason": "insufficient_qty", "detail": str(exc)}
+    except InvalidOrderParameters as exc:
+        log(f"⚠️  {exc} -- skipping BUY")
+        return None, {"status": "skipped", "reason": "invalid_order_parameters", "detail": str(exc)}
 
-    if exchange == "stocks":
-        try:
-            req = bracket_buy_with_SLTP(symbol, budget, slP, tpP)
-        except NoAskQuote as exc:
-            log(f"⚠️  {exc} -- skipping BUY")
-            return {"status": "skipped", "reason": "no_ask_quote", "detail": str(exc)}
-        except InsufficientQuantity as exc:
-            log(f"⚠️  {exc} -- skipping BUY")
-            return {"status": "skipped", "reason": "insufficient_qty", "detail": str(exc)}
-        except InvalidOrderParameters as exc:
-            # Catches invariants _validate_bracket_order() can't satisfy at all for a given quote
-            # (e.g. a sub-$0.02 stock, where the $0.02 SL/TP floor/ceiling clamp pushes stop_loss_px
-            # negative) -- these aren't a caller/config error, just an unbrokerable symbol at this
-            # price, so skip cleanly rather than let it fall through to app.py's 500 handler.
-            log(f"⚠️  {exc} -- skipping BUY")
-            return {"status": "skipped", "reason": "invalid_order_parameters", "detail": str(exc)}
-    else:
-        if not symbol.upper().endswith("/USD"):
-            log(f"⚠️  crypto BUY {symbol} is not USD-quoted -- skipping")
-            return {
-                "status": "skipped",
-                "reason": "non_usd_crypto_pair",
-                "detail": f"crypto BUY {symbol} is not quoted in USD",
-            }
 
-        # Alpaca rejects a crypto notional with more than 2 decimal places (code 42210000); the
-        # BTCUSD failure came from a `budget` value with more precision than that (e.g. a
-        # merged position's market_value), so round before submitting rather than trusting the
-        # caller to have already done so.
-        notional = round(budget, 2)
+def _crypto_buy_request_or_skip(symbol: str, budget: float):
+    if not is_usd_crypto_symbol(symbol):
+        log(f"⚠️  crypto BUY {symbol} is not USD-quoted -- skipping")
+        return None, {
+            "status": "skipped",
+            "reason": "non_usd_crypto_pair",
+            "detail": f"crypto BUY {symbol} is not quoted in USD",
+        }
 
-        # Alpaca also rejects a crypto notional below its minimum order value (code 40310000,
-        # "cost basis must be >= minimal amount of order 10"). Clamping up to that floor would
-        # silently submit an order larger than the caller's intended budget, so skip instead --
-        # the caller (Dealer) is responsible for supplying a sufficient budget in the first place.
-        if notional < MIN_CRYPTO_NOTIONAL:
-            log(f"⚠️  budget {notional} below Alpaca's ${MIN_CRYPTO_NOTIONAL:.0f} crypto minimum -- skipping")
-            return {
-                "status": "skipped",
-                "reason": "budget_below_minimum",
-                "detail": f"budget {notional} below ${MIN_CRYPTO_NOTIONAL:.0f} crypto minimum",
-            }
+    notional = round(budget, 2)
+    if notional < MIN_CRYPTO_NOTIONAL:
+        log(f"⚠️  budget {notional} below Alpaca's ${MIN_CRYPTO_NOTIONAL:.0f} crypto minimum -- skipping")
+        return None, {
+            "status": "skipped",
+            "reason": "budget_below_minimum",
+            "detail": f"budget {notional} below ${MIN_CRYPTO_NOTIONAL:.0f} crypto minimum",
+        }
 
-        req = MarketOrderRequest(
+    return (
+        MarketOrderRequest(
             symbol=symbol,
             notional=notional,
             side=OrderSide.BUY,
             time_in_force=TimeInForce.GTC,
-        )
+        ),
+        None,
+    )
 
+
+def _submit_buy_order(req, symbol: str, exchange: str, budget: float, slP: float, tpP: float):
     try:
-        order = trading_client.submit_order(req)
+        return trading_client.submit_order(req), None, req
     except APIError as exc:
         if exchange != "stocks":
             raise
@@ -587,27 +684,48 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
         if err.get("code") != 42210000 or base_price is None:
             raise
 
-        # Our client-quoted `ask` can diverge from Alpaca's own base_price on thin, low-priced
-        # symbols -- rather than guess an ever-bigger buffer around our own quote, retry once
-        # using Alpaca's own authoritative reference price straight from the rejection.
         log(f"🔄  retrying BUY {symbol} priced off Alpaca's own base_price {base_price} ...")
-        try:
-            req = bracket_buy_with_SLTP(symbol, budget, slP, tpP, base_price=float(base_price))
-        except NoAskQuote as retry_exc:
-            log(f"⚠️  {retry_exc} -- skipping BUY on retry")
-            return {"status": "skipped", "reason": "no_ask_quote", "detail": str(retry_exc)}
-        except InsufficientQuantity as retry_exc:
-            log(f"⚠️  {retry_exc} -- skipping BUY on retry")
-            return {"status": "skipped", "reason": "insufficient_qty", "detail": str(retry_exc)}
-        except InvalidOrderParameters as retry_exc:
-            log(f"⚠️  {retry_exc} -- skipping BUY on retry")
-            return {"status": "skipped", "reason": "invalid_order_parameters", "detail": str(retry_exc)}
-        order = trading_client.submit_order(req)
+        retry_req, skip = _stock_buy_request_or_skip(symbol, budget, slP, tpP, base_price=float(base_price))
+        if skip is not None:
+            return None, skip, retry_req
+        return trading_client.submit_order(retry_req), None, retry_req
+
+
+def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> dict:
+    if exchange != "stocks":
+        symbol = canonical_crypto_symbol(symbol)
+
+    cfg = load_config()  # fresh (within its own refresh window) so a live strategy change never needs a restart
+    skip = _buy_preflight_skip(symbol, cfg)
+    if skip is not None:
+        return skip
+
+    oo = trading_client.get_orders(GetOrdersRequest(status="open"))
+    matching_orders = [order for order in oo if alpaca_order_symbol(order.symbol) == alpaca_order_symbol(symbol)]
+
+    if matching_orders:
+        log(f"⚠️  open orders exist for {symbol} - aborting BUY")
+        return {"status": "skipped", "reason": "open_orders_exist", "detail": "open orders exist for symbol"}
+
+    budget, skip = _remaining_budget_or_skip(symbol, budget)
+    if skip is not None:
+        return skip
+
+    if exchange == "stocks":
+        req, skip = _stock_buy_request_or_skip(symbol, budget, slP, tpP)
+    else:
+        req, skip = _crypto_buy_request_or_skip(symbol, budget)
+    if skip is not None:
+        return skip
+
+    order, skip, req = _submit_buy_order(req, symbol, exchange, budget, slP, tpP)
+    if skip is not None:
+        return skip
 
     log(f"✅  buy order submitted: {order.id}")
 
     if exchange == "stocks":
-        _tracked_brackets[symbol] = order.id
+        _set_tracked_bracket(symbol, order.id)
         sl_price = req.stop_loss.stop_price
         tp_price = req.take_profit.limit_price
         crypto_slP = crypto_tpP = None
@@ -620,7 +738,7 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
         crypto_slP = cfg.strategy.crypto_slP
         crypto_tpP = cfg.strategy.crypto_tpP
 
-    _pending_fills[order.id] = {
+    _set_pending_fill(order.id, {
         "symbol": symbol,
         "action": "BUY",
         "reason": "opening_position",
@@ -628,7 +746,7 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
         "tp_price": tp_price,
         "crypto_slP": crypto_slP,
         "crypto_tpP": crypto_tpP,
-    }
+    })
 
     return {
         "status": "submitted",
@@ -641,6 +759,7 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
 
 
 def sell(symbol: str, reason: str = "dealer_signal") -> dict:
+    symbol = canonical_crypto_symbol(symbol) if "/" in symbol or is_usd_crypto_symbol(symbol) else symbol
     qty = get_open_position(symbol)
 
     if qty <= 0:
@@ -654,13 +773,12 @@ def sell(symbol: str, reason: str = "dealer_signal") -> dict:
     # waiting for check_bracket_fills() to notice the legs went terminal with no fill. Same idea
     # for a tracked synthetic crypto stop/target -- a manual/Dealer-driven SELL already closes the
     # position, so check_crypto_stops() must not also try to sell it.
-    _tracked_brackets.pop(symbol, None)
-    _crypto_stops.pop(symbol, None)
+    _stop_tracking_symbol(symbol)
 
     try:
         order = trading_client.submit_order(req)
         log(f"✅  sell order submitted: {order.id}")
-        _pending_fills[order.id] = {"symbol": symbol, "action": "SELL", "reason": reason, "sl_price": None, "tp_price": None}
+        _set_pending_fill(order.id, {"symbol": symbol, "action": "SELL", "reason": reason, "sl_price": None, "tp_price": None})
         return {
             "status": "submitted",
             "reason": reason,
@@ -693,7 +811,7 @@ def sell(symbol: str, reason: str = "dealer_signal") -> dict:
             log("🔄  retrying after clean-up ...")
             order = trading_client.submit_order(req)
             log(f"✅  sell order submitted: {order.id}")
-            _pending_fills[order.id] = {"symbol": symbol, "action": "SELL", "reason": reason, "sl_price": None, "tp_price": None}
+            _set_pending_fill(order.id, {"symbol": symbol, "action": "SELL", "reason": reason, "sl_price": None, "tp_price": None})
             return {
                 "status": "submitted",
                 "reason": reason,

@@ -72,6 +72,27 @@ def test_crypto_position_merged_with_configured_exchange_when_enabled(monkeypatc
     ]
 
 
+def test_crypto_position_from_live_alpaca_shape_is_canonicalized_when_merged(monkeypatch):
+    monkeypatch.setattr(
+        portfolio_state, "trading_client", FakeTradingClient([FakePosition("BTCUSD", AssetClass.CRYPTO, 10.0)])
+    )
+
+    result = portfolio_state.merge_held_positions({"symbols": []}, _cfg(enable_stocks=True, enable_crypto=True))
+
+    assert result["symbols"][0]["symbol"] == "BTC/USD"
+
+
+def test_canonical_crypto_position_is_not_duplicated_by_live_alpaca_shape(monkeypatch):
+    monkeypatch.setattr(
+        portfolio_state, "trading_client", FakeTradingClient([FakePosition("BTCUSD", AssetClass.CRYPTO, 10.0)])
+    )
+    portfolio = {"symbols": [{"symbol": "BTC/USD", "exchange": "binance", "budget": 100, "indicators": ["ALL"]}]}
+
+    result = portfolio_state.merge_held_positions(portfolio, _cfg(enable_stocks=True, enable_crypto=True))
+
+    assert result["symbols"] == portfolio["symbols"]
+
+
 def test_merged_position_budget_never_equals_market_value(monkeypatch):
     """Regression: a merged position's current market value must never flow through as new-BUY
     `budget` -- that would let a large held position silently re-authorize an equally large new
