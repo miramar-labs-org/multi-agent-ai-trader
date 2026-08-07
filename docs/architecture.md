@@ -605,10 +605,15 @@ or failing dispatch is logged as a warning and never blocks the EOD report itsel
 `python -m src.pl_badges.main`. Computes Today's and YTD aggregate P&L from the paper account
 (`src.common.pl_badges.fetch_pl_summary()` — today's P&L is
 `account.equity - account.last_equity`, the same math `execution.py`'s daily loss limit check
-uses; YTD P&L is `equity - base_value` from a `get_portfolio_history()` request starting Jan 1 of
-the current year — confirmed against a live account that `PortfolioHistory.profit_loss` is a
-day-over-day delta series, not cumulative from `base_value`, so `base_value` is the only reliable
-YTD anchor) and writes two shields.io endpoint-badge JSON files, `badges/today-pl.json` and
+uses; YTD P&L is normally `equity - base_value` from a `get_portfolio_history()` request starting
+Jan 1 of the current year — confirmed against a live account that `PortfolioHistory.profit_loss`
+is a day-over-day delta series, not cumulative from `base_value`, so `base_value` is the preferred
+YTD anchor when Alpaca actually returns one. On this paper account it persistently comes back
+`None` (no Jan-1 equity snapshot for the current account state), so `fetch_pl_summary()` falls
+back to summing `badges/pl_history.json` — a `{date_iso: today_pl}` record `main()` appends to
+after every run — for the current year, plus today's own P&L; today's own entry is excluded from
+that sum if a same-day rerun already persisted one, so a second dispatch on the same day can't
+double-count it) and writes two shields.io endpoint-badge JSON files, `badges/today-pl.json` and
 `badges/ytd-pl.json`. The workflow commits and pushes them back to `main` only if the content
 changed. README.md's two P/L badges point at those files via
 `img.shields.io/endpoint?url=.../raw.githubusercontent.com/...` — shields.io fetches the JSON

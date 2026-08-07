@@ -1,3 +1,5 @@
+from datetime import date
+
 from src.common import pl_badges
 
 
@@ -42,13 +44,46 @@ def test_fetch_pl_summary_handles_negative_pl(monkeypatch):
     assert summary == {"equity": 900.0, "today_pl": -100.0, "ytd_pl": -300.0}
 
 
-def test_fetch_pl_summary_falls_back_to_today_pl_when_base_value_is_none(monkeypatch):
+def test_fetch_pl_summary_falls_back_to_today_pl_when_base_value_is_none_and_no_history(monkeypatch):
     fake_client = FakeTradingClient(equity="999166.40", last_equity="1000000.00", base_value=None)
     monkeypatch.setattr(pl_badges, "trading_client", fake_client)
 
     summary = pl_badges.fetch_pl_summary()
 
     assert summary == {"equity": 999166.4, "today_pl": -833.6, "ytd_pl": -833.6}
+
+
+def test_fetch_pl_summary_accumulates_ytd_from_persisted_history_when_base_value_is_none(monkeypatch):
+    fake_client = FakeTradingClient(equity="999166.40", last_equity="1000000.00", base_value=None)
+    monkeypatch.setattr(pl_badges, "trading_client", fake_client)
+
+    summary = pl_badges.fetch_pl_summary(history_pl={"2026-08-05": -100.0, "2026-08-06": 50.0})
+
+    assert summary["today_pl"] == -833.6
+    assert summary["ytd_pl"] == -883.6
+
+
+def test_fetch_pl_summary_excludes_todays_own_persisted_entry_from_the_ytd_sum(monkeypatch):
+    """A second same-day run (e.g. EOD Report's backup dispatch) must not double-count today's
+    own P&L using a stale value already persisted by an earlier run today."""
+    fake_client = FakeTradingClient(equity="999166.40", last_equity="1000000.00", base_value=None)
+    monkeypatch.setattr(pl_badges, "trading_client", fake_client)
+    today_key = date.today().isoformat()
+
+    summary = pl_badges.fetch_pl_summary(history_pl={today_key: -999.0, "2026-01-02": 10.0})
+
+    assert summary["today_pl"] == -833.6
+    assert summary["ytd_pl"] == -823.6
+
+
+def test_fetch_pl_summary_ignores_persisted_entries_from_a_prior_year(monkeypatch):
+    fake_client = FakeTradingClient(equity="999166.40", last_equity="1000000.00", base_value=None)
+    monkeypatch.setattr(pl_badges, "trading_client", fake_client)
+
+    summary = pl_badges.fetch_pl_summary(history_pl={"2025-12-31": 5000.0})
+
+    assert summary["today_pl"] == -833.6
+    assert summary["ytd_pl"] == -833.6
 
 
 def test_build_badge_payload_formats_positive_value_as_brightgreen():
