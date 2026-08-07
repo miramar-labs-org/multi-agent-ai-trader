@@ -69,6 +69,20 @@ jobs:
             exit 1
           }
 
+      - name: Sync optional GitHub workflow token
+        env:
+          EOD_GITHUB_WORKFLOW_TOKEN: ${{ secrets.EOD_GITHUB_WORKFLOW_TOKEN }}
+        run: |
+          if [[ -z "${EOD_GITHUB_WORKFLOW_TOKEN}" ]]; then
+            echo "EOD_GITHUB_WORKFLOW_TOKEN not configured; EOD will skip P/L badge dispatch."
+            exit 0
+          fi
+          TOKEN_B64="$(printf '%s' "${EOD_GITHUB_WORKFLOW_TOKEN}" | base64 -w0)"
+          kubectl patch secret mlabs-api-keys \
+            -n "$PROJECT_NAME" \
+            --type merge \
+            -p "{\"data\":{\"GITHUB_WORKFLOW_TOKEN\":\"${TOKEN_B64}\"}}"
+
       - name: Apply RBAC
         run: kubectl apply --validate=false -f k8s/rbac.yaml
 
