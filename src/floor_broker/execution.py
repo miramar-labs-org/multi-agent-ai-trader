@@ -626,6 +626,41 @@ def _remaining_budget_or_skip(symbol: str, budget: float) -> tuple[float | None,
     return remaining_budget, None
 
 
+def _risk_based_budget_cap(slP: float, cfg) -> float | None:
+    """Returns the largest budget consistent with strategy.risk_per_trade_usd given a stop-loss
+    fraction slP (a BUY sized at that budget loses budget * (1 - slP) if stopped out), or None if
+    risk-based sizing isn't active -- "flat_budget" (the default) leaves the caller's requested
+    budget untouched. Only ever caps the budget down, never up, so this can shrink an
+    Analyst-authorized budget toward the risk target but never inflate exposure beyond what was
+    authorized."""
+    if cfg.strategy.position_sizing != "risk_based":
+        return None
+    risk_usd = cfg.strategy.risk_per_trade_usd
+    if not risk_usd or not (0 < slP < 1):
+        return None
+    return risk_usd / (1 - slP)
+
+
+def _max_concurrent_positions_skip(symbol: str, cfg) -> dict | None:
+    """Refuses a new BUY once the number of currently-open positions is at/above
+    strategy.max_concurrent_positions -- topping up a symbol that's already open doesn't add a
+    new position, so it's exempt (checked via _fetch_open_position, same as
+    _remaining_budget_or_skip's own top-up check)."""
+    if _fetch_open_position(symbol) is not None:
+        return None
+
+    open_count = len(trading_client.get_all_positions())
+    limit = cfg.strategy.max_concurrent_positions
+    if open_count >= limit:
+        log(f"🛑  max concurrent positions reached ({open_count}/{limit}) -- skipping new BUY {symbol}")
+        return {
+            "status": "skipped",
+            "reason": "max_concurrent_positions_reached",
+            "detail": f"{open_count} open position(s) at/above cap of {limit}",
+        }
+    return None
+
+
 def _stock_buy_request_or_skip(symbol: str, budget: float, slP: float, tpP: float, base_price: float | None = None):
     try:
         return bracket_buy_with_SLTP(symbol, budget, slP, tpP, base_price=base_price), None
@@ -696,6 +731,13 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
         symbol = canonical_crypto_symbol(symbol)
 
     cfg = load_config()  # fresh (within its own refresh window) so a live strategy change never needs a restart
+
+    effective_slP = slP if exchange == "stocks" else cfg.strategy.crypto_slP
+    risk_cap = _risk_based_budget_cap(effective_slP, cfg)
+    if risk_cap is not None and risk_cap < budget:
+        log(f"📉  risk-based sizing caps {symbol} budget ${budget:.2f} -> ${risk_cap:.2f} (risk_per_trade_usd=${cfg.strategy.risk_per_trade_usd}, slP={effective_slP})")
+        budget = risk_cap
+
     skip = _buy_preflight_skip(symbol, cfg)
     if skip is not None:
         return skip
@@ -706,6 +748,10 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
     if matching_orders:
         log(f"⚠️  open orders exist for {symbol} - aborting BUY")
         return {"status": "skipped", "reason": "open_orders_exist", "detail": "open orders exist for symbol"}
+
+    skip = _max_concurrent_positions_skip(symbol, cfg)
+    if skip is not None:
+        return skip
 
     budget, skip = _remaining_budget_or_skip(symbol, budget)
     if skip is not None:

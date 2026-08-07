@@ -12,3 +12,13 @@ class Signal(BaseModel):
     action: Literal["BUY", "HOLD", "SELL"]
     reasoning: str = Field(description="Explanation citing the indicators and news feed that led to this decision")
     size_hint: float = Field(default=1.0, ge=0.0, le=1.0, description="Fraction of the symbol's budget to deploy on a BUY")
+    confidence: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "How strongly the indicators agree with and support this action, from 0.0 (weak or "
+            "mixed signal) to 1.0 (multiple indicators clearly agree). A borderline or conflicting "
+            "reading should score low, not 1.0."
+        ),
+    )

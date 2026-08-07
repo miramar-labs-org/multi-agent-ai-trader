@@ -15,3 +15,19 @@ def test_size_hint_rejects_out_of_range_values():
 def test_size_hint_accepts_valid_fraction():
     signal = Signal(symbol="DFNS", action="BUY", reasoning="test", size_hint=0.5)
     assert signal.size_hint == 0.5
+
+
+def test_confidence_defaults_to_1_when_omitted():
+    """Older/simpler LLM outputs that don't set confidence must not be silently gated out."""
+    signal = Signal(symbol="DFNS", action="BUY", reasoning="test")
+    assert signal.confidence == 1.0
+
+
+def test_confidence_rejects_out_of_range_values():
+    with pytest.raises(ValidationError):
+        Signal(symbol="DFNS", action="BUY", reasoning="test", confidence=1.5)
+
+
+def test_confidence_accepts_valid_fraction():
+    signal = Signal(symbol="DFNS", action="BUY", reasoning="test", confidence=0.4)
+    assert signal.confidence == 0.4

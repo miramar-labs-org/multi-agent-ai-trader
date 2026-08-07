@@ -22,6 +22,9 @@ _FAKE_CFG = OmegaConf.create(
             "daily_loss_limit_usd": 500,
             "crypto_slP": 0.98,
             "crypto_tpP": 1.03,
+            "max_concurrent_positions": 10,
+            "position_sizing": "flat_budget",
+            "risk_per_trade_usd": None,
         },
         "eod_flatten": {
             "enabled": False,
@@ -88,10 +91,11 @@ class FakeTradingClient:
     in order, then succeeds -- lets tests replay real Alpaca rejection payloads without any
     network access."""
 
-    def __init__(self, rejections=(), account=None):
+    def __init__(self, rejections=(), account=None, open_positions_count=0):
         self._rejections = list(rejections)
         self.submitted = []
         self._account = account or FakeAccount()
+        self._open_positions_count = open_positions_count
 
     def get_account(self):
         return self._account
@@ -101,6 +105,9 @@ class FakeTradingClient:
 
     def get_orders(self, request):
         return []
+
+    def get_all_positions(self):
+        return [object()] * self._open_positions_count
 
     def submit_order(self, req):
         self.submitted.append(req)
@@ -1068,6 +1075,112 @@ def test_buy_proceeds_when_daily_pnl_is_within_bounds(monkeypatch):
     result = execution.buy("MGN", "stocks", 5000.0, slP=0.98, tpP=1.05)
 
     assert result["status"] == "submitted"
+
+
+def test_buy_skips_when_max_concurrent_positions_reached(monkeypatch):
+    fake_client = FakeTradingClient(open_positions_count=10)  # == _FAKE_CFG.strategy.max_concurrent_positions
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    result = execution.buy("MGN", "stocks", 5000.0, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "max_concurrent_positions_reached"
+    assert fake_client.submitted == []
+
+
+def test_buy_proceeds_when_below_max_concurrent_positions(monkeypatch):
+    fake_client = FakeTradingClient(open_positions_count=9)
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+    monkeypatch.setattr(execution, "get_current_ask_price", lambda symbol: 10.0)
+
+    result = execution.buy("MGN", "stocks", 5000.0, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "submitted"
+
+
+def test_buy_tops_up_existing_position_without_regard_to_max_concurrent_positions(monkeypatch):
+    """Topping up a symbol that's already open must never be blocked by the concurrent-positions
+    cap -- it isn't a new position. FakeExistingPositionTradingClient has no get_all_positions
+    override, so this also proves the cap check never even calls it for a top-up."""
+    fake_client = FakeExistingPositionTradingClient(market_value="4000.00")
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+    monkeypatch.setattr(execution, "get_current_ask_price", lambda symbol: 10.0)
+
+    result = execution.buy("MGN", "stocks", 5000.0, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "submitted"
+
+
+def _risk_based_cfg(risk_per_trade_usd=100):
+    return OmegaConf.create(
+        {
+            "strategy": {
+                "daily_profit_target_usd": 1000,
+                "daily_loss_limit_usd": 500,
+                "crypto_slP": 0.98,
+                "crypto_tpP": 1.03,
+                "max_concurrent_positions": 10,
+                "position_sizing": "risk_based",
+                "risk_per_trade_usd": risk_per_trade_usd,
+            },
+            "eod_flatten": {"enabled": False, "minutes_before_close": 10},
+        }
+    )
+
+
+def test_risk_based_sizing_caps_budget_to_risk_per_trade_over_stop_distance(monkeypatch):
+    """risk_per_trade_usd=100, slP=0.95 -> the stop loses 5% of the budget, so the largest budget
+    that risks exactly $100 at the stop is 100 / 0.05 = $2000."""
+    monkeypatch.setattr(execution, "load_config", lambda: _risk_based_cfg(risk_per_trade_usd=100))
+    fake_client = FakeTradingClient()
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+    monkeypatch.setattr(execution, "get_current_ask_price", lambda symbol: 10.0)
+
+    result = execution.buy("MGN", "stocks", 10000.0, slP=0.95, tpP=1.05)
+
+    assert result["status"] == "submitted"
+    # ~200 shares (100 / 0.05 / 10) -- computed the same way the production code does rather than
+    # hardcoded, since 1 - 0.95 isn't exactly representable in floating point.
+    assert fake_client.submitted[0].qty == int((100 / (1 - 0.95)) // 10.0)
+
+
+def test_risk_based_sizing_never_increases_budget_above_authorized(monkeypatch):
+    """The risk cap only ever shrinks the requested budget -- a generous risk_per_trade_usd must
+    never inflate exposure beyond what the Analyst/Dealer already authorized."""
+    monkeypatch.setattr(execution, "load_config", lambda: _risk_based_cfg(risk_per_trade_usd=1000))
+    fake_client = FakeTradingClient()
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+    monkeypatch.setattr(execution, "get_current_ask_price", lambda symbol: 10.0)
+
+    result = execution.buy("MGN", "stocks", 500.0, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "submitted"
+    assert fake_client.submitted[0].qty == 50  # int(500.0 // 10.0), unchanged -- the $50000 risk cap is far above it
+
+
+def test_risk_based_sizing_uses_crypto_slp_for_crypto_buys(monkeypatch):
+    monkeypatch.setattr(execution, "load_config", lambda: _risk_based_cfg(risk_per_trade_usd=1))
+    fake_client = FakeTradingClient()
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+
+    result = execution.buy("BTC/USD", "binance", 100.0, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "submitted"
+    assert fake_client.submitted[0].notional == 50.0  # 1 / (1 - 0.98) == 50, capped down from the $100 request
+
+
+def test_flat_budget_sizing_leaves_budget_unchanged(monkeypatch):
+    """Default mode (_FAKE_CFG.strategy.position_sizing == "flat_budget") -- confirms the risk
+    cap is a no-op unless risk_based is explicitly active, even with a stop wide enough that a
+    risk cap would otherwise bite hard."""
+    fake_client = FakeTradingClient()
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+    monkeypatch.setattr(execution, "get_current_ask_price", lambda symbol: 10.0)
+
+    result = execution.buy("MGN", "stocks", 5000.0, slP=0.5, tpP=1.05)
+
+    assert result["status"] == "submitted"
+    assert fake_client.submitted[0].qty == 500  # int(5000.0 // 10.0), unaffected by the wide stop
 
 
 def test_sell_still_permitted_when_daily_loss_limit_reached(monkeypatch):

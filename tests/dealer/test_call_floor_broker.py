@@ -12,16 +12,18 @@ def _cfg():
             "trading": {"slP": 0.98, "tpP": 1.05},
             "floor_broker": {"base_url": "http://floor-broker.test:8000"},
             "macro_blackout": {"enabled": False, "dates": []},
+            "strategy": {"min_confidence": 0.6, "enable_win_rate_throttle": False},
+            "analyst": {"track_record_days": 5},
         }
     )
 
 
-def _state(action: str, budget: float, size_hint: float = 1.0) -> dict:
+def _state(action: str, budget: float, size_hint: float = 1.0, confidence: float = 1.0) -> dict:
     return {
         "symbol": "MGN",
         "exchange": "stocks",
         "budget": budget,
-        "signal": {"action": action, "reasoning": "test", "size_hint": size_hint},
+        "signal": {"action": action, "reasoning": "test", "size_hint": size_hint, "confidence": confidence},
         "execution_result": None,
     }
 
@@ -234,6 +236,179 @@ def test_buy_is_not_skipped_when_macro_blackout_date_is_not_today(monkeypatch):
     cfg = _cfg()
     cfg.macro_blackout.enabled = True
     cfg.macro_blackout.dates = [{"date": "1999-01-01", "label": "not today"}]
+
+    result = graph.call_floor_broker(_state("BUY", budget=5000.0), cfg)
+
+    assert result["execution_result"]["status"] == "executed"
+
+
+def test_buy_is_skipped_when_confidence_below_minimum(monkeypatch):
+    _silence_slack(monkeypatch)
+    monkeypatch.setattr(graph, "_is_quad_witching_day", lambda d: False)
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("Floor Broker must not be called for a low-confidence BUY")
+
+    monkeypatch.setattr(graph.requests, "post", _fail_if_called)
+
+    result = graph.call_floor_broker(_state("BUY", budget=5000.0, confidence=0.4), _cfg())
+
+    assert result["execution_result"]["status"] == "skipped"
+    assert result["execution_result"]["reason"] == "low_confidence"
+
+
+def test_buy_proceeds_when_confidence_at_or_above_minimum(monkeypatch):
+    _silence_slack(monkeypatch)
+    monkeypatch.setattr(graph, "_is_quad_witching_day", lambda d: False)
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"status": "executed", "detail": "buy order submitted: order-123"}
+
+    monkeypatch.setattr(graph.requests, "post", lambda url, json, timeout: FakeResponse())
+
+    result = graph.call_floor_broker(_state("BUY", budget=5000.0, confidence=0.6), _cfg())
+
+    assert result["execution_result"]["status"] == "executed"
+
+
+def test_buy_missing_confidence_defaults_to_full_confidence(monkeypatch):
+    """A signal dict without a confidence key (e.g. an older cached state) must not be gated
+    out -- matches Signal's own default of 1.0."""
+    _silence_slack(monkeypatch)
+    monkeypatch.setattr(graph, "_is_quad_witching_day", lambda d: False)
+    state = _state("BUY", budget=5000.0)
+    del state["signal"]["confidence"]
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"status": "executed", "detail": "buy order submitted: order-123"}
+
+    monkeypatch.setattr(graph.requests, "post", lambda url, json, timeout: FakeResponse())
+
+    result = graph.call_floor_broker(state, _cfg())
+
+    assert result["execution_result"]["status"] == "executed"
+
+
+def test_classify_exit_event_stock_bracket_fills():
+    assert graph._classify_exit_event({"event_type": "fill", "detail": "take_profit leg filled: o-1"}) == "win"
+    assert graph._classify_exit_event({"event_type": "fill", "detail": "stop_loss leg filled: o-1"}) == "loss"
+
+
+def test_classify_exit_event_crypto_synthetic_exits():
+    assert graph._classify_exit_event({"event_type": "synthetic_take_profit", "detail": "sold"}) == "win"
+    assert graph._classify_exit_event({"event_type": "synthetic_stop_loss", "detail": "sold"}) == "loss"
+
+
+def test_classify_exit_event_ignores_non_exit_events():
+    """BUY opens, manual SELLs, eod_flatten, errors, and skips have no reliable win/loss outcome
+    without the original entry price -- must be excluded from the win-rate sample, not miscounted."""
+    assert graph._classify_exit_event({"event_type": "buy_executed", "detail": "buy order submitted: o-1"}) is None
+    assert graph._classify_exit_event({"event_type": "sell_executed", "detail": "sell order submitted: o-1"}) is None
+    assert graph._classify_exit_event({"event_type": "error", "detail": "boom"}) is None
+    assert graph._classify_exit_event({"event_type": "skip", "detail": "macro blackout"}) is None
+    assert graph._classify_exit_event({"event_type": "fill", "detail": "unrelated fill text"}) is None
+
+
+def _win_rate_cfg(min_win_rate=0.3, win_rate_min_sample=5):
+    cfg = _cfg()
+    cfg.strategy.enable_win_rate_throttle = True
+    cfg.strategy.min_win_rate = min_win_rate
+    cfg.strategy.win_rate_min_sample = win_rate_min_sample
+    return cfg
+
+
+def _fill_event(reason: str) -> dict:
+    return {"event_type": "fill", "detail": f"{reason} leg filled: order-1"}
+
+
+def _synthetic_event(reason: str) -> dict:
+    return {"event_type": f"synthetic_{reason}", "detail": "sold"}
+
+
+def test_buy_is_skipped_when_win_rate_below_minimum_with_sufficient_sample(monkeypatch):
+    _silence_slack(monkeypatch)
+    monkeypatch.setattr(graph, "_is_quad_witching_day", lambda d: False)
+    events = [_fill_event("stop_loss")] * 4 + [_fill_event("take_profit")] * 1  # 20% win rate
+    monkeypatch.setattr(graph.db, "fetch_floor_broker_events_since", lambda since_date: events)
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("Floor Broker must not be called while the win-rate throttle is active")
+
+    monkeypatch.setattr(graph.requests, "post", _fail_if_called)
+
+    result = graph.call_floor_broker(_state("BUY", budget=5000.0), _win_rate_cfg(min_win_rate=0.3, win_rate_min_sample=5))
+
+    assert result["execution_result"]["status"] == "skipped"
+    assert result["execution_result"]["reason"] == "win_rate_throttle"
+
+
+def test_buy_proceeds_when_win_rate_at_or_above_minimum(monkeypatch):
+    _silence_slack(monkeypatch)
+    monkeypatch.setattr(graph, "_is_quad_witching_day", lambda d: False)
+    events = [_fill_event("take_profit")] * 4 + [_synthetic_event("stop_loss")] * 1  # 80% win rate
+    monkeypatch.setattr(graph.db, "fetch_floor_broker_events_since", lambda since_date: events)
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"status": "executed", "detail": "buy order submitted: order-123"}
+
+    monkeypatch.setattr(graph.requests, "post", lambda url, json, timeout: FakeResponse())
+
+    result = graph.call_floor_broker(_state("BUY", budget=5000.0), _win_rate_cfg(min_win_rate=0.3, win_rate_min_sample=5))
+
+    assert result["execution_result"]["status"] == "executed"
+
+
+def test_buy_proceeds_when_exit_sample_size_is_below_the_minimum(monkeypatch):
+    """A poor win rate on too few completed exits (e.g. 0/1) must not trip the throttle -- avoids
+    overreacting to noise early in the trailing window."""
+    _silence_slack(monkeypatch)
+    monkeypatch.setattr(graph, "_is_quad_witching_day", lambda d: False)
+    events = [_fill_event("stop_loss")]  # 0% win rate, but only 1 sample
+    monkeypatch.setattr(graph.db, "fetch_floor_broker_events_since", lambda since_date: events)
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"status": "executed", "detail": "buy order submitted: order-123"}
+
+    monkeypatch.setattr(graph.requests, "post", lambda url, json, timeout: FakeResponse())
+
+    result = graph.call_floor_broker(_state("BUY", budget=5000.0), _win_rate_cfg(min_win_rate=0.3, win_rate_min_sample=5))
+
+    assert result["execution_result"]["status"] == "executed"
+
+
+def test_buy_proceeds_when_win_rate_throttle_disabled(monkeypatch):
+    """enable_win_rate_throttle: false must be a config-only no-op, matching macro_blackout's own
+    feature-gate precedent -- the db call is never even made."""
+    _silence_slack(monkeypatch)
+    monkeypatch.setattr(graph, "_is_quad_witching_day", lambda d: False)
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("must not query floor_broker_events while the throttle is disabled")
+
+    monkeypatch.setattr(graph.db, "fetch_floor_broker_events_since", _fail_if_called)
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"status": "executed", "detail": "buy order submitted: order-123"}
+
+    monkeypatch.setattr(graph.requests, "post", lambda url, json, timeout: FakeResponse())
+
+    cfg = _win_rate_cfg(min_win_rate=0.99, win_rate_min_sample=0)
+    cfg.strategy.enable_win_rate_throttle = False
 
     result = graph.call_floor_broker(_state("BUY", budget=5000.0), cfg)
 

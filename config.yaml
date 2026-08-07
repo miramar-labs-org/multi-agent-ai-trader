@@ -36,9 +36,34 @@ strategy:
   halt_behavior: block_new_buys   # only this is enforced; flatten_positions is recorded intent only
   crypto_slP: 0.98                # synthetic stop-loss, as a fraction of crypto fill price
   crypto_tpP: 1.03                # synthetic take-profit, as a fraction of crypto fill price
-  position_sizing: flat_budget    # only this is enforced (analyst.default_budget); risk_based is recorded intent only
-  risk_per_trade_usd: null        # recorded intent only -- see position_sizing note above
-  max_concurrent_positions: 10    # recorded intent only -- analyst.max_universe_size already caps concurrent picks
+  position_sizing: risk_based     # "flat_budget" uses the Analyst-authorized budget as-is;
+                                   # "risk_based" (live since 2026-08-07) caps that budget so a
+                                   # stopped-out BUY loses at most risk_per_trade_usd -- see
+                                   # execution.py's _risk_based_budget_cap(). Only ever caps the
+                                   # budget down, never inflates it above what the Analyst
+                                   # authorized. Note slP/crypto_slP are flat percentages today
+                                   # (no per-symbol volatility-adjusted stop), so this mainly
+                                   # removes the Analyst LLM's arbitrary per-pick budget as the de
+                                   # facto risk driver, rather than doing true risk parity across
+                                   # symbols of differing volatility.
+  risk_per_trade_usd: 100         # max $ lost on a single stopped-out BUY under risk_based sizing
+  max_concurrent_positions: 10    # enforced in execution.py's buy() -- new (non-top-up) BUYs are
+                                   # skipped once open positions are at/above this count
+  min_confidence: 0.6             # Dealer's LLM signal now includes a 0.0-1.0 confidence score
+                                   # (src/dealer/schema.py) -- a BUY below this is skipped
+                                   # (reason: low_confidence) before ever reaching Floor Broker.
+                                   # SELL/HOLD are unaffected. Set to 0.0 to disable this gate
+                                   # entirely (config-only change, no redeploy needed).
+  min_win_rate: 0.30              # trailing automatic-exit (TP/SL) win rate floor -- new BUYs
+                                   # pause (reason: win_rate_throttle) once the win rate over the
+                                   # trailing analyst.track_record_days falls below this. Set just
+                                   # above the trading.slP/tpP breakeven rate (~28.6% at
+                                   # slP=0.98/tpP=1.05) rather than an arbitrary round number --
+                                   # see src/dealer/graph.py's _win_rate_throttle_active().
+  win_rate_min_sample: 5          # minimum completed TP/SL exits required before the win-rate
+                                   # throttle evaluates at all, so a handful of early trades can't
+                                   # trip it on noise
+  enable_win_rate_throttle: true  # feature gate: config-only change, no redeploy needed
 
 eod_flatten:
   enabled: true   # feature gate: when false, poll_eod_flatten() (src/floor_broker/main.py) short-

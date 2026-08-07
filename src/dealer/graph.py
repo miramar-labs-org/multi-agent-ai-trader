@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TypedDict
 
 import pytz
@@ -48,7 +48,11 @@ def llm_call(state: DealerState, cfg) -> DealerState:
         "Based on the values of ALL of the indicators below, decide if you should BUY, SELL, or HOLD. "
         "size_hint must be a decimal fraction between 0.0 and 1.0 representing the portion of the "
         "symbol's budget to deploy on a BUY (e.g. 0.5 = half the budget, 1.0 = the full budget) -- "
-        "never a dollar amount or share count."
+        "never a dollar amount or share count. "
+        "confidence must be a decimal fraction between 0.0 and 1.0 reflecting how strongly the "
+        "indicators actually agree with and support this action -- reserve a high score for cases "
+        "where multiple indicators clearly point the same direction, and score low when the "
+        "reading is mixed, weak, or borderline."
     )
     user_prompt = f"Indicators for {state['symbol']}:\n{state['indicators_text']}"
 
@@ -88,6 +92,57 @@ def _macro_blackout_active(cfg) -> str | None:
     return None
 
 
+def _classify_exit_event(event: dict) -> str | None:
+    """Returns "win" for a take-profit exit, "loss" for a stop-loss exit, or None for any other
+    floor_broker_events row (BUY opens, manual dealer-triggered SELLs, eod_flatten, errors,
+    skips) -- those don't carry an unambiguous win/loss outcome without the original entry price,
+    which floor_broker_events doesn't record. Covers both stock brackets (poll_bracket_fills
+    records event_type="fill" with the leg reason embedded in `detail`) and crypto's synthetic
+    stop/target (poll_bracket_fills records event_type="synthetic_take_profit"/
+    "synthetic_stop_loss" directly, see src/floor_broker/main.py)."""
+    event_type = event.get("event_type", "")
+    if event_type == "synthetic_take_profit":
+        return "win"
+    if event_type == "synthetic_stop_loss":
+        return "loss"
+    if event_type == "fill":
+        detail = event.get("detail") or ""
+        if "take_profit leg filled" in detail:
+            return "win"
+        if "stop_loss leg filled" in detail:
+            return "loss"
+    return None
+
+
+def _win_rate_throttle_active(cfg) -> str | None:
+    """Returns a Slack-friendly reason string if new BUYs should pause because the trailing
+    automatic-exit win rate (take-profit vs stop-loss hits, both stock brackets and synthetic
+    crypto stops) has fallen below strategy.min_win_rate -- a quantitative companion to
+    fetch_track_record (src/analyst/graph.py), which only hands the LLM raw history and leaves
+    interpretation to it. Requires at least strategy.win_rate_min_sample completed exits before
+    evaluating at all, so a handful of early trades can't trip the throttle on noise. Discretionary
+    dealer-triggered SELLs, eod_flatten, and BUY opens are excluded from the count -- see
+    _classify_exit_event."""
+    if not cfg.strategy.get("enable_win_rate_throttle", True):
+        return None
+
+    since_date = (
+        datetime.now(pytz.timezone("US/Eastern")) - timedelta(days=cfg.analyst.track_record_days)
+    ).date()
+    events = db.fetch_floor_broker_events_since(since_date)
+    outcomes = [_classify_exit_event(e) for e in events]
+    wins = outcomes.count("win")
+    losses = outcomes.count("loss")
+    total = wins + losses
+    if total < cfg.strategy.win_rate_min_sample:
+        return None
+
+    win_rate = wins / total
+    if win_rate < cfg.strategy.min_win_rate:
+        return f"trailing win rate {win_rate:.0%} ({wins}W/{losses}L over {total} exits) below minimum {cfg.strategy.min_win_rate:.0%}"
+    return None
+
+
 def call_floor_broker(state: DealerState, cfg) -> DealerState:
     signal = state["signal"]
     slack.notify_dealer_signal(state["symbol"], signal["action"], signal["reasoning"])
@@ -104,6 +159,30 @@ def call_floor_broker(state: DealerState, cfg) -> DealerState:
                 "status": "skipped",
                 "reason": "macro_blackout",
                 "detail": f"new BUY entries paused for macro blackout: {blackout_label}",
+            }
+            slack.notify_floor_broker_result(state["symbol"], signal["action"], result["status"], result["detail"])
+            db.record_floor_broker_event(state["symbol"], "skip", result["detail"])
+            return {**state, "execution_result": result}
+
+        throttle_reason = _win_rate_throttle_active(cfg)
+        if throttle_reason:
+            log(f"⏭️  BUY for {state['symbol']} skipped -- {throttle_reason}")
+            result = {
+                "status": "skipped",
+                "reason": "win_rate_throttle",
+                "detail": f"new BUY entries paused: {throttle_reason}",
+            }
+            slack.notify_floor_broker_result(state["symbol"], signal["action"], result["status"], result["detail"])
+            db.record_floor_broker_event(state["symbol"], "skip", result["detail"])
+            return {**state, "execution_result": result}
+
+        confidence = signal.get("confidence", 1.0)
+        if confidence < cfg.strategy.min_confidence:
+            log(f"⏭️  BUY for {state['symbol']} skipped -- confidence {confidence:.2f} below minimum {cfg.strategy.min_confidence}")
+            result = {
+                "status": "skipped",
+                "reason": "low_confidence",
+                "detail": f"BUY confidence {confidence:.2f} below minimum {cfg.strategy.min_confidence}",
             }
             slack.notify_floor_broker_result(state["symbol"], signal["action"], result["status"], result["detail"])
             db.record_floor_broker_event(state["symbol"], "skip", result["detail"])
