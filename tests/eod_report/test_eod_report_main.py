@@ -48,6 +48,15 @@ class FakeTradingClient:
         return self._activities
 
 
+class FakeResponse:
+    def __init__(self, status_error=None):
+        self._status_error = status_error
+
+    def raise_for_status(self):
+        if self._status_error:
+            raise self._status_error
+
+
 def _silence_slack(monkeypatch):
     calls = {}
     monkeypatch.setattr(main.slack, "notify_market_closed", lambda *a, **k: calls.setdefault("market_closed", (a, k)))
@@ -94,6 +103,7 @@ def test_open_market_sends_full_eod_report(monkeypatch):
     fake_client = FakeTradingClient(activities=[])
     monkeypatch.setattr(main, "trading_client", fake_client)
     monkeypatch.setattr(eod, "trading_client", fake_client)
+    monkeypatch.setattr(main, "_trigger_pl_badges_workflow", lambda: None)
     close = _close_at(16)
     _set_now(monkeypatch, close + timedelta(minutes=30))
     monkeypatch.setattr(main, "get_stock_market_close", lambda day: close)
@@ -139,6 +149,7 @@ def test_eod_report_sends_at_early_close_plus_thirty(monkeypatch):
     fake_client = FakeTradingClient(activities=[])
     monkeypatch.setattr(main, "trading_client", fake_client)
     monkeypatch.setattr(eod, "trading_client", fake_client)
+    monkeypatch.setattr(main, "_trigger_pl_badges_workflow", lambda: None)
     close = _close_at(13)
     _set_now(monkeypatch, close + timedelta(minutes=30))
     monkeypatch.setattr(main, "get_stock_market_close", lambda day: close)
@@ -177,6 +188,11 @@ def test_alpaca_failure_notifies_error_and_reraises(monkeypatch):
 
     fake_client = FailingTradingClient()
     monkeypatch.setattr(main, "trading_client", fake_client)
+    monkeypatch.setattr(
+        main,
+        "_trigger_pl_badges_workflow",
+        lambda: (_ for _ in ()).throw(AssertionError("must not dispatch after failed EOD")),
+    )
     close = _close_at(16)
     _set_now(monkeypatch, close + timedelta(minutes=30))
     monkeypatch.setattr(main, "get_stock_market_close", lambda day: close)
@@ -192,3 +208,44 @@ def test_alpaca_failure_notifies_error_and_reraises(monkeypatch):
     assert raised
     assert "error" in calls
     assert "eod_report" not in calls
+
+
+def test_successful_eod_dispatches_pl_badges_workflow(monkeypatch):
+    fake_client = FakeTradingClient(activities=[])
+    monkeypatch.setattr(main, "trading_client", fake_client)
+    monkeypatch.setattr(eod, "trading_client", fake_client)
+    monkeypatch.setenv("GITHUB_WORKFLOW_TOKEN", "token-123")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "miramar-labs-org/multi-agent-ai-trader")
+    close = _close_at(16)
+    _set_now(monkeypatch, close + timedelta(minutes=30))
+    monkeypatch.setattr(main, "get_stock_market_close", lambda day: close)
+    _not_sent(monkeypatch)
+    _silence_slack(monkeypatch)
+    posts = []
+    monkeypatch.setattr(
+        main.requests,
+        "post",
+        lambda *args, **kwargs: posts.append((args, kwargs)) or FakeResponse(),
+    )
+
+    main.main()
+
+    assert len(posts) == 1
+    args, kwargs = posts[0]
+    assert args == (
+        "https://api.github.com/repos/miramar-labs-org/multi-agent-ai-trader/actions/workflows/pl-badges.yaml/dispatches",
+    )
+    assert kwargs["headers"]["Authorization"] == "Bearer token-123"
+    assert kwargs["json"] == {"ref": "main"}
+    assert kwargs["timeout"] == 15
+
+
+def test_pl_badges_workflow_dispatch_skips_without_token(monkeypatch):
+    monkeypatch.delenv("GITHUB_WORKFLOW_TOKEN", raising=False)
+    monkeypatch.setattr(
+        main.requests,
+        "post",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not call GitHub without token")),
+    )
+
+    main._trigger_pl_badges_workflow()

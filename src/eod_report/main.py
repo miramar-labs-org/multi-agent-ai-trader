@@ -1,6 +1,8 @@
+import os
 from datetime import datetime, timedelta
 
 import pytz
+import requests
 
 from src.common import db, slack
 from src.common.alpaca_client import trading_client
@@ -13,6 +15,33 @@ log = get_logger("EOD")
 
 def _now_eastern() -> datetime:
     return datetime.now(pytz.timezone("US/Eastern"))
+
+
+def _trigger_pl_badges_workflow() -> None:
+    """Best-effort GitHub Actions dispatch; badge refresh must not block the Slack EOD report."""
+    token = os.environ.get("GITHUB_WORKFLOW_TOKEN")
+    if not token:
+        log("⚠️ GITHUB_WORKFLOW_TOKEN not set; skipping P/L badge workflow dispatch")
+        return
+
+    repository = os.environ.get("GITHUB_REPOSITORY", "miramar-labs-org/multi-agent-ai-trader")
+    workflow_file = os.environ.get("PL_BADGES_WORKFLOW_FILE", "pl-badges.yaml")
+    url = f"https://api.github.com/repos/{repository}/actions/workflows/{workflow_file}/dispatches"
+    try:
+        response = requests.post(
+            url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {token}",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            json={"ref": "main"},
+            timeout=15,
+        )
+        response.raise_for_status()
+        log("✅ P/L badge workflow dispatched")
+    except Exception as exc:
+        log(f"⚠️ P/L badge workflow dispatch failed: {exc}")
 
 
 def main():
@@ -57,6 +86,7 @@ def main():
 
     slack.notify_eod_report(today.isoformat(), account_summary, fills, position_summaries)
     db.record_eod_report_sent(today)
+    _trigger_pl_badges_workflow()
     log(f"✅ EOD report sent — {len(fills)} fill(s), {len(position_summaries)} open position(s)")
 
 

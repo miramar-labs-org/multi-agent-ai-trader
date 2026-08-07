@@ -545,10 +545,13 @@ see [`docs/backtesting.md`](backtesting.md) for the full design and documented a
 
 ## P/L badges (`src/pl_badges/`)
 
-**Not a k8s workload** — run by a scheduled GHA workflow, `.github/workflows/pl-badges.yaml`
+**Not a k8s workload** — run by a GHA workflow, `.github/workflows/pl-badges.yaml`
 (`45 21 * * *` UTC, plus `workflow_dispatch`), on the same `[self-hosted, dgx]` runner as
-`test-lint.yaml`. Entrypoint: `python -m src.pl_badges.main`. Computes Today's and YTD aggregate
-P&L from the paper account (`src.common.pl_badges.fetch_pl_summary()` — today's P&L is
+`test-lint.yaml`. EOD Report also dispatches this workflow immediately after a successful Slack
+EOD post when its pod has `GITHUB_WORKFLOW_TOKEN` set in the `mlabs-api-keys` secret; missing or
+failing dispatch is logged as a warning and never blocks the EOD report itself. Entrypoint:
+`python -m src.pl_badges.main`. Computes Today's and YTD aggregate P&L from the paper account
+(`src.common.pl_badges.fetch_pl_summary()` — today's P&L is
 `account.equity - account.last_equity`, the same math `execution.py`'s daily loss limit check
 uses; YTD P&L is `equity - base_value` from a `get_portfolio_history()` request starting Jan 1 of
 the current year — confirmed against a live account that `PortfolioHistory.profit_loss` is a
