@@ -14,7 +14,8 @@ name: Test and Lint
 # in CI would fail on unrelated files. ruff check (lint rules) has no such drift and is safe to
 # gate on.
 #
-# Runs on Python 3.12, matching the Dockerfile.* runtime images.
+# Runs on Python 3.11 because the current self-hosted runner image does not provide python3.12.
+# Dockerfile.* still runs production services on Python 3.12.
 
 on:
   push:
@@ -31,7 +32,7 @@ jobs:
 
       - name: Set up virtualenv
         run: |
-          python3.12 -m venv .venv-ci
+          python3.11 -m venv .venv-ci
           .venv-ci/bin/pip install --upgrade pip
           .venv-ci/bin/pip install -r requirements-dev.txt
 
