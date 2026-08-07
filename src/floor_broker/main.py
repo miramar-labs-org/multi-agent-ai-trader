@@ -3,7 +3,7 @@ import time
 
 import uvicorn
 
-from src.common import db, kill_switch, slack
+from src.common import db, kill_switch, slack, symbols
 from src.common.logging import get_logger
 from src.floor_broker import execution
 
@@ -14,6 +14,7 @@ KILL_SWITCH_POLL_INTERVAL_S = 30
 PENDING_FILL_POLL_INTERVAL_S = 30
 RECONCILIATION_RETRY_INTERVAL_S = 60
 EOD_FLATTEN_POLL_INTERVAL_S = 60
+SYMBOL_BASES_POLL_INTERVAL_S = symbols.REFRESH_INTERVAL_S
 
 
 def poll_bracket_fills():
@@ -180,6 +181,20 @@ def poll_reconciliation():
             log(f"💥 background reconciliation attempt failed: {exc}")
 
 
+def poll_symbol_bases():
+    """Runs for the lifetime of the process, periodically refreshing the known-USD-crypto-base
+    set (see src.common.symbols) from Alpaca's own tradable crypto asset list -- keeps
+    canonical_crypto_symbol()/is_usd_crypto_symbol() correct as Alpaca lists new coins, without
+    ever blocking the hot paths that call them on a live Alpaca request."""
+    while True:
+        try:
+            count = symbols.refresh_known_usd_crypto_bases_from_alpaca()
+            log(f"🔄  refreshed known USD crypto bases from Alpaca ({count} base(s))")
+        except Exception as exc:
+            log(f"💥 symbol-bases poll failed: {exc}")
+        time.sleep(SYMBOL_BASES_POLL_INTERVAL_S)
+
+
 def main():
     execution.reconstruct_tracked_state()
     threading.Thread(target=poll_reconciliation, daemon=True).start()
@@ -187,6 +202,7 @@ def main():
     threading.Thread(target=poll_pending_fills, daemon=True).start()
     threading.Thread(target=poll_kill_switch, daemon=True).start()
     threading.Thread(target=poll_eod_flatten, daemon=True).start()
+    threading.Thread(target=poll_symbol_bases, daemon=True).start()
     uvicorn.run("src.floor_broker.app:app", host="0.0.0.0", port=8000)
 
 

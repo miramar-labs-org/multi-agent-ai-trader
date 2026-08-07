@@ -92,6 +92,43 @@ def test_market_open_does_not_post_closed_notice(monkeypatch):
     assert posted == {}
 
 
+def test_refresh_symbol_bases_if_due_skips_within_the_interval(monkeypatch):
+    monkeypatch.setattr(dealer_main.time, "monotonic", lambda: 1000.0)
+    monkeypatch.setattr(dealer_main, "_last_symbol_bases_refresh", 1000.0 - (dealer_main.symbols.REFRESH_INTERVAL_S - 1))
+    calls = []
+    monkeypatch.setattr(dealer_main.symbols, "refresh_known_usd_crypto_bases_from_alpaca", lambda: calls.append(1) or 11)
+
+    dealer_main.refresh_symbol_bases_if_due()
+
+    assert calls == []
+
+
+def test_refresh_symbol_bases_if_due_refreshes_once_the_interval_has_elapsed(monkeypatch):
+    monkeypatch.setattr(dealer_main.time, "monotonic", lambda: 1000.0)
+    monkeypatch.setattr(dealer_main, "_last_symbol_bases_refresh", 1000.0 - (dealer_main.symbols.REFRESH_INTERVAL_S + 1))
+    calls = []
+    monkeypatch.setattr(dealer_main.symbols, "refresh_known_usd_crypto_bases_from_alpaca", lambda: calls.append(1) or 11)
+
+    dealer_main.refresh_symbol_bases_if_due()
+
+    assert calls == [1]
+    assert dealer_main._last_symbol_bases_refresh == 1000.0
+
+
+def test_refresh_symbol_bases_if_due_survives_an_exception(monkeypatch):
+    monkeypatch.setattr(dealer_main.time, "monotonic", lambda: 1000.0)
+    monkeypatch.setattr(dealer_main, "_last_symbol_bases_refresh", 1000.0 - (dealer_main.symbols.REFRESH_INTERVAL_S + 1))
+
+    def _raise():
+        raise RuntimeError("alpaca unavailable")
+
+    monkeypatch.setattr(dealer_main.symbols, "refresh_known_usd_crypto_bases_from_alpaca", _raise)
+
+    dealer_main.refresh_symbol_bases_if_due()  # must not raise
+
+    assert dealer_main._last_symbol_bases_refresh == 1000.0
+
+
 def test_market_override_does_not_post_closed_notice(monkeypatch):
     monkeypatch.setattr(dealer_main, "_last_market_open", False)
     posted = {}

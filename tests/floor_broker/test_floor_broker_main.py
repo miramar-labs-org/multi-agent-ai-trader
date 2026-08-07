@@ -406,3 +406,25 @@ def test_poll_kill_switch_survives_an_exception_and_reaches_the_next_sleep(monke
 
     with pytest.raises(_StopLoop):
         fb_main.poll_kill_switch()
+
+
+def test_poll_symbol_bases_refreshes_on_each_iteration(monkeypatch):
+    calls = []
+    monkeypatch.setattr(fb_main.symbols, "refresh_known_usd_crypto_bases_from_alpaca", lambda: calls.append(1) or 12)
+    monkeypatch.setattr(fb_main.time, "sleep", _stop_after(2))
+
+    with pytest.raises(_StopLoop):
+        fb_main.poll_symbol_bases()
+
+    assert len(calls) == 2
+
+
+def test_poll_symbol_bases_survives_an_exception_and_reaches_the_next_sleep(monkeypatch):
+    def _raise():
+        raise RuntimeError("alpaca unavailable")
+
+    monkeypatch.setattr(fb_main.symbols, "refresh_known_usd_crypto_bases_from_alpaca", _raise)
+    monkeypatch.setattr(fb_main.time, "sleep", _stop_after(1))
+
+    with pytest.raises(_StopLoop):
+        fb_main.poll_symbol_bases()

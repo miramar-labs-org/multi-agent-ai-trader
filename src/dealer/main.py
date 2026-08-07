@@ -5,7 +5,7 @@ from datetime import datetime, time as dtime, timedelta
 import pytz
 from kubernetes.client.exceptions import ApiException
 
-from src.common import langsmith, slack
+from src.common import langsmith, slack, symbols
 from src.common.alpaca_client import trading_client
 from src.common.config import load_config
 from src.common.logging import get_logger
@@ -16,6 +16,7 @@ log = get_logger("DEALER")
 
 _last_market_open = None  # edge-detects open/closed transitions so Slack gets one notice per
                           # transition, not a repeat every poll cycle while the market stays closed
+_last_symbol_bases_refresh = 0.0  # monotonic timestamp; gates refresh_symbol_bases_if_due() below
 
 
 def _now_et() -> datetime:
@@ -70,6 +71,24 @@ def market_is_open(cfg, log) -> bool:
     return False
 
 
+def refresh_symbol_bases_if_due() -> None:
+    """Dealer has no dedicated poll thread (unlike Floor Broker's poll_symbol_bases()) -- it's a
+    single loop already gated by cfg.trading.pollsecs (10 min by default), well under
+    symbols.REFRESH_INTERVAL_S. This throttles the Alpaca asset-list refresh to that shared
+    interval so merge_held_positions()'s crypto-symbol canonicalization stays correct without
+    hitting Alpaca on every dealer poll cycle."""
+    global _last_symbol_bases_refresh
+    now = time.monotonic()
+    if now - _last_symbol_bases_refresh < symbols.REFRESH_INTERVAL_S:
+        return
+    try:
+        count = symbols.refresh_known_usd_crypto_bases_from_alpaca()
+        log(f"🔄  refreshed known USD crypto bases from Alpaca ({count} base(s))")
+    except Exception as exc:
+        log(f"💥 symbol-bases refresh failed: {exc}")
+    _last_symbol_bases_refresh = now
+
+
 def main():
     langsmith.configure(load_config())
 
@@ -77,6 +96,7 @@ def main():
 
     while True:
         cfg = load_config()  # reloaded every poll cycle so a live config change never needs a restart
+        refresh_symbol_bases_if_due()
         if market_is_open(cfg, log):
             try:
                 portfolio = merge_held_positions(read_portfolio(), cfg)
