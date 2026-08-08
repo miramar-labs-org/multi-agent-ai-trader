@@ -9,7 +9,7 @@ from src.power_scheduler import main
 EASTERN = pytz.timezone("US/Eastern")
 
 
-def _cfg(minutes_before_open=60, minutes_after_close=60, flatten_crypto=True, enabled=True):
+def _cfg(minutes_before_open=60, minutes_after_close=60, flatten_crypto=True, enabled=True, manage_ollama=True):
     return OmegaConf.create(
         {
             "power_schedule": {
@@ -17,8 +17,10 @@ def _cfg(minutes_before_open=60, minutes_after_close=60, flatten_crypto=True, en
                 "minutes_before_open": minutes_before_open,
                 "minutes_after_close": minutes_after_close,
                 "flatten_crypto_before_powerdown": flatten_crypto,
+                "manage_ollama_model": manage_ollama,
             },
             "floor_broker": {"base_url": "http://floor-broker.test:8000"},
+            "llm": {"base_url": "http://ollama.test:11434/v1", "model": "qwen3.6:35b-a3b"},
         }
     )
 
@@ -100,12 +102,76 @@ def test_wait_until_floor_broker_ready_returns_false_after_timeout(monkeypatch):
     assert main._wait_until_floor_broker_ready(_cfg(), timeout_s=0) is False
 
 
+# --- _stop_ollama_model / _start_ollama_model -------------------------------
+
+
+def test_ollama_native_url_strips_v1_suffix():
+    assert main._ollama_native_url(_cfg()) == "http://ollama.test:11434"
+
+
+def test_stop_ollama_model_posts_keep_alive_zero(monkeypatch):
+    posted = {}
+
+    def _fake_post(url, json=None, timeout=None):
+        posted.update(url=url, json=json, timeout=timeout)
+        return FakeResponse()
+
+    monkeypatch.setattr(main.requests, "post", _fake_post)
+
+    main._stop_ollama_model(_cfg())
+
+    assert posted["url"] == "http://ollama.test:11434/api/generate"
+    assert posted["json"] == {"model": "qwen3.6:35b-a3b", "keep_alive": 0}
+
+
+def test_start_ollama_model_posts_keep_alive_forever(monkeypatch):
+    posted = {}
+
+    def _fake_post(url, json=None, timeout=None):
+        posted.update(url=url, json=json, timeout=timeout)
+        return FakeResponse()
+
+    monkeypatch.setattr(main.requests, "post", _fake_post)
+
+    main._start_ollama_model(_cfg())
+
+    assert posted["url"] == "http://ollama.test:11434/api/generate"
+    assert posted["json"] == {"model": "qwen3.6:35b-a3b", "keep_alive": -1}
+
+
+def test_stop_ollama_model_notifies_but_does_not_raise_on_request_failure(monkeypatch):
+    def _raise(*a, **k):
+        raise main.requests.RequestException("connection refused")
+
+    monkeypatch.setattr(main.requests, "post", _raise)
+    errors = {}
+    monkeypatch.setattr(main.slack, "notify_error", lambda component, text: errors.setdefault("text", text))
+
+    main._stop_ollama_model(_cfg())  # must not raise
+
+    assert "text" in errors
+
+
+def test_start_ollama_model_notifies_but_does_not_raise_on_request_failure(monkeypatch):
+    def _raise(*a, **k):
+        raise main.requests.RequestException("timed out")
+
+    monkeypatch.setattr(main.requests, "post", _raise)
+    errors = {}
+    monkeypatch.setattr(main.slack, "notify_error", lambda component, text: errors.setdefault("text", text))
+
+    main._start_ollama_model(_cfg())  # must not raise
+
+    assert "text" in errors
+
+
 # --- _power_down / _power_up orchestration ----------------------------------
 
 
 def test_power_down_scales_dealer_first_then_flattens_and_scales_floor_broker(monkeypatch):
     calls = []
     monkeypatch.setattr(main, "_scale", lambda apps_v1, name, replicas: calls.append((name, replicas)))
+    monkeypatch.setattr(main, "_stop_ollama_model", lambda cfg: None)
     monkeypatch.setattr(main.requests, "post", lambda url, timeout: FakeResponse(json_data={"events": [{"symbol": "BTC/USD"}]}))
     monkeypatch.setattr(main, "_wait_until_crypto_flat", lambda: True)
     notified = {}
@@ -121,6 +187,7 @@ def test_power_down_scales_dealer_first_then_flattens_and_scales_floor_broker(mo
 def test_power_down_aborts_and_leaves_floor_broker_up_when_crypto_never_flattens(monkeypatch):
     calls = []
     monkeypatch.setattr(main, "_scale", lambda apps_v1, name, replicas: calls.append((name, replicas)))
+    monkeypatch.setattr(main, "_stop_ollama_model", lambda cfg: None)
     monkeypatch.setattr(main.requests, "post", lambda url, timeout: FakeResponse(json_data={"events": []}))
     monkeypatch.setattr(main, "_wait_until_crypto_flat", lambda: False)
     errors = {}
@@ -135,6 +202,7 @@ def test_power_down_aborts_and_leaves_floor_broker_up_when_crypto_never_flattens
 def test_power_down_skips_flatten_request_when_disabled_by_config(monkeypatch):
     calls = []
     monkeypatch.setattr(main, "_scale", lambda apps_v1, name, replicas: calls.append((name, replicas)))
+    monkeypatch.setattr(main, "_stop_ollama_model", lambda cfg: None)
     posted = {"called": False}
 
     def _fake_post(*a, **k):
@@ -154,6 +222,7 @@ def test_power_down_skips_flatten_request_when_disabled_by_config(monkeypatch):
 def test_power_down_aborts_when_flatten_crypto_request_fails(monkeypatch):
     calls = []
     monkeypatch.setattr(main, "_scale", lambda apps_v1, name, replicas: calls.append((name, replicas)))
+    monkeypatch.setattr(main, "_stop_ollama_model", lambda cfg: None)
 
     def _raise(*a, **k):
         raise main.requests.RequestException("connection refused")
@@ -168,10 +237,38 @@ def test_power_down_aborts_when_flatten_crypto_request_fails(monkeypatch):
     assert "text" in errors
 
 
+def test_power_down_stops_ollama_model_after_scaling_dealer_to_zero(monkeypatch):
+    order = []
+    monkeypatch.setattr(main, "_scale", lambda apps_v1, name, replicas: order.append(("scale", name, replicas)))
+    monkeypatch.setattr(main, "_stop_ollama_model", lambda cfg: order.append(("stop_ollama",)))
+    monkeypatch.setattr(main.requests, "post", lambda url, timeout: FakeResponse(json_data={"events": []}))
+    monkeypatch.setattr(main, "_wait_until_crypto_flat", lambda: True)
+    monkeypatch.setattr(main.slack, "notify_power_state", lambda *a, **k: None)
+
+    main._power_down(None, _cfg())
+
+    assert order[0] == ("scale", "dealer", 0)
+    assert order[1] == ("stop_ollama",)
+
+
+def test_power_down_skips_ollama_stop_when_disabled_by_config(monkeypatch):
+    monkeypatch.setattr(main, "_scale", lambda apps_v1, name, replicas: None)
+    called = {"stop": False}
+    monkeypatch.setattr(main, "_stop_ollama_model", lambda cfg: called.__setitem__("stop", True))
+    monkeypatch.setattr(main.requests, "post", lambda url, timeout: FakeResponse(json_data={"events": []}))
+    monkeypatch.setattr(main, "_wait_until_crypto_flat", lambda: True)
+    monkeypatch.setattr(main.slack, "notify_power_state", lambda *a, **k: None)
+
+    main._power_down(None, _cfg(manage_ollama=False))
+
+    assert called["stop"] is False
+
+
 def test_power_up_scales_floor_broker_first_then_dealer(monkeypatch):
     calls = []
     monkeypatch.setattr(main, "_scale", lambda apps_v1, name, replicas: calls.append((name, replicas)))
     monkeypatch.setattr(main, "_wait_until_floor_broker_ready", lambda cfg: True)
+    monkeypatch.setattr(main, "_start_ollama_model", lambda cfg: None)
     notified = {}
     monkeypatch.setattr(main.slack, "notify_power_state", lambda action, detail: notified.update(action=action))
 
@@ -192,6 +289,30 @@ def test_power_up_leaves_dealer_at_zero_when_floor_broker_never_ready(monkeypatc
 
     assert calls == [("floor-broker", 1)]
     assert "text" in errors
+
+
+def test_power_up_starts_ollama_model_after_floor_broker_ready_before_dealer(monkeypatch):
+    order = []
+    monkeypatch.setattr(main, "_scale", lambda apps_v1, name, replicas: order.append(("scale", name, replicas)))
+    monkeypatch.setattr(main, "_wait_until_floor_broker_ready", lambda cfg: True)
+    monkeypatch.setattr(main, "_start_ollama_model", lambda cfg: order.append(("start_ollama",)))
+    monkeypatch.setattr(main.slack, "notify_power_state", lambda *a, **k: None)
+
+    main._power_up(None, _cfg())
+
+    assert order == [("scale", "floor-broker", 1), ("start_ollama",), ("scale", "dealer", 1)]
+
+
+def test_power_up_skips_ollama_start_when_disabled_by_config(monkeypatch):
+    monkeypatch.setattr(main, "_scale", lambda apps_v1, name, replicas: None)
+    monkeypatch.setattr(main, "_wait_until_floor_broker_ready", lambda cfg: True)
+    called = {"start": False}
+    monkeypatch.setattr(main, "_start_ollama_model", lambda cfg: called.__setitem__("start", True))
+    monkeypatch.setattr(main.slack, "notify_power_state", lambda *a, **k: None)
+
+    main._power_up(None, _cfg(manage_ollama=False))
+
+    assert called["start"] is False
 
 
 # --- main() reconcile dispatch ----------------------------------------------

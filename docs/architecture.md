@@ -577,6 +577,24 @@ only useful ~6.5 hours a day, and scales them back to 1 before the next session.
    scale `floor-broker` to 1, poll its `/healthz` for up to 60s, then scale `dealer` to 1 and
    `slack.notify_power_state`.
 
+**Ollama model stop/start** (gated by `power_schedule.manage_ollama_model`, default true): the
+`llm.model` configured for Analyst/Dealer (`qwen3.6:35b-a3b` as of 2026-08-07) is only used by
+this project, but Ollama (a systemd service on the DGX host, outside k3s) otherwise keeps it
+resident in GPU memory indefinitely once loaded, pinning the GPU in its max-power P0 state even
+at 0% utilization. `_stop_ollama_model`/`_start_ollama_model` call Ollama's *native* API (not the
+OpenAI-compat `/v1` prefix `llm.base_url` uses for inference — `_ollama_native_url` strips that
+suffix) with `POST /api/generate {"model": ..., "keep_alive": 0 | -1}` and no `"prompt"` field,
+which unloads/preloads the model without generating text. Stop fires right after `dealer` scales
+to 0 in `_power_down`; preload fires right after Floor Broker is confirmed ready in `_power_up`,
+before `dealer` scales to 1, so Dealer's first poll never hits a cold model. Both are
+non-blocking: a failed stop/preload is logged and `slack.notify_error`'d but never aborts or
+delays power-down/power-up — this is a power-saving optimization, not a trading safety control,
+and Ollama auto-loads on first request regardless (just slower, ~10-30s for this model's ~23GB
+off NVMe) if a preload is missed. Analyst's earliest run (`55 8 * * *` `America/New_York`, i.e.
+08:55 ET) lands well after the power-up window opens (`open - minutes_before_open`, e.g. 08:30 ET
+for a 09:30 open) and power_scheduler's 15-minute tick, so the model is already warm by the time
+Analyst needs it.
+
 **Why crypto needs special handling:** crypto trades 24/7, and its stop-loss/take-profit is
 *synthetic* — enforced only by Floor Broker's own `poll_bracket_fills` → `check_crypto_stops()`
 loop (Alpaca has no server-side bracket order support for crypto). Scaling Floor Broker to 0 with
@@ -810,6 +828,7 @@ isn't purely for human/skill consumption.
 | `power_schedule` | `minutes_after_close` | scale `dealer`/`floor-broker` to 0 replicas this many minutes after today's official market close (default 60) |
 | `power_schedule` | `minutes_before_open` | scale back to 1 replica this many minutes before the next trading day's official open (default 60) |
 | `power_schedule` | `flatten_crypto_before_powerdown` | when true (default), force-sells every open crypto position and verifies it's flat before scaling `floor-broker` down — crypto's stop-loss/take-profit is only enforced by that pod's own poll loop, so an open position would otherwise be unprotected while it's scaled to 0 |
+| `power_schedule` | `manage_ollama_model` | when true (default), stops `llm.model` in Ollama (`keep_alive: 0`) right after `dealer` scales to 0, and preloads it (`keep_alive: -1`) right after `floor-broker` is confirmed ready on power-up, before `dealer` scales back to 1 — avoids leaving the GPU pinned in its max-power P0 state overnight; failures are logged/Slack-notified but never block power-down/power-up |
 | `earnings_blackout` | `enabled` | feature gate for the earnings-date filter in `discover_candidates` (`src/analyst/graph.py`) — `true` as of 2026-08-05; when false, the stock screener list is unfiltered by earnings dates and Finnhub is never called; requires `FINNHUB_API_KEY` (verified working 2026-08-05) |
 | `earnings_blackout` | `days_before` | drop a screener candidate if it's reporting earnings within this many calendar days from today (default 2) — anticipation/IV-crush risk pre-report |
 | `earnings_blackout` | `days_after` | drop a screener candidate if it reported earnings within this many calendar days before today (default 1) — post-report gap risk, covers both BMO and AMC reporters without a week-long exclusion |

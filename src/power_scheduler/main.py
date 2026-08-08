@@ -19,6 +19,8 @@ NAMESPACE = "multi-agent-ai-trader"
 POLL_INTERVAL_S = 5
 CRYPTO_FLAT_TIMEOUT_S = 60
 FLOOR_BROKER_READY_TIMEOUT_S = 60
+OLLAMA_STOP_TIMEOUT_S = 10
+OLLAMA_PRELOAD_TIMEOUT_S = 60
 
 
 def _now_eastern() -> datetime:
@@ -76,12 +78,49 @@ def _wait_until_floor_broker_ready(cfg, timeout_s: int = FLOOR_BROKER_READY_TIME
         time.sleep(POLL_INTERVAL_S)
 
 
+def _ollama_native_url(cfg) -> str:
+    """cfg.llm.base_url is the OpenAI-compat prefix (".../v1") used for inference; Ollama's
+    native keep_alive control (stop/preload) lives at the API root, not under /v1."""
+    return cfg.llm.base_url.removesuffix("/v1")
+
+
+def _stop_ollama_model(cfg) -> None:
+    try:
+        resp = requests.post(
+            f"{_ollama_native_url(cfg)}/api/generate",
+            json={"model": cfg.llm.model, "keep_alive": 0},
+            timeout=OLLAMA_STOP_TIMEOUT_S,
+        )
+        resp.raise_for_status()
+        log(f"🧠  stopped ollama model {cfg.llm.model}")
+    except requests.RequestException as exc:
+        log(f"💥  failed to stop ollama model {cfg.llm.model}: {exc}")
+        slack.notify_error("POWER", f"failed to stop ollama model {cfg.llm.model}: {exc}")
+
+
+def _start_ollama_model(cfg) -> None:
+    try:
+        resp = requests.post(
+            f"{_ollama_native_url(cfg)}/api/generate",
+            json={"model": cfg.llm.model, "keep_alive": -1},
+            timeout=OLLAMA_PRELOAD_TIMEOUT_S,
+        )
+        resp.raise_for_status()
+        log(f"🧠  preloaded ollama model {cfg.llm.model}")
+    except requests.RequestException as exc:
+        log(f"💥  failed to preload ollama model {cfg.llm.model}: {exc}")
+        slack.notify_error("POWER", f"failed to preload ollama model {cfg.llm.model}: {exc}")
+
+
 def _power_down(apps_v1, cfg) -> None:
     """Dealer stops first (no state/positions, safe to kill immediately) so it can't fire a new
     BUY mid-flatten. Floor Broker stays up until crypto is confirmed flat -- it's the only thing
     enforcing crypto's synthetic stop-loss/take-profit, so scaling it to 0 with a position still
     open would leave that position completely unprotected overnight."""
     _scale(apps_v1, "dealer", 0)
+
+    if cfg.power_schedule.manage_ollama_model:
+        _stop_ollama_model(cfg)
 
     events = []
     if cfg.power_schedule.flatten_crypto_before_powerdown:
@@ -110,6 +149,9 @@ def _power_up(apps_v1, cfg) -> None:
         log("💥  floor-broker not ready after timeout -- dealer left at 0")
         slack.notify_error("POWER", "power-up incomplete -- floor-broker not ready after timeout, dealer left at 0")
         return
+
+    if cfg.power_schedule.manage_ollama_model:
+        _start_ollama_model(cfg)
 
     _scale(apps_v1, "dealer", 1)
     slack.notify_power_state("powered_up", "")

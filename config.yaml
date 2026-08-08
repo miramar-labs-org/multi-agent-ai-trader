@@ -95,6 +95,13 @@ power_schedule:
                                            # server-side bracket support for crypto) -- an open
                                            # crypto position would be completely unprotected while
                                            # floor-broker is scaled to 0, so it's force-sold first.
+  manage_ollama_model: true   # stop the llm.model in Ollama (native keep_alive=0) right after
+                               # dealer scales to 0, and preload it (keep_alive=-1) right after
+                               # floor-broker is confirmed ready on power-up, before dealer scales
+                               # back to 1 -- avoids leaving the GPU pinned in its max-power P0
+                               # state overnight for a model only this project uses. Failures here
+                               # are logged/Slack-notified but never abort/block power-down or
+                               # power-up -- it's an optimization, not a safety control.
                                            # Stocks need no equivalent flag: eod_flatten already
                                            # unconditionally flattens them near close.
 
