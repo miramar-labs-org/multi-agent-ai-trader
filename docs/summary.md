@@ -25,6 +25,13 @@ a new feature ships.
 
 | Date | Feature | Summary | Status |
 |---|---|---|---|
+| 2026-08-07 | Ollama model stop/preload on power schedule | When the trading system powers down for the night, the local AI model is also unloaded from GPU memory, then reloaded just before the system wakes back up — so the machine can actually go idle overnight instead of sitting warm for a market that's closed. | On |
+| 2026-08-07 | Nightly power-down/power-up | Dealer and Floor Broker are scaled off about an hour after market close and back on about an hour before the next open, instead of running around the clock for a market that's only open ~6.5 hours a day. Any open crypto position is force-closed first, since crypto's stop-loss/take-profit protection only works while Floor Broker is running. | On |
+| 2026-08-07 | Position limit cap | Stops opening brand-new positions once too many are already open at the same time, so one bad stretch can't spread risk across an unbounded number of simultaneous bets. | On |
+| 2026-08-07 | Risk-based position sizing | Caps how much a single stopped-out trade can lose, regardless of the budget the Analyst assigned it, by scaling the trade size down so a full stop-loss hit costs at most a fixed dollar amount. | On |
+| 2026-08-07 | Confidence gate | The Dealer's AI now also reports how confident it is in each buy call, and a low-confidence buy is skipped automatically before it ever reaches the Floor Broker. | On |
+| 2026-08-07 | Win-rate throttle | If the trailing win rate on recent stop-loss/take-profit exits drops too low, new buys pause automatically until it recovers — existing positions can still be sold anytime. | On |
+| 2026-08-05 | Live P/L badges | Adds "Today's P/L" and "Year-to-date P/L" badges to the README, refreshed automatically after each trading day closes. | On |
 | 2026-08-05 | Earnings blackout | Drops a screener candidate from the watchlist if it's about to report earnings or just did, avoiding the price swings those reports can cause. | On |
 | 2026-08-05 | Macro-event blackout | Pauses new buys for the whole day on FOMC/CPI/jobs-report/PCE dates and quarterly "quad witching" days, when the whole market can move sharply. Selling is never paused. | On |
 | 2026-08-05 | Conditional EOD flatten | End-of-day flatten only closes everything out if today's overall unrealized P&L is break-even or better; on a down day it holds positions overnight instead (except any held too long). | Off |
@@ -226,6 +233,22 @@ its output reliably machine-usable.
   economic release (Fed rate decisions, inflation/jobs reports, and similar) or on quarterly
   "quad witching" days, when the whole market — not just one stock — tends to move sharply.
   Selling out of existing positions is never paused by this.
+- **Position limit cap** — once too many positions are open at the same time (10 by default), no
+  new (non-top-up) buy goes out until something closes and frees up a slot, so one bad stretch
+  can't spread risk across an unbounded number of simultaneous bets.
+- **Risk-based position sizing** — a stopped-out trade is capped to lose at most a fixed dollar
+  amount ($100 by default), regardless of how large a budget the Analyst assigned it. This only
+  ever scales a trade's size *down* from what the Analyst authorized, never up.
+- **Confidence gate** — the Dealer's AI now scores its own confidence (0-100%) on every buy call,
+  and a buy below the configured floor (60% by default) is skipped automatically before it's ever
+  forwarded to the Floor Broker. Sells and holds are unaffected.
+- **Win-rate throttle** — if the trailing win rate on recent stop-loss/take-profit exits falls
+  below a floor (30% by default, over the last several trading days), new buys pause
+  automatically until it recovers. Existing positions can still be sold at any time.
+- **Nightly power-down** — Dealer and Floor Broker turn off about an hour after market close and
+  back on about an hour before the next open, so nothing is running (or exposed) outside the
+  hours it's actually needed. Any open crypto position is force-closed first, since crypto's
+  stop-loss/take-profit protection only works while Floor Broker is running.
 
 ## What this system is not (yet)
 
