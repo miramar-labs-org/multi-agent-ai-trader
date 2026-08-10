@@ -137,3 +137,48 @@ above reflects the pre-existing position's total gain/loss, not something that h
 - **BTC/USD** (17:55): `"Internal Server Error"` on a submit attempt.
 - **no_fill** (canceled, never filled): AAOZ (14:59), PLTL (15:22), GTE (17:16), SPPL (17:30),
   AHCO (18:20).
+
+## 2026-08-10 16:07 ET
+
+**P&L: \$0.00 (0.00%)** — equity \$998,697.12, exactly flat vs. prior close of \$998,697.12. Zero
+fills, zero open positions, completely flat book all day.
+
+The Analyst ran two batches today (13:04 ET: RCEL, CVRX, PN, TTDU, VATE, BTC/USD, SOL/USD,
+CRV/USD, WIF/USD, LDO/USD; 16:45 ET: JWEL, STKH, XHLD, FEAM, TENX, WYHG). The Dealer made 156
+decisions across the day's poll cycles, but not a single one reached a fill — every action got
+vetoed downstream, for two different reasons.
+
+### Every BUY got blocked by the win-rate throttle
+
+CVRX, PN, TTDU, VATE, JWEL, STKH, XHLD, FEAM, TENX, and WYHG all drew repeated BUY calls from the
+Dealer over the day — e.g. CVRX: *"RSI at 14.21 signals deeply oversold conditions... MACD line
+has crossed above the signal line... confluence of deep oversold RSI, bullish MACD crossover, and
+lower-band proximity strongly supports a short-term bounce trade"* (13:52 ET), and WYHG: *"Price
+holding above the VWAP and BB upper band with RSI at 62.96 confirms strong intraday buying
+pressure"* (19:14 ET). Every one of these was vetoed at Floor Broker with the same message:
+`"new BUY entries paused: trailing win rate 16% (4W/21L over 25 exits) below minimum 30%"` — 38
+such skips today. This is the `enable_win_rate_throttle` risk control working as designed, not a
+bug.
+
+### Every SELL found nothing to sell
+
+RCEL (Dealer repeatedly called SELL on overbought RSI, e.g. *"RSI at 76.75... deep in overbought
+territory... MACD has crossed below its signal line"*), BTC/USD (bearish on MACD/RSI confluence
+most of the day), VATE, SOL/USD, and TENX all got SELL decisions at various points, but Floor
+Broker logged `sell_skipped: "no open position"` each time (17 occurrences) — there was nothing to
+sell since no BUY has landed in weeks.
+
+### Data gap: CRV/USD, WIF/USD, LDO/USD
+
+18 of 27 Dealer decisions on these three crypto pairs today came back as HOLD with reasoning like
+*"No indicator values were provided in your prompt... please supply RSI, MACD, moving
+averages..."* — the technical indicator payload wasn't reaching the Dealer for these symbols
+roughly two-thirds of the time (it did work correctly the other third, so it's intermittent, not
+fully broken). This is worth a human look — it's a data-pipeline gap specific to these three
+symbols, separate from the win-rate throttle story.
+
+**Open positions carried from before today:** none — the account is fully flat.
+
+**Errors/no_fill today:** none recorded (unlike prior sessions in this log) — today's story is
+entirely risk controls correctly preventing new entries, plus the CRV/WIF/LDO indicator-data gap
+noted above.
