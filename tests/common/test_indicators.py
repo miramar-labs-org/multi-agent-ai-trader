@@ -72,6 +72,20 @@ def test_fetch_indicators_bulk_skips_indicator_result_missing_expected_field(mon
     assert "Relative Strength Index (RSI) for MGN is 71.2" in text
 
 
+def test_fetch_indicators_bulk_logs_when_taapi_returns_no_data(monkeypatch):
+    """Regression: TAAPI can return HTTP 200 with an empty `data` array (observed live for
+    thinly-traded pairs like CRV/USD, WIF/USD, LDO/USD -- likely insufficient historical bars).
+    This used to return "" with zero logging, making the failure invisible in the Dealer's logs
+    even though the LLM was about to receive an empty indicators block."""
+    monkeypatch.setattr(indicators.requests, "post", lambda *a, **k: FakeResponse(payload={"data": []}))
+    logged = []
+
+    text = indicators.fetch_indicators_bulk(_INDICATORS_CFG, "CRV/USD", "binance", ["rsi", "macd"], log=logged.append)
+
+    assert text == ""
+    assert any("no data" in line and "CRV/USD" in line for line in logged)
+
+
 def test_fetch_indicators_bulk_returns_empty_string_on_non_200_response(monkeypatch):
     monkeypatch.setattr(indicators.requests, "post", lambda *a, **k: FakeResponse(status_code=500, text="boom"))
 

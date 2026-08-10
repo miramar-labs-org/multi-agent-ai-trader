@@ -63,6 +63,29 @@ def llm_call(state: DealerState, cfg) -> DealerState:
     return {**state, "signal": signal.model_dump()}
 
 
+def _route_after_indicators(state: DealerState) -> str:
+    return "llm_call" if state["indicators_text"].strip() else "skip_missing_indicators"
+
+
+def skip_missing_indicators(state: DealerState, cfg) -> DealerState:
+    """fetch_indicators_bulk can come back empty (TAAPI 200 with no data -- typically
+    insufficient historical bars for a thinly-traded pair, see indicators.py). Skip the cycle
+    outright instead of sending an empty indicators block to the LLM, which otherwise improvises
+    a "please provide indicators" HOLD instead of a real trading decision."""
+    reasoning = (
+        f"no indicator data available for {state['symbol']} this cycle "
+        f"(exchange={state['exchange']}) -- skipped without invoking the LLM"
+    )
+    log(f"⏭️  {reasoning}")
+    slack.notify_dealer_signal(state["symbol"], "HOLD", reasoning)
+    db.record_dealer_decision(state["symbol"], "HOLD", reasoning, None)
+    return {
+        **state,
+        "signal": {"action": "HOLD", "reasoning": reasoning, "size_hint": None, "confidence": 0.0},
+        "execution_result": {"status": "skipped", "detail": "missing_indicators"},
+    }
+
+
 def _is_quad_witching_day(d) -> bool:
     """Third Friday of March/June/September/December -- the quarterly simultaneous expiration of
     stock options, index options, and index futures, historically one of the highest-volume,
@@ -270,11 +293,17 @@ def build_graph():
     graph = StateGraph(DealerState)
     graph.add_node("fetch_indicators", lambda state: fetch_indicators(state, load_config()))
     graph.add_node("llm_call", lambda state: llm_call(state, load_config()))
+    graph.add_node("skip_missing_indicators", lambda state: skip_missing_indicators(state, load_config()))
     graph.add_node("call_floor_broker", lambda state: call_floor_broker(state, load_config()))
 
     graph.set_entry_point("fetch_indicators")
-    graph.add_edge("fetch_indicators", "llm_call")
+    graph.add_conditional_edges(
+        "fetch_indicators",
+        _route_after_indicators,
+        {"llm_call": "llm_call", "skip_missing_indicators": "skip_missing_indicators"},
+    )
     graph.add_edge("llm_call", "call_floor_broker")
+    graph.add_edge("skip_missing_indicators", END)
     graph.add_edge("call_floor_broker", END)
 
     return graph.compile()

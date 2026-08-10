@@ -138,8 +138,13 @@ def fetch_indicators_bulk(indicators_cfg, symbol: str, exchange: str, names: lis
         log(f"⚠️ taapi bulk error for {symbol}: {response.status_code} {response.text[:200]}")
         return ""
 
+    data = response.json().get("data", [])
+    if not data:
+        log(f"⚠️ taapi bulk returned no data for {symbol} (exchange={exchange}) -- possibly insufficient historical bars")
+        return ""
+
     lines = []
-    for item in response.json().get("data", []):
+    for item in data:
         indicator_id = item.get("id")
         formatter = RESULT_FORMATTERS.get(indicator_id)
         if formatter is None:
