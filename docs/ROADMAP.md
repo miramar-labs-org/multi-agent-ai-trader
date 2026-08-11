@@ -833,8 +833,9 @@ described below.** `strategy.daily_profit_target_usd`/`daily_loss_limit_usd`
 (`config.yaml`, enforced in `src/floor_broker/execution.py::buy()`) block new BUYs once
 today's Alpaca account `equity - last_equity` crosses either bound — no
 `risk.py` module, no durable local event log, just a live Alpaca account-state read on
-every BUY. Trade-count limits, failed-submission-rate limits, per-asset-class aggregate
-exposure limits, and cooldown-after-rejection are not implemented. See
+every BUY. A Dealer-side same-symbol stop-loss cooldown was added on 2026-08-11, but trade-count
+limits, failed-submission-rate limits, per-asset-class aggregate exposure limits, and generalized
+cooldown-after-rejection controls are not implemented. See
 `docs/strategy.md` for the design log and `docs/ROADMAP.md`'s P0.4 note above for the
 same scope decision.
 
@@ -845,7 +846,7 @@ Extend `risk.py` with:
 - maximum trades per day;
 - maximum failed submissions per interval;
 - maximum aggregate exposure by asset class;
-- optional cooldown after repeated rejection or loss events.
+- optional cooldown after repeated rejection or portfolio-level loss events.
 
 Use Alpaca account activities plus durable local events. Define timezone and trading-day boundaries explicitly.
 

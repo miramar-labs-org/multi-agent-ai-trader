@@ -133,6 +133,21 @@ HTTP call is withheld on a HOLD. `cfg.floor_broker.base_url` is in-cluster Servi
 (`http://floor-broker.multi-agent-ai-trader.svc.cluster.local:8000`) — a k8s primitive, not a
 Miramar platform endpoint.
 
+BUY signals are now gated locally in this order before the HTTP call:
+
+1. `macro_blackout` — whole-day scheduled macro/quad-witching pause.
+2. `strategy.enable_symbol_stop_cooldown` — same-symbol stop-loss cooldown, using
+   `db.fetch_symbol_floor_broker_events_since()` and `_classify_exit_event()`.
+3. `strategy.enable_win_rate_throttle` — trailing TP/SL win-rate throttle. The scope is
+   `strategy.win_rate_throttle_scope`: `symbol` reads only same-symbol events; `global` restores
+   the older portfolio-wide behavior.
+4. `strategy.min_confidence` — low-confidence BUY skip.
+5. Authorized-budget checks — held-only entries (`budget=0`) and `size_hint=0`.
+
+`llm_call()` also includes a compact "Recent same-symbol trading history" block when
+`strategy.enable_dealer_memory` is true. It is advisory prompt context only: DB read failures
+log a warning and fail open, while the deterministic cooldown above is the hard re-entry guard.
+
 ## Floor Broker — the only order-placement path
 
 Entrypoint: `uvicorn.run("src.floor_broker.app:app", ...)`, `apps/v1 Deployment` + `ClusterIP
@@ -172,6 +187,9 @@ module level for the `strategy:` fields below. Order logic:
   Stocks get a bracket order (`OrderClass.BRACKET`, SL = `ask_price * slP`, TP =
   `ask_price * tpP`); crypto (`exchange != "stocks"`) gets a plain notional market order
   instead, skipped rather than clamped if the rounded notional falls below Alpaca's $10 minimum.
+  Stock BUYs also enforce `strategy.max_bid_ask_spread_pct` when set: the Floor Broker fetches
+  one live ask/bid pair, skips wide or invalid spreads with a normal `status="skipped"` reason,
+  and reuses the accepted ask as the bracket-order reference price.
 - `sell(symbol, reason="dealer_signal")` — sells the full open quantity at market; on Alpaca's
   "conflicting orders" rejection, cancels the blockers and resubmits against the re-fetched
   quantity.

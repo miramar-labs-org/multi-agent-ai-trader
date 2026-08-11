@@ -128,17 +128,20 @@ context, and parse the response into a strict structured-output schema (via Lang
 [LangGraph](https://langchain-ai.github.io/langgraph/) state machines:
 
 - **Analyst** (9 nodes): discover screener candidates (stocks and/or a fixed crypto watchlist,
-  per `trading.enable_stocks`/`enable_crypto`) → fetch news/RSS research → fetch real TAAPI
-  indicators for the top candidates by move size → fetch its own recent track record (past
-  picks, Dealer decisions, Floor Broker outcomes, read from Postgres) → fetch a live unrealized
-  P&L snapshot of currently-open positions → LLM picks up to 10 symbols with a budget and
-  rationale each → validate each pick's exchange against the actual candidate it came from
-  (dropping any hallucinated symbol) → write the `portfolio` ConfigMap → if crypto is enabled,
-  post a crypto-only EOD report to Slack. News, indicators, track record, and the P&L snapshot
-  are each individually feature-gated (`analyst.enable_news`/`enable_indicators`/
-  `enable_track_record`/`enable_position_pnl`).
+  per `trading.enable_stocks`/`enable_crypto`) → apply stock-candidate quality filters
+  (`min_price_usd`, `max_abs_change_pct`, `min_dollar_volume_usd`, excluded suffixes) → fetch
+  news/RSS research → fetch real TAAPI indicators for the top candidates by move size → fetch
+  its own recent track record (past picks, Dealer decisions, Floor Broker outcomes, read from
+  Postgres) → fetch a live unrealized P&L snapshot of currently-open positions → LLM picks up to
+  10 symbols with a budget and rationale each → validate each pick's exchange against the actual
+  candidate it came from (dropping any hallucinated symbol) → write the `portfolio` ConfigMap →
+  if crypto is enabled, post a crypto-only EOD report to Slack. News, indicators, track record,
+  and the P&L snapshot are each individually feature-gated (`analyst.enable_news`/
+  `enable_indicators`/`enable_track_record`/`enable_position_pnl`).
 - **Dealer** (3 nodes, per symbol per poll): fetch technical indicators → LLM decides
-  BUY/HOLD/SELL → if not HOLD, dispatch to Floor Broker over HTTP.
+  BUY/HOLD/SELL with recent same-symbol history in the prompt when enabled → apply local BUY
+  gates (macro blackout, same-symbol stop cooldown, win-rate throttle, confidence, budget) → if
+  not HOLD and not locally skipped, dispatch to Floor Broker over HTTP.
 
 ```mermaid
 flowchart TD
@@ -176,9 +179,10 @@ Both LLM calls go through `langchain_openai.ChatOpenAI` against a single OpenAI-
 locally-hosted model served by Ollama on the DGX (see `docs/models.md` for the Ollama-vs-vLLM
 decision), so no external LLM API key is required for trading decisions themselves.
 
-Floor Broker has no decision logic of its own — by the time it receives a request, the
-BUY/SELL call has already been made; it only handles order placement, safety checks
-(no duplicate positions), and Alpaca's order-conflict retry cases.
+Floor Broker has no LLM decision logic of its own — by the time it receives a request, the
+BUY/SELL call has already been made; it only handles order placement and deterministic safety
+checks: no duplicate/open-order conflicts, daily P/L halt, max concurrent positions, risk-based
+sizing, bid/ask spread gating for stock BUYs, and Alpaca's order-conflict retry cases.
 
 ## External APIs used
 

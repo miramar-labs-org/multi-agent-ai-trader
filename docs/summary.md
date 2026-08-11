@@ -25,6 +25,11 @@ a new feature ships.
 
 | Date | Feature | Summary | Status |
 |---|---|---|---|
+| 2026-08-11 | Same-symbol stop-loss cooldown | After a symbol stops out, the Dealer pauses new BUY entries for that symbol during the configured lookback window, preventing repeated re-entry into the same failing setup. | On |
+| 2026-08-11 | Dealer same-symbol memory | Dealer prompts now include recent decisions and Floor Broker outcomes for the same symbol, so the AI can see if a setup has already failed today instead of judging each poll in isolation. | On |
+| 2026-08-11 | Symbol-scoped win-rate throttle | The win-rate throttle can now run per symbol instead of globally, so one cluster of bad symbols no longer freezes all BUYs across the whole portfolio. | On |
+| 2026-08-11 | Analyst candidate quality filters | Stock screener candidates are filtered for extreme moves, minimum dollar volume, and warrant/unit-like suffixes before the Analyst LLM sees them. | On |
+| 2026-08-11 | Bid/ask spread gate | Floor Broker skips stock BUYs when the live bid/ask spread is too wide for controlled entry risk. | On |
 | 2026-08-07 | Ollama model stop/preload on power schedule | When the trading system powers down for the night, the local AI model is also unloaded from GPU memory, then reloaded just before the system wakes back up — so the machine can actually go idle overnight instead of sitting warm for a market that's closed. | On |
 | 2026-08-07 | Nightly power-down/power-up | Dealer and Floor Broker are scaled off about an hour after market close and back on about an hour before the next open, instead of running around the clock for a market that's only open ~6.5 hours a day. Any open crypto position is force-closed first, since crypto's stop-loss/take-profit protection only works while Floor Broker is running. | On |
 | 2026-08-07 | Position limit cap | Stops opening brand-new positions once too many are already open at the same time, so one bad stretch can't spread risk across an unbounded number of simultaneous bets. | On |
@@ -98,6 +103,8 @@ minutes after the opening bell before its first check, to let opening volatility
 For every symbol on today's watchlist, each cycle:
 
 - Pulls that symbol's current technical indicator readings from the indicator service.
+- Looks up recent same-symbol history from Postgres — recent Dealer calls, BUY skips/fills, and
+  stop-loss/take-profit outcomes — and gives that context to the AI alongside the indicators.
 - Hands those numbers to the AI model with the instruction: "you're an expert technical
   trader — based on all these indicators, should we BUY, SELL, or HOLD?"
 - Every decision — including HOLD — is posted to Slack so a human can see what the Dealer
@@ -229,6 +236,9 @@ its output reliably machine-usable.
 - **Earnings blackout** — a stock due to report earnings in the next couple of days, or that
   just reported, is left off the watchlist entirely, avoiding the price swings those reports can
   cause.
+- **Screener quality filters** — low-quality stock candidates are filtered before the Analyst
+  sees them: extreme daily movers can be excluded, candidates with insufficient dollar volume
+  can be dropped when volume and price are known, and warrant/unit-like suffixes are avoided.
 - **Macro-event blackout** — new buys pause for the whole day on dates with a major scheduled
   economic release (Fed rate decisions, inflation/jobs reports, and similar) or on quarterly
   "quad witching" days, when the whole market — not just one stock — tends to move sharply.
@@ -242,9 +252,17 @@ its output reliably machine-usable.
 - **Confidence gate** — the Dealer's AI now scores its own confidence (0-100%) on every buy call,
   and a buy below the configured floor (60% by default) is skipped automatically before it's ever
   forwarded to the Floor Broker. Sells and holds are unaffected.
+- **Same-symbol stop-loss cooldown** — after a symbol hits a recent stop-loss, new BUYs for
+  that same symbol pause for the configured lookback window. This blocks repeated re-entry into
+  the same failed intraday setup; other symbols can still trade.
 - **Win-rate throttle** — if the trailing win rate on recent stop-loss/take-profit exits falls
   below a floor (30% by default, over the last several trading days), new buys pause
-  automatically until it recovers. Existing positions can still be sold at any time.
+  automatically until it recovers. This now defaults to symbol scope, so weak performance in one
+  name pauses that name rather than the whole portfolio; existing positions can still be sold at
+  any time.
+- **Bid/ask spread gate** — stock BUYs are skipped if the current bid/ask spread is wider than
+  the configured percentage cap, avoiding thin names where a market entry and bracket stop may
+  not reflect the intended risk.
 - **Nightly power-down** — Dealer and Floor Broker turn off about an hour after market close and
   back on about an hour before the next open, so nothing is running (or exposed) outside the
   hours it's actually needed. Any open crypto position is force-closed first, since crypto's

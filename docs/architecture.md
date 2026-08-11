@@ -125,7 +125,7 @@ off to the Dealer.
 
 | Node | What it does |
 |---|---|
-| `discover_candidates` | when `cfg.trading.enable_stocks` **and** `state["stock_market_open"]` (set once in `main.py`, see above), `sources.fetch_screener_candidates(screener_top_n=20)` — raw REST calls (not wrapped by `alpaca-py`) to Alpaca's `/v1beta1/screener/stocks/most-actives` and `/movers` endpoints, merged into a symbol→{volume, change_pct} dict, each tagged `market: "stocks"`. When `cfg.earnings_blackout.enabled` (default false), the stock candidate list is further filtered through `sources.fetch_earnings_calendar()` — a single market-wide Finnhub free-tier call (Alpaca has no earnings-calendar data, only Corporate Actions for splits/dividends/mergers) — dropping any symbol reporting earnings within `earnings_blackout.days_before`/`days_after` calendar days of today; fails soft to an unfiltered list on any Finnhub error. When `cfg.trading.enable_crypto`, also `sources.fetch_crypto_candidates(...)` — a fixed watchlist (`BTC/USD`, `ETH/USD`, `SOL/USD`; Alpaca's crypto screener has no most-actives equivalent) merged with `/v1beta1/screener/crypto/movers`, tagged `market: cfg.trading.crypto_taapi_exchange`. Crypto discovery is **not** gated on the stock-market-open flag or the earnings blackout (no earnings dates apply to crypto) — it always runs when enabled |
+| `discover_candidates` | when `cfg.trading.enable_stocks` **and** `state["stock_market_open"]` (set once in `main.py`, see above), `sources.fetch_screener_candidates(screener_top_n=20)` — raw REST calls (not wrapped by `alpaca-py`) to Alpaca's `/v1beta1/screener/stocks/most-actives` and `/movers` endpoints, merged into a symbol→{volume, change_pct, price} dict, each tagged `market: "stocks"`. The screener source applies quality filters before the LLM sees candidates: `analyst.min_price_usd`, `analyst.max_abs_change_pct`, `analyst.min_dollar_volume_usd` when volume and price are known, and `analyst.excluded_symbol_suffixes` for warrant/unit-like tickers. When `cfg.earnings_blackout.enabled` (default false), the stock candidate list is further filtered through `sources.fetch_earnings_calendar()` — a single market-wide Finnhub free-tier call (Alpaca has no earnings-calendar data, only Corporate Actions for splits/dividends/mergers) — dropping any symbol reporting earnings within `earnings_blackout.days_before`/`days_after` calendar days of today; fails soft to an unfiltered list on any Finnhub error. When `cfg.trading.enable_crypto`, also `sources.fetch_crypto_candidates(...)` — a fixed watchlist (`BTC/USD`, `ETH/USD`, `SOL/USD`; Alpaca's crypto screener has no most-actives equivalent) merged with `/v1beta1/screener/crypto/movers`, tagged `market: cfg.trading.crypto_taapi_exchange`. Crypto discovery is **not** gated on the stock-market-open flag, the stock quality filters, or the earnings blackout — it always runs when enabled |
 | `fetch_research` | gated on `cfg.analyst.enable_news` (short-circuits before any network call when false) — `sources.fetch_news(news_days=2)` (Alpaca News API, HTML stripped via BeautifulSoup) + `sources.fetch_yahoo_rss_headlines(...)` (Yahoo Finance RSS), concatenated into plain text |
 | `fetch_indicators` | gated on `cfg.analyst.enable_indicators` (short-circuits before any TAAPI call when false) — ranks `raw_candidates` by `abs(change_pct)` (missing values sort last) and calls `src.common.indicators.fetch_indicators_bulk` (shared with the Dealer) for the top `cfg.analyst.indicator_fetch_limit` (default 15) — one TAAPI `/bulk` POST per symbol covering `rsi, macd, vwap, bbands, sma, ema`, sleeping `cfg.taapi.min_request_interval_secs` between calls to respect TAAPI's free-tier 1-req/15s cap. At the default limit this adds ~3.5 minutes to the once-daily run — accepted as a fixed cost of a pre-market CronJob, unlike the Dealer's 10-minute poll cycle where the same rate limit is a tighter constraint. Not every candidate gets indicator data; only the top movers by size do |
 | `fetch_track_record` | gated on `cfg.analyst.enable_track_record` (short-circuits before any DB call when false) — reads the Analyst's own pick history plus matching Dealer decisions and Floor Broker events from Postgres via `db.fetch_analyst_picks_since()`/`fetch_dealer_decisions_since()`/`fetch_floor_broker_events_since()` for the last `cfg.analyst.track_record_days` (default 5) calendar days, formatted as plain text (qualitative sequence only — no computed P&L; see [Persistence](#persistence)). Runs before `write_portfolio` records this run's own picks, so a symbol picked *this* run never appears in its own track record |
@@ -233,8 +233,8 @@ distinguishable from Slack alone.
 | Node | What it does |
 |---|---|
 | `fetch_indicators` | fetches every indicator configured for the symbol (or all of `cfg.indicators` if the entry says `["ALL"]`) from **TAAPI.io** — a third-party technical-analysis API, unrelated to any Miramar platform service — in a single `/bulk` POST request (`indicators.py`), and builds a natural-language indicator text block |
-| `llm_call` | the decision LLM call — see below |
-| `call_floor_broker` | HTTP POST to Floor Broker if action != HOLD; a BUY is additionally refused locally (never forwarded) while `cfg.macro_blackout.enabled` and today matches either a `macro_blackout.dates` entry or an auto-computed quad witching day — see [Risk controls](#risk-controls-and-failure-handling) |
+| `llm_call` | the decision LLM call — see below. When `strategy.enable_dealer_memory` is true, it also appends recent same-symbol Dealer decisions and Floor Broker events from Postgres as prompt context |
+| `call_floor_broker` | HTTP POST to Floor Broker if action != HOLD; a BUY is additionally refused locally (never forwarded) by macro blackout, same-symbol stop cooldown, win-rate throttle, confidence, or authorized-budget gates — see [Risk controls](#risk-controls-and-failure-handling) |
 
 ```mermaid
 flowchart TD
@@ -261,6 +261,11 @@ would otherwise fail request validation rather than get a graceful business-logi
 budget scaled to a small but nonzero amount is still forwarded as-is — Floor Broker's own
 minimum-notional/insufficient-qty checks (`execution.py`) already handle that gracefully with
 their own reason codes, so Dealer doesn't need a second floor.
+
+When `strategy.enable_dealer_memory` is true, a same-symbol memory block is added to the user
+prompt. It is intentionally advisory: the LLM sees recent `BUY`/`HOLD`/`SELL` reasoning plus
+recent fills/skips/stops for the same symbol, but deterministic skip logic still owns hard
+safety rules such as stop-loss cooldown.
 
 **Dispatch to Floor Broker** — plain in-cluster HTTP, no message queue:
 ```python
@@ -334,7 +339,10 @@ pollers below send directly.
   `insufficient_qty`/`budget_below_minimum` skips automatically. For stocks, submits a
   **bracket order** (`OrderClass.BRACKET`) with computed stop-loss (`ask_price * slP`) and
   take-profit (`ask_price * tpP`) legs, `TimeInForce.DAY` — priced off the ask since that's
-  where a BUY actually fills, not the bid/ask mid. TP/SL prices are rounded to 4 decimals for
+  where a BUY actually fills, not the bid/ask mid. If `strategy.max_bid_ask_spread_pct` is set,
+  `buy()` first fetches the current bid and ask, skips invalid quotes or spreads wider than the
+  configured cap (`reason="wide_bid_ask_spread"` / `"invalid_bid_ask_quote"`), and reuses that
+  accepted ask for quantity and bracket pricing. TP/SL prices are rounded to 4 decimals for
   stocks under $1.00 and 2 decimals otherwise (`_round_to_tick`) — sub-$1 stocks are quoted in
   $0.0001 increments (SEC Rule 612), so 2dp rounding can land TP/SL on the same cent as
   `base_price` and get rejected. For crypto (`exchange != "stocks"`), submits a plain
@@ -762,12 +770,15 @@ v0.6.1 are unrecoverable, same limitation as the Slack-only trail it replaces. (
 a schema bug — `CREATE INDEX` on a `timestamptz::date` expression isn't `IMMUTABLE`, which
 rolled back table creation entirely and silently wrote zero rows until the v0.6.1 fix; the
 current schema indexes the raw `(symbol, timestamp)` columns instead.) Read access is
-via two families of functions in `db.py`: `fetch_*_for_date()`, used by the read-only
+via three families of functions in `db.py`: `fetch_*_for_date()`, used by the read-only
 `/analyst-explain` skill (`skills/analyst-explain/SKILL.md`) to explain a trading day's P&L
-using the actual logged Dealer reasoning rather than a generic summary; and `fetch_*_since()`,
+using the actual logged Dealer reasoning rather than a generic summary; `fetch_*_since()`,
 used by `fetch_track_record` (see [Agent 1 — Analyst](#agent-1--analyst-srcanalyst)) to feed
-the Analyst's own recent pick history back into its LLM prompt — the first read path that
-isn't purely for human/skill consumption.
+the Analyst's own recent pick history back into its LLM prompt; and the same-symbol helpers
+`fetch_symbol_dealer_decisions_since()`/`fetch_symbol_floor_broker_events_since()`, used by
+Dealer memory, same-symbol stop cooldown, and symbol-scoped win-rate throttling. The floor
+broker event rows now also carry `qty` when Alpaca reports filled quantity, improving later
+trade attribution without adding a separate trade-ledger table yet.
 
 ## Data flow — one full cycle
 
@@ -776,15 +787,18 @@ isn't purely for human/skill consumption.
    `main.py` checks the Alpaca calendar once; if the stock market is closed today, the run
    continues anyway (crypto still trades 24/7) rather than exiting early.
 2. Discover ≤20 screener candidates (Alpaca `most-actives`/`movers`, skipped if the stock
-   market is closed today) → fetch 2 days of news + Yahoo RSS headlines → LLM picks ≤10 symbols
-   with budgets/indicators/rationale → written to the `portfolio` ConfigMap → a "Morning Market
-   Report" (picks + account balance, prefixed with a closed-market banner if applicable) is
-   posted to Slack, before market open → if `enable_crypto`, a crypto-only "Crypto EOD Report"
-   covering the prior full ET day's crypto fills/positions is posted right after.
+   market is closed today), apply stock-candidate quality filters, then fetch 2 days of news +
+   Yahoo RSS headlines → LLM picks ≤10 symbols with budgets/indicators/rationale → written to
+   the `portfolio` ConfigMap → a "Morning Market Report" (picks + account balance, prefixed
+   with a closed-market banner if applicable) is posted to Slack, before market open → if
+   `enable_crypto`, a crypto-only "Crypto EOD Report" covering the prior full ET day's crypto
+   fills/positions is posted right after.
 3. **Every 600s while the market is open** — Dealer reads the ConfigMap fresh, and for each
    symbol: fetches its configured indicators from TAAPI.io in one `/bulk` request (throttled
    `taapi.min_request_interval_secs` between symbols to respect TAAPI's per-15s rate limit),
-   asks the LLM for BUY/HOLD/SELL, and (if not HOLD) POSTs to Floor Broker.
+   appends same-symbol memory when enabled, asks the LLM for BUY/HOLD/SELL, applies local BUY
+   gates, and POSTs to Floor Broker only when the action is not HOLD and no local BUY gate
+   skipped it.
 4. Floor Broker fetches a live quote, runs the position/order safety check, and submits a
    bracket order (stocks) or notional market order (crypto) to Alpaca's paper account.
 5. Floor Broker's `{"status": "submitted"|"skipped"|"error"}` response is logged by Dealer and
@@ -820,6 +834,15 @@ isn't purely for human/skill consumption.
 | `trading` | `enable_stocks` | when true, Analyst screens/picks equities, and Dealer processes/merges stock symbols; set false to pause equities handling entirely |
 | `trading` | `enable_crypto` | when true, Analyst also screens/picks from a fixed crypto watchlist (`BTC/USD`, `ETH/USD`, `SOL/USD`) via `fetch_crypto_candidates()`, Dealer also polls merged-in crypto positions, and `merge_held_positions()` folds pre-existing crypto positions into the watchlist |
 | `trading` | `crypto_taapi_exchange` | TAAPI venue name (e.g. `"binance"`) used as the `exchange` for crypto positions merged in by `merge_held_positions()` — TAAPI's `/bulk` API requires an actual venue, not the literal word "crypto" |
+| `strategy` | `daily_profit_target_usd`, `daily_loss_limit_usd` | Floor Broker BUY preflight gates based on Alpaca account equity versus `last_equity`; reaching either target skips new BUY exposure while SELL remains allowed |
+| `strategy` | `crypto_slP`, `crypto_tpP` | synthetic crypto stop-loss/take-profit multipliers applied after a crypto BUY fill, because Alpaca has no crypto bracket orders |
+| `strategy` | `position_sizing`, `risk_per_trade_usd` | when `position_sizing: risk_based`, Floor Broker caps the effective BUY budget so a full stop-loss hit risks at most `risk_per_trade_usd`; it only scales down from the Analyst-authorized budget |
+| `strategy` | `max_concurrent_positions` | Floor Broker skips a new non-top-up BUY once the live open-position count is at/above this cap |
+| `strategy` | `min_confidence` | Dealer-side BUY gate; a structured LLM signal below this confidence is skipped before Floor Broker is called. Set `0.0` to disable |
+| `strategy` | `enable_symbol_stop_cooldown`, `symbol_stop_cooldown_days`, `max_symbol_stop_losses` | Dealer-side same-symbol re-entry guard. When enabled, recent stop-loss exits for the same symbol are counted over the lookback window; at or above the configured count, new BUYs for that symbol are skipped |
+| `strategy` | `enable_win_rate_throttle`, `win_rate_throttle_scope`, `min_win_rate`, `win_rate_min_sample` | Dealer-side TP/SL outcome throttle. `scope: symbol` counts only same-symbol automatic exits; `scope: global` counts all recent automatic exits. The throttle only evaluates after `win_rate_min_sample` classified exits |
+| `strategy` | `enable_dealer_memory`, `symbol_memory_days`, `symbol_memory_limit` | controls same-symbol history added to the Dealer LLM prompt. This context is advisory and fails open on DB read errors |
+| `strategy` | `max_bid_ask_spread_pct` | Floor Broker stock BUY gate; when set, a BUY is skipped if `(ask - bid) / ask` exceeds this cap or the bid/ask quote is invalid |
 | `eod_flatten` | `enabled` | feature gate for `poll_eod_flatten()` (`src/floor_broker/main.py`) — when false (default), `check_eod_flatten()` short-circuits before touching the clock or Alpaca positions; opt-in "day trading mode" that closes every open stock position near market close instead of holding overnight |
 | `eod_flatten` | `minutes_before_close` | how close (by Alpaca's live clock) to market close before `check_eod_flatten()` starts selling open stock positions (default 10) — crypto is 24/7 and untouched |
 | `eod_flatten` | `conditional` | when true, `check_eod_flatten()` only flattens everything if the aggregate unrealized P&L across open stock positions is >= 0; when negative, positions are held overnight instead except any past `max_days_held_loss`. When false (default), always flattens everything, same as pre-`conditional` behavior |
@@ -839,6 +862,7 @@ isn't purely for human/skill consumption.
 | `analyst` | `enable_midday_run` | feature gate for the optional `analyst-midday` CronJob (12:30pm ET) — when false (default), `main()` exits immediately on a midday-labeled run before `build_graph()` is called |
 | `analyst` | `midday_schedule` | informational copy of `k8s/analyst-midday-cronjob-k3s.yaml`'s own `spec.schedule` — not templated, must be kept in sync manually |
 | `analyst` | `max_universe_size`, `default_budget`, `screener_top_n`, `news_days`, `yahoo_rss_url` | Analyst's selection parameters |
+| `analyst` | `min_price_usd`, `max_abs_change_pct`, `min_dollar_volume_usd`, `excluded_symbol_suffixes` | stock screener quality filters applied before the Analyst LLM sees candidates. `min_dollar_volume_usd` is enforced only when both screener volume and reference price are available; crypto candidates are unaffected |
 | `analyst` | `max_total_budget_usd` | last-line-of-defense cap (default 50000 = `max_universe_size` × `default_budget`) on the sum of every pick's `budget` in one selection — `validate_selection` drops trailing picks (in the LLM's own returned order) once the running total would exceed it |
 | `analyst` | `indicator_fetch_limit` | candidates (top-N by `abs(change_pct)`) that get a real TAAPI `/bulk` indicator fetch in `fetch_indicators` (default 15) — capped by the TAAPI free-tier 15s/request limit |
 | `analyst` | `enable_news` | feature gate for `fetch_research` — when false, short-circuits before any Alpaca News/Yahoo RSS call and feeds the LLM an empty research text |
@@ -886,6 +910,13 @@ isn't purely for human/skill consumption.
   soft to an unfiltered candidate list on any Finnhub error (missing key, network error, non-200,
   429, bad JSON) — a Finnhub outage never blocks or crashes the Analyst run. Crypto candidates
   are never filtered (no earnings dates apply). Config-only toggle (no redeploy).
+- **Analyst stock-candidate quality filters** — `discover_candidates` now applies basic
+  liquidity/quality gates before prompt construction: `min_price_usd` drops sub-threshold
+  stocks or unpriced symbols, `max_abs_change_pct` removes extreme movers/losers,
+  `min_dollar_volume_usd` drops low-notional candidates when volume and price are both known,
+  and `excluded_symbol_suffixes` filters likely warrants/units. These filters are deliberately
+  upstream of the LLM so bad candidates never become rationalized picks. Crypto candidates are
+  unaffected.
 - **Market-wide macro blackout** — `macro_blackout.enabled: true` as of 2026-08-05; when on,
   `call_floor_broker` refuses any BUY signal locally (never forwarded to Floor Broker) on a day
   matching either a hand-maintained `macro_blackout.dates` entry (FOMC, CPI, NFP, PCE — 18 real
@@ -897,6 +928,24 @@ isn't purely for human/skill consumption.
   note (next refresh due ~2026-11-15) re-runs the sourcing process each quarter (see
   `docs/ROADMAP.md`'s P1.13 entry) rather than the live app scraping government calendar pages
   at runtime.
+- **Same-symbol stop-loss cooldown** — `strategy.enable_symbol_stop_cooldown: true` as of
+  2026-08-11. `call_floor_broker` checks same-symbol Floor Broker history before the global/
+  symbol win-rate throttle and refuses a BUY with `reason="symbol_stop_cooldown"` once
+  `max_symbol_stop_losses` stop-loss exits are found inside `symbol_stop_cooldown_days`.
+  This is the hard guard against repeated buy→stop→buy loops on names like `AZI`/`YJ`; other
+  symbols can continue trading.
+- **Dealer same-symbol memory** — `strategy.enable_dealer_memory: true` adds recent same-symbol
+  Dealer decisions and Floor Broker events to the LLM prompt. This helps the LLM see that a
+  setup already failed, but it is not a safety dependency: DB failures fail open and the
+  deterministic cooldown above still owns the hard skip.
+- **Symbol-scoped win-rate throttle** — `strategy.win_rate_throttle_scope: symbol` as of
+  2026-08-11. The existing TP/SL win-rate throttle now counts only same-symbol automatic exits
+  by default, avoiding the earlier self-locking portfolio-wide halt where one bad cluster
+  paused every BUY. Set `global` to restore portfolio-wide behavior.
+- **Bid/ask spread gate** — `strategy.max_bid_ask_spread_pct` makes Floor Broker skip stock
+  BUYs before order construction when `(ask - bid) / ask` exceeds the configured cap, or when
+  bid/ask data is invalid. The accepted ask is reused as the bracket-order reference price so
+  spread validation, quantity sizing, and SL/TP pricing are based on one market snapshot.
 - **TAAPI stays inside its rate limit** — Dealer fetches all of a symbol's indicators in one
   `/bulk` POST instead of one GET per indicator (up to 9 individual calls per symbol would blow
   through TAAPI's per-15s rate limit — even on the Pro plan — the moment two symbols overlapped),

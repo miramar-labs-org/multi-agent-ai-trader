@@ -92,15 +92,13 @@ unrealized P&L and the original Analyst rationale into the Dealer prompt would l
 "has the original thesis broken" rather than re-deriving a verdict from indicators alone every
 10 minutes.
 
-### Dealer has no memory across polls
+### ~~Dealer has no memory across polls~~ — Partly addressed (2026-08-11)
 
-Every `pollsecs` cycle (600s default) rebuilds a fresh state dict per symbol with no reference to
-the prior cycle's decision or reasoning (`src/dealer/main.py`) — the only trace is the Postgres
-audit write, which nothing reads back at decision time. This means two consecutive polls can
-flip BUY→SELL→BUY on marginal indicator noise with no continuity check. Passing the last 1–2
-decisions (action + one-line reasoning) into the next cycle's prompt would let the LLM
-distinguish "conditions genuinely reversed" from "noise near a threshold," and could reduce
-order churn/whipsaw.
+Implemented: `strategy.enable_dealer_memory` now adds recent same-symbol Dealer decisions and
+Floor Broker outcomes to the Dealer LLM prompt. This gives each poll context about recent BUY
+skips, fills, stop-outs, and prior reasoning for the same symbol. It is intentionally
+same-symbol memory only; broader account state, current unrealized P&L, and the original Analyst
+rationale are still open improvements under "Give the Dealer LLM more than bare indicators."
 
 ### Crypto only gets synthetic, polled stop-loss/take-profit
 
@@ -116,11 +114,13 @@ built, per `docs/strategy.md`).
 ### Daily loss control is a single blunt equity check
 
 `strategy.daily_loss_limit_usd` blocks new BUYs once `equity - last_equity` crosses the bound —
-but doesn't distinguish realized vs. unrealized loss, has no trade-count limit, no per-symbol or
-per-asset-class exposure cap, and no cooldown after a loss/rejection streak. This is
-`docs/ROADMAP.md` P1.8, already tracked as Partial — flagging here because it's directly upstream
-of any algorithmic sizing change: a smarter sizing model is only as safe as the blunt instrument
-backing it up.
+but doesn't distinguish realized vs. unrealized loss, has no trade-count limit, and has no
+per-asset-class exposure cap. As of 2026-08-11, there is a same-symbol stop-loss cooldown
+(`strategy.enable_symbol_stop_cooldown`) that prevents immediate re-entry after recent stop-outs,
+but there is still no generalized rejection-streak cooldown or portfolio-level loss-streak
+controller. This is `docs/ROADMAP.md` P1.8, already tracked as Partial — flagging here because
+it's directly upstream of any algorithmic sizing change: a smarter sizing model is only as safe
+as the blunt instrument backing it up.
 
 ---
 

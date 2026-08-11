@@ -182,3 +182,26 @@ symbols, separate from the win-rate throttle story.
 **Errors/no_fill today:** none recorded (unlike prior sessions in this log) — today's story is
 entirely risk controls correctly preventing new entries, plus the CRV/WIF/LDO indicator-data gap
 noted above.
+
+### 2026-08-11 remediation
+
+The 2026-08-10 global BUY pause exposed two separate problems: the trailing win-rate throttle was
+portfolio-wide and self-locking, and the Dealer had no same-symbol memory, so repeated
+buy→stop→buy loops on volatile names were only caught after they had already damaged the global
+win-rate sample.
+
+Implemented mitigations:
+
+- `strategy.win_rate_throttle_scope: symbol` makes the TP/SL win-rate throttle default to
+  same-symbol history instead of all recent exits.
+- `strategy.enable_symbol_stop_cooldown` blocks new BUYs for a symbol after recent stop-loss
+  exits, before the Floor Broker HTTP call.
+- `strategy.enable_dealer_memory` adds recent same-symbol Dealer decisions and Floor Broker
+  events to the Dealer prompt.
+- Analyst screener filters now drop extreme movers, low-notional candidates when dollar volume
+  is computable, and likely warrant/unit symbols before LLM selection.
+- `strategy.max_bid_ask_spread_pct` skips stock BUYs with wide or invalid live bid/ask quotes.
+
+These changes do not claim the affected symbols were impossible to trade profitably; they make
+the system stop re-entering the same failed setup blindly and keep one bad cluster from pausing
+the entire portfolio.
