@@ -103,6 +103,42 @@ payload. This costs real latency per decision (thousands of tokens of
 thinking) but is a non-issue against the 600s (`trading.pollsecs`) poll
 interval.
 
+## Decision update (2026-08-11): switched to nemotron-3-super
+
+Re-checked the actual DGX Ollama budget live rather than trusting the
+original ~100GB nominal figure: `qwen3.6:35b-a3b` was only using **32.2GB**
+VRAM (`/api/ps` → `size_vram: 34561840256`, `Q4_K_M`, not the FP8 checkpoint
+originally discussed above — Ollama's library-default quantization turned
+out to be Q4_K_M), leaving substantial unused headroom in a budget that's
+already paid for. `ollama list` showed several much larger models already
+pulled and idle, so no download was needed to use a bigger one.
+
+Two already-pulled candidates were evaluated against live free-memory
+numbers (`free -h`, DGX unified memory): `gpt-oss:120b` (65.4GB, MXFP4,
+116.8B total) with a comfortable ~40GB margin, and `nemotron-3-super:latest`
+(86.8GB, Q4_K_M, 123.6B total, Nemotron-H hybrid) with a tighter ~18GB
+margin. `nemotron-3-super` is the architecture NVIDIA/vLLM specifically
+validated for DGX Spark (see the vLLM DGX Spark blog post in Sources below),
+so despite the smaller margin it was chosen over `gpt-oss:120b`.
+
+### Verified 2026-08-11: Ollama deploy + structured-output path
+
+Deployed via `deploy-ollama.yaml` (`CURRENT_OLLAMA_MODEL=nemotron-3-super:latest`,
+88GB VRAM per `/api/ps`: `size_vram: 94152404736`). Auto-undeploy step
+cleanly evicted `qwen3.6:35b-a3b` first, per the workflow's built-in
+behavior.
+
+Like `qwen3.6:35b-a3b`, this model emits chain-of-thought before its tool
+call, exposed via a separate `reasoning` field rather than inline in
+`content`. Sent a manual test request to `/v1/chat/completions` mirroring
+the Dealer's `Signal` schema, no `max_tokens` cap, `tool_choice: "required"`:
+reliably reached `finish_reason: "tool_calls"` with a schema-valid `Signal`
+payload (`symbol`, `action`, `reasoning`, `size_hint`, `confidence` all
+present and correctly typed). 517 completion tokens, **39.2s** total
+latency — well under the 600s (`trading.pollsecs`) poll interval. Confirms
+the existing unbounded-`max_tokens` `ChatOpenAI` call in
+`src/dealer/graph.py` needs no change for this model.
+
 ## Sources
 
 - [Atlas: Open-source inference engine for DGX Spark](https://forums.developer.nvidia.com/t/atlas-open-source-inference-engine-for-dgx-spark-2minute-cold-start-100-tok-s-on-qwen3-6-35b-fp8-13-supported-models/369263)
