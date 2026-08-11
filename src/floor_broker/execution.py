@@ -46,6 +46,7 @@ class NoAskQuote(Exception):
     """Raised when Alpaca has no executable ask for a symbol. This is a market-data/no-liquidity
     condition, not a malformed order parameter."""
 
+
 # Tracks the parent order id of each open bracket BUY, keyed by symbol, so the fill-watcher
 # (check_bracket_fills) can later find out which of its TP/SL legs eventually filled. Value is
 # either a plain order-id string (the normal case) or, once a poll has hit a transient error for
@@ -196,7 +197,10 @@ def check_pending_fills() -> list[dict]:
                 tp_price = fill_price * ctx["crypto_tpP"]
                 _track_crypto_stop(ctx["symbol"], sl_price, tp_price)
                 log(f"🎯  tracking synthetic stop/target for {ctx['symbol']}: {(sl_price, tp_price)}")
-            events.append({**ctx, "kind": "fill", "order_id": order_id, "fill_price": fill_price})
+            event = {**ctx, "kind": "fill", "order_id": order_id, "fill_price": fill_price}
+            if getattr(order, "filled_qty", None):
+                event["qty"] = float(order.filled_qty)
+            events.append(event)
             _drop_pending_fill(order_id)
         elif order.status in _TERMINAL_NO_FILL:
             events.append({**ctx, "kind": "terminal", "order_id": order_id, "order_status": order.status.value})
@@ -676,8 +680,48 @@ def _max_concurrent_positions_skip(symbol: str, cfg) -> dict | None:
     return None
 
 
-def _stock_buy_request_or_skip(symbol: str, budget: float, slP: float, tpP: float, base_price: float | None = None):
+def _spread_reference_price_or_skip(symbol: str, cfg) -> tuple[float | None, dict | None]:
+    max_spread_pct = cfg.strategy.get("max_bid_ask_spread_pct")
+    if max_spread_pct is None:
+        return None, None
+    ask = get_current_ask_price(symbol)
+    bid = get_current_bid_price(symbol)
+    if ask <= 0:
+        return None, {
+            "status": "skipped",
+            "reason": "no_ask_quote",
+            "detail": f"no executable ask quote for {symbol}: {ask}",
+        }
+    if bid <= 0 or bid >= ask:
+        return None, {
+            "status": "skipped",
+            "reason": "invalid_bid_ask_quote",
+            "detail": f"invalid bid/ask quote for {symbol}: bid={bid} ask={ask}",
+        }
+    spread_pct = (ask - bid) / ask
+    if spread_pct > max_spread_pct:
+        log(f"⚠️  spread {spread_pct:.2%} exceeds max {max_spread_pct:.2%} for {symbol} -- skipping BUY")
+        return None, {
+            "status": "skipped",
+            "reason": "wide_bid_ask_spread",
+            "detail": f"bid/ask spread {spread_pct:.2%} exceeds max {max_spread_pct:.2%}",
+        }
+    return ask, None
+
+
+def _stock_buy_request_or_skip(
+    symbol: str,
+    budget: float,
+    slP: float,
+    tpP: float,
+    cfg,
+    base_price: float | None = None,
+):
     try:
+        if base_price is None:
+            base_price, skip = _spread_reference_price_or_skip(symbol, cfg)
+            if skip is not None:
+                return None, skip
         return bracket_buy_with_SLTP(symbol, budget, slP, tpP, base_price=base_price), None
     except NoAskQuote as exc:
         log(f"⚠️  {exc} -- skipping BUY")
@@ -735,7 +779,14 @@ def _submit_buy_order(req, symbol: str, exchange: str, budget: float, slP: float
             raise
 
         log(f"🔄  retrying BUY {symbol} priced off Alpaca's own base_price {base_price} ...")
-        retry_req, skip = _stock_buy_request_or_skip(symbol, budget, slP, tpP, base_price=float(base_price))
+        retry_req, skip = _stock_buy_request_or_skip(
+            symbol,
+            budget,
+            slP,
+            tpP,
+            load_config(),
+            base_price=float(base_price),
+        )
         if skip is not None:
             return None, skip, retry_req
         return trading_client.submit_order(retry_req), None, retry_req
@@ -773,7 +824,7 @@ def buy(symbol: str, exchange: str, budget: float, slP: float, tpP: float) -> di
         return skip
 
     if exchange == "stocks":
-        req, skip = _stock_buy_request_or_skip(symbol, budget, slP, tpP)
+        req, skip = _stock_buy_request_or_skip(symbol, budget, slP, tpP, cfg)
     else:
         req, skip = _crypto_buy_request_or_skip(symbol, budget)
     if skip is not None:

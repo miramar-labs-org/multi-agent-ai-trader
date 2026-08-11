@@ -33,7 +33,18 @@ def _is_usd_crypto_pair(symbol: str) -> bool:
     return symbol.upper().endswith("/USD")
 
 
-def fetch_screener_candidates(top_n: int, min_price: float = 0.0) -> list[dict]:
+def _excluded_by_suffix(symbol: str, suffixes: list[str] | tuple[str, ...]) -> bool:
+    normalized = symbol.upper()
+    return any(normalized.endswith(suffix.upper()) for suffix in suffixes)
+
+
+def fetch_screener_candidates(
+    top_n: int,
+    min_price: float = 0.0,
+    max_abs_change_pct: float | None = None,
+    min_dollar_volume: float | None = None,
+    excluded_suffixes: list[str] | tuple[str, ...] = (),
+) -> list[dict]:
     # Screener endpoints aren't wrapped by alpaca-py yet, so this hits the REST API directly.
     endpoints = [
         f"{SCREENER_BASE_URL}/most-actives?by=volume&top={top_n}",
@@ -85,10 +96,36 @@ def fetch_screener_candidates(top_n: int, min_price: float = 0.0) -> list[dict]:
             except Exception as exc:
                 log(f"⚠️ failed to fetch a reference price for {c['symbol']}: {exc}")
 
-    candidates = [c for c in all_candidates if c.get("price") is not None and c["price"] >= min_price]
+    candidates = []
+    drop_reasons = {
+        "price": 0,
+        "change": 0,
+        "dollar_volume": 0,
+        "suffix": 0,
+    }
+    for c in all_candidates:
+        symbol = c["symbol"]
+        price = c.get("price")
+        if price is None or price < min_price:
+            drop_reasons["price"] += 1
+            continue
+        if excluded_suffixes and _excluded_by_suffix(symbol, excluded_suffixes):
+            drop_reasons["suffix"] += 1
+            continue
+        change_pct = c.get("change_pct")
+        if max_abs_change_pct is not None and change_pct is not None and abs(float(change_pct)) > max_abs_change_pct:
+            drop_reasons["change"] += 1
+            continue
+        volume = c.get("volume")
+        if min_dollar_volume is not None and volume is not None and float(volume) * float(price) < min_dollar_volume:
+            drop_reasons["dollar_volume"] += 1
+            continue
+        candidates.append(c)
+
     dropped = len(all_candidates) - len(candidates)
     if dropped:
-        log(f"📉 dropped {dropped} screener candidate(s) below ${min_price:.2f} min price (or price unavailable)")
+        detail = ", ".join(f"{reason}={count}" for reason, count in drop_reasons.items() if count)
+        log(f"📉 dropped {dropped} screener candidate(s) by quality filters ({detail})")
     log(f"📈 fetched {len(candidates)} screener candidates")
     return candidates
 

@@ -278,3 +278,35 @@ def fetch_floor_broker_events_since(since_date: date) -> list[dict]:
                 (since_date,),
             )
             return cur.fetchall()
+
+
+def fetch_symbol_dealer_decisions_since(symbol: str, since_date: date, limit: int = 20) -> list[dict]:
+    _ensure_schema()
+    with _get_pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT * FROM dealer_decisions
+                WHERE symbol = %s AND decided_at::date >= %s
+                ORDER BY decided_at DESC
+                LIMIT %s
+                """,
+                (symbol, since_date, limit),
+            )
+            return cur.fetchall()
+
+
+def fetch_symbol_floor_broker_events_since(symbol: str, since_date: date, limit: int = 20) -> list[dict]:
+    _ensure_schema()
+    with _get_pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT * FROM floor_broker_events
+                WHERE symbol = %s AND occurred_at::date >= %s
+                ORDER BY occurred_at DESC
+                LIMIT %s
+                """,
+                (symbol, since_date, limit),
+            )
+            return cur.fetchall()

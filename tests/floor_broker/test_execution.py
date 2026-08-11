@@ -1143,6 +1143,37 @@ def test_buy_proceeds_when_below_max_concurrent_positions(monkeypatch):
     assert result["status"] == "submitted"
 
 
+def test_stock_buy_skips_when_bid_ask_spread_exceeds_configured_cap(monkeypatch):
+    cfg = OmegaConf.create(_FAKE_CFG)
+    cfg.strategy.max_bid_ask_spread_pct = 0.03
+    monkeypatch.setattr(execution, "load_config", lambda: cfg)
+    fake_client = FakeTradingClient()
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+    monkeypatch.setattr(execution, "get_current_ask_price", lambda symbol: 10.0)
+    monkeypatch.setattr(execution, "get_current_bid_price", lambda symbol: 9.5)
+
+    result = execution.buy("MGN", "stocks", 5000.0, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "wide_bid_ask_spread"
+    assert fake_client.submitted == []
+
+
+def test_stock_buy_uses_single_spread_checked_ask_for_order_pricing(monkeypatch):
+    cfg = OmegaConf.create(_FAKE_CFG)
+    cfg.strategy.max_bid_ask_spread_pct = 0.03
+    monkeypatch.setattr(execution, "load_config", lambda: cfg)
+    fake_client = FakeTradingClient()
+    monkeypatch.setattr(execution, "trading_client", fake_client)
+    monkeypatch.setattr(execution, "get_current_ask_price", lambda symbol: 10.0)
+    monkeypatch.setattr(execution, "get_current_bid_price", lambda symbol: 9.9)
+
+    result = execution.buy("MGN", "stocks", 5000.0, slP=0.98, tpP=1.05)
+
+    assert result["status"] == "submitted"
+    assert fake_client.submitted[0].qty == 500
+
+
 def test_buy_tops_up_existing_position_without_regard_to_max_concurrent_positions(monkeypatch):
     """Topping up a symbol that's already open must never be blocked by the concurrent-positions
     cap -- it isn't a new position. FakeExistingPositionTradingClient has no get_all_positions

@@ -39,7 +39,13 @@ def discover_candidates(state: AnalystState, cfg) -> AnalystState:
     candidates = []
 
     if cfg.trading.enable_stocks and state["stock_market_open"]:
-        stock_candidates = sources.fetch_screener_candidates(cfg.analyst.screener_top_n, cfg.analyst.min_price_usd)
+        stock_candidates = sources.fetch_screener_candidates(
+            cfg.analyst.screener_top_n,
+            cfg.analyst.min_price_usd,
+            max_abs_change_pct=cfg.analyst.get("max_abs_change_pct"),
+            min_dollar_volume=cfg.analyst.get("min_dollar_volume_usd"),
+            excluded_suffixes=cfg.analyst.get("excluded_symbol_suffixes", []),
+        )
         if cfg.earnings_blackout.enabled:
             blackout_symbols = sources.fetch_earnings_calendar(
                 [c["symbol"] for c in stock_candidates],

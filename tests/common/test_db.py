@@ -31,6 +31,7 @@ class FakeConnection:
         self.executed = []
         self._rows = rows or []
         self._raise_on_execute = raise_on_execute
+        self.last_cursor = None
 
     def execute(self, sql, params=None):
         if self._raise_on_execute:
@@ -38,7 +39,8 @@ class FakeConnection:
         self.executed.append((sql, params))
 
     def cursor(self, row_factory=None):
-        return FakeCursor(self._rows)
+        self.last_cursor = FakeCursor(self._rows)
+        return self.last_cursor
 
     def __enter__(self):
         return self
@@ -263,3 +265,29 @@ def test_fetch_floor_broker_events_since_returns_list_of_dicts(monkeypatch):
     result = db.fetch_floor_broker_events_since(date(2026, 8, 1))
 
     assert result == rows
+
+
+def test_fetch_symbol_dealer_decisions_since_filters_symbol_and_limits(monkeypatch):
+    rows = [{"id": 1, "symbol": "MGN", "action": "BUY"}]
+    conn = FakeConnection(rows=rows)
+    _patch_pool(monkeypatch, conn)
+
+    result = db.fetch_symbol_dealer_decisions_since("MGN", date(2026, 8, 1), limit=7)
+
+    assert result == rows
+    sql, params = conn.last_cursor.queries[-1]
+    assert "WHERE symbol = %s" in sql
+    assert params == ("MGN", date(2026, 8, 1), 7)
+
+
+def test_fetch_symbol_floor_broker_events_since_returns_list_of_dicts(monkeypatch):
+    rows = [{"id": 1, "symbol": "MGN", "event_type": "fill"}]
+    conn = FakeConnection(rows=rows)
+    _patch_pool(monkeypatch, conn)
+
+    result = db.fetch_symbol_floor_broker_events_since("MGN", date(2026, 8, 1), limit=5)
+
+    assert result == rows
+    sql, params = conn.last_cursor.queries[-1]
+    assert "WHERE symbol = %s" in sql
+    assert params == ("MGN", date(2026, 8, 1), 5)

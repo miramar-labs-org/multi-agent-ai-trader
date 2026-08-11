@@ -38,6 +38,14 @@ strategy:
   position_sizing: flat_budget    # only this is enforced (analyst.default_budget); risk_based is recorded intent only
   risk_per_trade_usd: null        # recorded intent only -- see position_sizing note above
   max_concurrent_positions: 10    # recorded intent only -- analyst.max_universe_size already caps concurrent picks
+  win_rate_throttle_scope: symbol
+  enable_symbol_stop_cooldown: true
+  symbol_stop_cooldown_days: 1
+  max_symbol_stop_losses: 1
+  enable_dealer_memory: true
+  symbol_memory_days: 2
+  symbol_memory_limit: 8
+  max_bid_ask_spread_pct: 0.03
 
 eod_report:
   schedule: "30 21 * * *"   # informational copy of the CronJob's own spec.schedule — 21:30 UTC daily, after
@@ -53,6 +61,9 @@ analyst:
                                # sources.py; most-actives has no price field to filter on). Sub-$1
                                # stocks can fail Floor Broker's SL/TP bracket math (see execution.py's
                                # $0.02 floor/ceiling clamp in bracket_buy_with_SLTP)
+  max_abs_change_pct: 40.0
+  min_dollar_volume_usd: 1000000
+  excluded_symbol_suffixes: [".W", ".WS", "WS", "WT", "U"]
   news_days: 2
   yahoo_rss_url: "https://feeds.finance.yahoo.com/rss/2.0/headline"
   indicator_fetch_limit: 15   # candidates (by |change_pct|) that get real TAAPI indicator data,

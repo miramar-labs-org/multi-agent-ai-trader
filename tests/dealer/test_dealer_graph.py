@@ -1,3 +1,5 @@
+from omegaconf import OmegaConf
+
 from src.dealer import graph
 
 
@@ -45,3 +47,54 @@ def test_skip_missing_indicators_records_hold_without_calling_llm(monkeypatch):
     assert result["execution_result"] == {"status": "skipped", "detail": "missing_indicators"}
     assert recorded["slack"][1] == "HOLD"
     assert recorded["db"][1] == "HOLD"
+
+
+def test_llm_call_includes_recent_same_symbol_memory(monkeypatch):
+    captured = {}
+
+    class FakeSignal:
+        action = "HOLD"
+
+        def model_dump(self):
+            return {"action": "HOLD", "reasoning": "wait", "size_hint": 0.0, "confidence": 0.0}
+
+    class FakeStructured:
+        def invoke(self, messages):
+            captured["user_prompt"] = messages[-1].content
+            return FakeSignal()
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            pass
+
+        def with_structured_output(self, schema):
+            return FakeStructured()
+
+    cfg = OmegaConf.create(
+        {
+            "llm": {"base_url": "http://llm.test/v1", "model": "test-model", "temperature": 0.0},
+            "strategy": {"enable_dealer_memory": True, "symbol_memory_days": 2, "symbol_memory_limit": 4},
+        }
+    )
+    monkeypatch.setattr(graph, "ChatOpenAI", FakeChatOpenAI)
+    monkeypatch.setattr(
+        graph.db,
+        "fetch_symbol_dealer_decisions_since",
+        lambda symbol, since_date, limit: [
+            {"decided_at": "t1", "action": "BUY", "size_hint": 0.5, "reasoning": "prior buy"}
+        ],
+    )
+    monkeypatch.setattr(
+        graph.db,
+        "fetch_symbol_floor_broker_events_since",
+        lambda symbol, since_date, limit: [
+            {"occurred_at": "t2", "event_type": "fill", "detail": "stop_loss leg filled: o-1"}
+        ],
+    )
+
+    result = graph.llm_call(_state("rsi: 25"), cfg)
+
+    assert result["signal"]["action"] == "HOLD"
+    assert "Recent same-symbol trading history" in captured["user_prompt"]
+    assert "prior buy" in captured["user_prompt"]
+    assert "stop_loss leg filled" in captured["user_prompt"]

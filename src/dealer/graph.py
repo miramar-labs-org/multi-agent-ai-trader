@@ -54,7 +54,10 @@ def llm_call(state: DealerState, cfg) -> DealerState:
         "where multiple indicators clearly point the same direction, and score low when the "
         "reading is mixed, weak, or borderline."
     )
+    memory_text = _symbol_memory_text(state["symbol"], cfg)
     user_prompt = f"Indicators for {state['symbol']}:\n{state['indicators_text']}"
+    if memory_text:
+        user_prompt += f"\n\nRecent same-symbol trading history:\n{memory_text}"
 
     log(f"🧠 thinking about {state['symbol']}...")
     signal: Signal = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
@@ -137,7 +140,54 @@ def _classify_exit_event(event: dict) -> str | None:
     return None
 
 
-def _win_rate_throttle_active(cfg) -> str | None:
+def _symbol_memory_text(symbol: str, cfg) -> str:
+    """Returns compact recent same-symbol context for the Dealer prompt. This is advisory context
+    only: DB failures fail open so a transient logging-store outage does not block decisions."""
+    if not cfg.strategy.get("enable_dealer_memory", True):
+        return ""
+    days = cfg.strategy.get("symbol_memory_days", 2)
+    limit = cfg.strategy.get("symbol_memory_limit", 8)
+    since_date = (datetime.now(pytz.timezone("US/Eastern")) - timedelta(days=days)).date()
+    try:
+        decisions = db.fetch_symbol_dealer_decisions_since(symbol, since_date, limit=limit)
+        events = db.fetch_symbol_floor_broker_events_since(symbol, since_date, limit=limit)
+    except Exception as exc:
+        log(f"⚠️ same-symbol memory unavailable for {symbol}: {exc}")
+        return ""
+
+    lines = []
+    for d in reversed(decisions):
+        decided_at = d.get("decided_at", "")
+        size_hint = d.get("size_hint")
+        suffix = f", size_hint={size_hint}" if size_hint is not None else ""
+        lines.append(f"dealer {decided_at}: {d.get('action')}{suffix}; {d.get('reasoning')}")
+    for e in reversed(events):
+        occurred_at = e.get("occurred_at", "")
+        lines.append(f"floor {occurred_at}: {e.get('event_type')}; {e.get('detail')}")
+    return "\n".join(lines[-limit:])
+
+
+def _symbol_stop_cooldown_active(symbol: str, cfg) -> str | None:
+    """Blocks repeated same-symbol BUYs after recent stop-outs. This is deterministic risk
+    control, separate from the LLM's interpretation of recent history."""
+    if not cfg.strategy.get("enable_symbol_stop_cooldown", True):
+        return None
+    days = cfg.strategy.get("symbol_stop_cooldown_days", 1)
+    max_stops = cfg.strategy.get("max_symbol_stop_losses", 1)
+    since_date = (datetime.now(pytz.timezone("US/Eastern")) - timedelta(days=days)).date()
+    try:
+        events = db.fetch_symbol_floor_broker_events_since(symbol, since_date, limit=100)
+    except Exception as exc:
+        log(f"⚠️ stop cooldown check unavailable for {symbol}: {exc}")
+        return None
+
+    losses = sum(1 for event in events if _classify_exit_event(event) == "loss")
+    if losses >= max_stops:
+        return f"{losses} stop-loss exit(s) for {symbol} since {since_date}; cooldown blocks new BUYs"
+    return None
+
+
+def _win_rate_throttle_active(cfg, symbol: str | None = None) -> str | None:
     """Returns a Slack-friendly reason string if new BUYs should pause because the trailing
     automatic-exit win rate (take-profit vs stop-loss hits, both stock brackets and synthetic
     crypto stops) has fallen below strategy.min_win_rate -- a quantitative companion to
@@ -149,10 +199,14 @@ def _win_rate_throttle_active(cfg) -> str | None:
     if not cfg.strategy.get("enable_win_rate_throttle", True):
         return None
 
-    since_date = (
-        datetime.now(pytz.timezone("US/Eastern")) - timedelta(days=cfg.analyst.track_record_days)
-    ).date()
-    events = db.fetch_floor_broker_events_since(since_date)
+    since_date = (datetime.now(pytz.timezone("US/Eastern")) - timedelta(days=cfg.analyst.track_record_days)).date()
+    scope = cfg.strategy.get("win_rate_throttle_scope", "global")
+    if scope == "symbol" and symbol:
+        events = db.fetch_symbol_floor_broker_events_since(symbol, since_date, limit=100)
+        scope_label = f"{symbol} "
+    else:
+        events = db.fetch_floor_broker_events_since(since_date)
+        scope_label = ""
     outcomes = [_classify_exit_event(e) for e in events]
     wins = outcomes.count("win")
     losses = outcomes.count("loss")
@@ -162,7 +216,10 @@ def _win_rate_throttle_active(cfg) -> str | None:
 
     win_rate = wins / total
     if win_rate < cfg.strategy.min_win_rate:
-        return f"trailing win rate {win_rate:.0%} ({wins}W/{losses}L over {total} exits) below minimum {cfg.strategy.min_win_rate:.0%}"
+        return (
+            f"{scope_label}trailing win rate {win_rate:.0%} ({wins}W/{losses}L over {total} exits) "
+            f"below minimum {cfg.strategy.min_win_rate:.0%}"
+        )
     return None
 
 
@@ -187,7 +244,19 @@ def call_floor_broker(state: DealerState, cfg) -> DealerState:
             db.record_floor_broker_event(state["symbol"], "skip", result["detail"])
             return {**state, "execution_result": result}
 
-        throttle_reason = _win_rate_throttle_active(cfg)
+        cooldown_reason = _symbol_stop_cooldown_active(state["symbol"], cfg)
+        if cooldown_reason:
+            log(f"⏭️  BUY for {state['symbol']} skipped -- {cooldown_reason}")
+            result = {
+                "status": "skipped",
+                "reason": "symbol_stop_cooldown",
+                "detail": f"new BUY entry paused: {cooldown_reason}",
+            }
+            slack.notify_floor_broker_result(state["symbol"], signal["action"], result["status"], result["detail"])
+            db.record_floor_broker_event(state["symbol"], "skip", result["detail"])
+            return {**state, "execution_result": result}
+
+        throttle_reason = _win_rate_throttle_active(cfg, state["symbol"])
         if throttle_reason:
             log(f"⏭️  BUY for {state['symbol']} skipped -- {throttle_reason}")
             result = {

@@ -44,7 +44,7 @@ def test_discover_candidates_skips_stocks_when_market_closed(monkeypatch):
 
 
 def test_discover_candidates_includes_stocks_when_market_open(monkeypatch):
-    monkeypatch.setattr(graph.sources, "fetch_screener_candidates", lambda n, min_price: [{"symbol": "MGN"}])
+    monkeypatch.setattr(graph.sources, "fetch_screener_candidates", lambda n, min_price, **kwargs: [{"symbol": "MGN"}])
     monkeypatch.setattr(graph.sources, "fetch_crypto_candidates", lambda n: [])
     cfg = OmegaConf.create(
         {
@@ -68,7 +68,9 @@ def test_discover_candidates_includes_stocks_when_market_open(monkeypatch):
 
 def test_discover_candidates_drops_earnings_blackout_symbols(monkeypatch):
     monkeypatch.setattr(
-        graph.sources, "fetch_screener_candidates", lambda n, min_price: [{"symbol": "MGN"}, {"symbol": "NVDA"}]
+        graph.sources,
+        "fetch_screener_candidates",
+        lambda n, min_price, **kwargs: [{"symbol": "MGN"}, {"symbol": "NVDA"}],
     )
     monkeypatch.setattr(graph.sources, "fetch_crypto_candidates", lambda n: [])
     monkeypatch.setattr(graph.sources, "fetch_earnings_calendar", lambda symbols, days_before, days_after: {"NVDA"})
@@ -94,7 +96,9 @@ def test_discover_candidates_drops_earnings_blackout_symbols(monkeypatch):
 
 def test_discover_candidates_skips_earnings_filter_when_disabled_via_config(monkeypatch):
     monkeypatch.setattr(
-        graph.sources, "fetch_screener_candidates", lambda n, min_price: [{"symbol": "MGN"}, {"symbol": "NVDA"}]
+        graph.sources,
+        "fetch_screener_candidates",
+        lambda n, min_price, **kwargs: [{"symbol": "MGN"}, {"symbol": "NVDA"}],
     )
     monkeypatch.setattr(graph.sources, "fetch_crypto_candidates", lambda n: [])
 

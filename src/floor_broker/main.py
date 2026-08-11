@@ -42,6 +42,7 @@ def poll_bracket_fills():
                     )
                     db.record_floor_broker_event(
                         event["symbol"], "fill", f"{event['reason']} leg filled: {event['order_id']}",
+                        qty=event.get("qty"),
                         price=event["fill_price"],
                     )
                 else:
@@ -101,6 +102,7 @@ def poll_pending_fills():
                         event["symbol"],
                         "fill",
                         f"{event['reason']} order filled: {event['order_id']}",
+                        qty=event.get("qty"),
                         price=event["fill_price"],
                     )
                     if event["action"] == "BUY":

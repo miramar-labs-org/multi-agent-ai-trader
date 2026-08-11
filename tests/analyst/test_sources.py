@@ -87,7 +87,44 @@ def test_fetch_screener_candidates_drops_candidate_when_price_lookup_fails(monke
 def test_fetch_screener_candidates_defaults_to_no_price_filtering():
     """Backward-compat: callers that don't pass min_price (default 0.0) get every symbol
     regardless of price."""
-    assert sources.fetch_screener_candidates.__defaults__ == (0.0,)
+    assert sources.fetch_screener_candidates.__defaults__ == (0.0, None, None, ())
+
+
+def test_fetch_screener_candidates_drops_extreme_movers_low_dollar_volume_and_suffixes(monkeypatch):
+    def fake_get(url, headers=None, timeout=None):
+        if "most-actives" in url:
+            return FakeResponse(
+                {
+                    "most_actives": [
+                        {"symbol": "GOOD", "volume": 200000},
+                        {"symbol": "THIN", "volume": 1000},
+                        {"symbol": "UNITU", "volume": 200000},
+                    ]
+                }
+            )
+        return FakeResponse(
+            {
+                "gainers": [
+                    {"symbol": "WILD", "price": 10.0, "percent_change": 55.0},
+                    {"symbol": "GOOD", "price": 10.0, "percent_change": 5.0},
+                ],
+                "losers": [],
+            }
+        )
+
+    prices = {"GOOD": 10.0, "THIN": 10.0, "UNITU": 10.0}
+    monkeypatch.setattr(sources.requests, "get", fake_get)
+    monkeypatch.setattr(sources, "get_current_ask_price", lambda symbol: prices[symbol])
+
+    candidates = sources.fetch_screener_candidates(
+        top_n=20,
+        min_price=1.0,
+        max_abs_change_pct=40.0,
+        min_dollar_volume=1_000_000,
+        excluded_suffixes=["U"],
+    )
+
+    assert [c["symbol"] for c in candidates] == ["GOOD"]
 
 
 def test_fetch_crypto_candidates_keeps_only_usd_quoted_pairs(monkeypatch):

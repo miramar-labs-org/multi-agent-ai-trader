@@ -64,6 +64,16 @@ strategy:
                                    # throttle evaluates at all, so a handful of early trades can't
                                    # trip it on noise
   enable_win_rate_throttle: true  # feature gate: config-only change, no redeploy needed
+  win_rate_throttle_scope: symbol  # "symbol" avoids one cluster of bad names pausing all BUYs;
+                                   # set "global" to restore portfolio-wide behavior
+  enable_symbol_stop_cooldown: true  # blocks same-symbol re-entry after recent stop-loss exits
+  symbol_stop_cooldown_days: 1       # lookback window for same-symbol stop-loss cooldown
+  max_symbol_stop_losses: 1          # one stop-loss in the window pauses new BUYs for that symbol
+  enable_dealer_memory: true         # include recent same-symbol decisions/execution outcomes in
+                                     # Dealer's prompt so it can see failed re-entry patterns
+  symbol_memory_days: 2
+  symbol_memory_limit: 8
+  max_bid_ask_spread_pct: 0.03       # stock BUYs skip when spread/ask exceeds this fraction
 
 eod_flatten:
   enabled: true   # feature gate: when false, poll_eod_flatten() (src/floor_broker/main.py) short-
@@ -211,6 +221,11 @@ analyst:
                                # sources.py; most-actives has no price field to filter on). Sub-$1
                                # stocks can fail Floor Broker's SL/TP bracket math (see execution.py's
                                # $0.02 floor/ceiling clamp in bracket_buy_with_SLTP)
+  max_abs_change_pct: 40.0    # drop extreme intraday movers/losers before the LLM; these were the
+                               # main source of repeated stop-out churn
+  min_dollar_volume_usd: 1000000  # when screener volume and reference price are available, require
+                                  # at least this much traded notional
+  excluded_symbol_suffixes: [".W", ".WS", "WS", "WT", "U"]  # avoid warrants/units where possible
   news_days: 2
   yahoo_rss_url: "https://feeds.finance.yahoo.com/rss/2.0/headline"
   indicator_fetch_limit: 15   # candidates (by |change_pct|) that get real TAAPI indicator data,
