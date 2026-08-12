@@ -145,8 +145,6 @@ macro_blackout:
                    # FOMC meeting minutes (3wk after each decision), PPI, ISM Manufacturing/
                    # Services PMI, GDP (advance/preliminary/final), and the Fed Chair's
                    # semiannual (Humphrey-Hawkins) testimony.
-    - date: "2026-08-12"
-      label: "CPI release"
     - date: "2026-08-26"
       label: "PCE release"
     - date: "2026-09-04"
