@@ -205,3 +205,141 @@ Implemented mitigations:
 These changes do not claim the affected symbols were impossible to trade profitably; they make
 the system stop re-entering the same failed setup blindly and keep one bad cluster from pausing
 the entire portfolio.
+
+## 2026-08-12 13:35 ET
+
+**P&L: +\$13.40 (+0.001%)** — equity \$998,683.01 vs. prior close \$998,669.61. Essentially flat on
+net, but the day validates the candidate-mix redesign end-to-end: TISI and ETH/USD (both from the
+original 09:10 ET screener batch, already covered qualitatively in the 11:05 ET entry above) both
+filled after that entry was written, and NVDA became the first live BUY sourced from the new
+40/30/30 large-cap/crypto/screener candidate-mix pool.
+
+### TISI — +\$31.05 unrealized (+1.04%)
+
+Analyst pick at 09:10 ET: *"RSI 65.1 bullish with positive MACD histogram and price above
+VWAP/SMA, showing strong upward momentum continuation."* Dealer issued a consistent BUY signal
+from 09:55 ET onward (*"MACD line is above its signal line with a positive histogram... price is
+trading above VWAP, SMA and EMA"*), but Floor Broker blocked every attempt until late morning:
+first paused by the CPI macro blackout (09:55–10:41 ET), then blocked once by the spread guard
+(3.41% vs. the 3.00% cap, 10:58 ET). The order finally cleared at 11:19:51 ET — 135 shares @
+\$22.09 (34 + 101 share fills, order `5fb49b8b`). For the rest of the day Dealer correctly held
+the position rather than adding to it (open orders / no fresh edge). Now holding 135 shares,
+unrealized +\$31.05.
+
+### ETH/USD — roughly -\$11 realized (closed out)
+
+Analyst pick at 09:10 ET: *"RSI 63.8 bullish, MACD histogram strongly positive... indicating
+sustained crypto uptrend."* Dealer's BUY signal was blocked by the same CPI macro blackout through
+10:42 ET, then filled in two pieces once the blackout lifted: 1.426579552 @ \$1889.38 (11:04:57 ET)
+and 0.030518487 @ \$1892.50 (11:20:44 ET), for a combined cost of ≈\$2,753. At 12:09:23 ET the
+Dealer reversed to SELL: *"RSI is neutral (~49.5), MACD line is below its signal line with a
+negative histogram (-0.24), indicating bearish momentum... lack of bullish RSI or price-action
+signals gives a modest bearish bias."* The sell filled almost immediately (12:09:42 ET) for
+1.453455293 @ \$1886.40 (≈\$2,742 proceeds) — a clean, fast reversal call that closed nearly the
+entire position for a small loss (≈-\$11 on ≈\$2,753 notional), leaving only a ~0.0036 ETH dust
+remainder. No ETH/USD position remains open.
+
+### NVDA — first live BUY from the new candidate-mix pool
+
+NVDA entered the candidate pool via the manual mix rerun (Analyst batch generated 12:35:16 ET:
+*"RSI 67.7 shows bullish momentum, MACD line above signal with positive histogram, price above
+VWAP and SMA/EMA, indicating upward trend"*) and again via the midday cronjob batch (12:57:30 ET).
+Dealer's first pass after the pod restart (13:08:15 ET) came back HOLD with *"no indicator data
+available for NVDA this cycle... skipped without invoking the LLM"* — a transient TAAPI gap right
+after the fresh portfolio was picked up, not a bug (the fail-closed indicator gate working as
+designed). The next cycle (13:25:08 ET) had real indicator data and Dealer issued a BUY:
+*"RSI at 68.1 shows bullish momentum but not yet overbought; MACD line (1.059) above signal
+(0.404) with positive histogram (0.654) confirms upward crossover; price is trading above VWAP
+(~220.01), EMA (~220.54) and SMA (~219.71)... All indicators align to a bullish bias, though RSI
+nearing 70 warrants caution, so a moderate position is advised."* Floor Broker submitted the
+bracket buy immediately (order `880e66c2-f430-41f8-93c4-dbc15dd9f05a`) and it filled in full
+within seconds: 13 shares @ \$223.98 (13:25:33 ET). Holding 13 shares, unrealized +\$0.52.
+
+### JPM, CWVX, WYFL, CRWX — mix-pool large-cap/screener picks, no trades
+
+The rest of the 12:35/12:57 ET mix batch stayed HOLD every cycle for the same reason: RSI deep in
+overbought territory (73–83) against a still-bullish MACD — e.g. JPM: *"RSI is overbought (74.8)
+suggesting a potential pullback, while MACD shows bullish momentum... These mixed signals do not
+give a clear directional edge."* No BUY was ever attempted on these four.
+
+### HYPE/USD, CRV/USD — mix-pool crypto picks, correctly skipped
+
+Both entered the pool on daily %-gain alone (*"+3.48% daily gain... no indicator data"* /
+*"+2.2% daily gain... no indicator data"*) and every Dealer cycle short-circuited with *"no
+indicator data available... skipped without invoking the LLM"* — the same fail-closed TAAPI gate
+working as intended, not a bug.
+
+### SLXN, BODI, CRIS, GAIA — original screener batch, blocked by the spread guard all day
+
+Consistent with the 11:05 ET entry: SLXN kept getting SELL/HOLD calls on oversold-RSI-vs-bearish-
+MACD conflicts (no open position to sell against, so `sell_skipped`). BODI flipped to BUY multiple
+times through the afternoon (oversold RSI, price above VWAP/middle Bollinger) but every single
+attempt (5 total, 10:00–17:04 ET) was blocked by the spread guard — spreads ranged 14.19%–22.49%
+against the 3.00% cap. CRIS and GAIA stayed HOLD all day on genuinely mixed oversold-RSI-vs-
+bearish-trend signals. Zero trades on any of the four.
+
+### Open positions carried from before today
+
+None beyond TISI/NVDA covered above — no other same-day-less positions in today's data.
+
+### Notes
+
+No `error` events today. The two "no indicator data" HOLDs (NVDA's first post-restart cycle,
+HYPE/USD, CRV/USD) are the fail-closed indicator gate behaving correctly, not something to
+investigate.
+
+---
+
+## 2026-08-12 11:05 ET
+
+**P&L: \$0.00 (0.00%)** — dead flat day. Equity held at \$998,669.61 all session, zero fills,
+zero open positions. Every Analyst pick that reached the Dealer as a BUY signal got blocked
+before execution; every SELL signal had no position to act on.
+
+### SLXN
+
+Analyst flagged it oversold (RSI 17.2, price above VWAP) for a mean-reversion bounce, \$5,000
+budget. The Dealer disagreed every cycle: across 5 decisions (13:51–14:53 ET) it called SELL each
+time, reasoning that bearish MACD, price below both SMA/EMA, and price well under the Bollinger
+midline outweighed the lone bullish RSI reading. Floor Broker logged `sell_skipped — no open
+position` every time, exactly as expected since there was nothing to sell.
+
+### BODI
+
+Oversold pick (RSI 25.7). Dealer started cautious — two HOLDs (13:52, 14:07) citing bearish MACD
+against bullish RSI/VWAP — then flipped to BUY three times (14:38, 14:55, 15:00, size_hint 0.5)
+once price cleared the Bollinger midline. The first BUY attempt hit the CPI macro blackout; the
+last was skipped for a 19.10% bid/ask spread, way over the 3.00% cap. Never filled.
+
+### CRIS
+
+Oversold pick (RSI 22.96). Dealer held firm at HOLD across all 6 cycles (13:53–15:02),
+consistently citing price below SMA/EMA/VWAP outweighing the oversold RSI and a near-zero MACD
+histogram. No BUY/SELL signal ever generated, so no Floor Broker action at all.
+
+### GAIA
+
+Oversold pick (RSI 26.9). Same story as CRIS — HOLD across all 6 cycles (13:54–15:03), bearish
+trend indicators outvoting the oversold momentum reading. No execution attempted.
+
+### TISI
+
+Bullish momentum pick (RSI 65.1, positive MACD histogram). This was the Dealer's most consistent
+conviction call of the day: BUY on all 6 cycles (13:55–15:03, size_hint 0.6), citing price above
+VWAP/SMA/EMA and a clean MACD bullish crossover. Every single attempt was blocked — the first
+three by the CPI macro blackout, the last two by spread guards (3.41% and 14.31% vs. the 3.00%
+max). Zero fills despite six straight BUY calls — worth a look at whether TISI's typical spread
+makes it a poor fit for this budget size.
+
+### ETH/USD
+
+Bullish crypto pick (RSI 63.8). Dealer called BUY three times (13:56, 14:11, 14:26, size_hint
+0.55–0.6) on bullish MACD/EMA-over-SMA momentum. All three blocked by the CPI macro blackout. No
+further Dealer decisions for ETH/USD appear after 14:26 in today's data.
+
+**Open positions carried from before today:** none — the account is fully flat.
+
+**Errors/no-fills needing a look:** nothing broken — every skip traces to an intentional risk
+control (macro blackout during the CPI release, or the bid/ask spread guard). The one pattern
+worth flagging: TISI generated 6 consecutive BUY signals and never executed once, split between
+blackout timing and spread width.

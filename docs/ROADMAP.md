@@ -39,6 +39,8 @@ All trading remains **paper-only**. SELL operations that reduce exposure should 
 | P1.7 | Resolve `size_hint` semantics | P1 | Done | P1.1 |
 | P1.8 | Daily loss, trade-count, and aggregate exposure controls | P1 | Partial (daily P&L halt only; see below) | P0.4, P1.1 |
 | P1.9 | Core operational metrics | P1 | Planned | P1.1 |
+| P1.14 | Multi-modal Dealer: OHLCV enrichment + AGX-Orin Visual Analyst (shadow) | P1 | Planned (full plan drafted, approved, not started; see below) | P1.1 |
+| P1.15 | Analyst candidate-mix: fixed large-cap/crypto/screener pool ratio | P1 | Done | — |
 | P2.1 | Full Prometheus and Grafana observability | P2 | Planned | P1.9 |
 | P2.2 | Automatic circuit breakers | P2 | Planned | P1.8, P1.9 |
 | P2.3 | Distributed execution coordination | P2 | Planned | Future scaling need |
@@ -1018,6 +1020,72 @@ enabled, never calls Finnhub when disabled) and `tests/dealer/test_call_floor_br
 witching day, forwards BUY normally when no date matches, forwards SELL unconditionally even
 during a blackout; `_is_quad_witching_day()` matches the third Friday of each quarter-end month
 and rejects other Fridays/months).
+
+---
+
+## P1.14 — Multi-modal Dealer: OHLCV enrichment + AGX-Orin Visual Analyst (shadow)
+
+**Planned — full implementation plan drafted and approved 2026-08-12, not started.**
+Adds two independently config-gated enhancements to the Dealer's input, bundled in one v1:
+
+- **OHLCV enrichment**: multi-timeframe candle data and derived technical features
+  (return%, realized volatility, ATR, volume-relative, distance-from-high/low, VWAP
+  distance, trend slope) feeding the numerical Dealer's existing prompt, in addition to
+  today's TAAPI scalar indicator snapshot.
+- **Visual Analyst**: an independent, shadow-only second opinion from a vision-capable
+  model (target: a 7B-class VLM on AGX Orin's Ollama, e.g. `qwen2.5-vl:7b`, tag to be
+  verified before enabling) reasoning over a rendered candlestick chart. Stocks only in
+  v1; degrades cleanly to today's numerical-only behavior whenever AGX/its model is
+  unreachable. The numerical Dealer is never told the visual opinion exists — no
+  consensus/enforcement gate is built in v1 — so the two signals stay decorrelated for a
+  future ablation study. Persisted separately as `visual_analyst_decisions`, not merged
+  into `dealer_decisions`.
+
+Both flags ship `false` by default; enabling either is a config-only change
+(`ohlcv_enrichment.enabled`, `visual_analyst.enabled` in `config.yaml` and
+`config.default.yaml`), same live-reload story as `eod_flatten.enabled`. Full design,
+rollout sequencing, and manual-verification checklist:
+`/home/aaron/.claude/plans/tingly-pondering-codd.md`.
+
+---
+
+## P1.15 — Analyst candidate-mix: fixed large-cap/crypto/screener pool ratio
+
+**Done.** Before this change, the Analyst's entire stock candidate pool came from Alpaca's
+screener (`most-actives` by volume, `movers` gainers/losers by %-change), and `fetch_indicators`
+(`src/analyst/graph.py`) ranked candidates by `abs(change_pct)` before fetching real TAAPI
+indicator data for only the top `indicator_fetch_limit`. Mega-caps (AAPL, NVDA, MSFT, ...) almost
+never move enough in a day to compete with a thinly-traded microcap's 20-30%+ swing, so blue chips
+essentially never appeared as picks — confirmed against a live run where 16 surviving stock
+candidates were all in the penny/microcap range.
+
+New `analyst.candidate_mix` block (`config.yaml`/`config.default.yaml`, default `enabled: true`)
+composes the daily stock+crypto candidate pool as a fixed percentage mix instead of letting the
+day's movers ranking alone decide what the LLM sees: `pool_size: 20` total, split
+`large_cap_pct: 0.40` / `crypto_pct: 0.30` / `screener_pct: 0.30`. The large-cap bucket draws from
+a new `analyst.large_cap_symbols` list (15 blue-chip names) via `sources.fetch_large_cap_candidates`
+— fails *open* on a quote-lookup failure (unlike the screener's fail-closed behavior), since a
+hand-picked large-cap symbol carries none of the illiquid-mover risk the fail-closed path exists to
+guard against. The crypto bucket is silently redistributed to the other two buckets when
+`trading.enable_crypto` is false. All existing downstream risk controls (earnings blackout, macro
+blackout, spread guard, daily P&L halt, position caps) apply unchanged to every symbol regardless
+of which bucket it came from — the mix only changes what reaches the candidate pool, not what
+happens after. `enabled: false` reverts to today's screener-only discovery; the whole feature is a
+config-only, no-redeploy change.
+
+Commits: `daeba6b` (feat: candidate mix), `a6d2662` (ruff fix). Tests:
+`tests/analyst/test_sources.py` (`fetch_large_cap_candidates` — price populated per symbol, fails
+open on a lookup error, empty input short-circuits without calling anything) and
+`tests/analyst/test_graph.py` (pool composed by ratio, screener_pct excludes symbols already in
+`large_cap_symbols`, crypto redistribution when crypto is disabled, `enabled: false` regression
+parity with pre-change behavior).
+
+**Live-verified 2026-08-12**: a manual rerun plus the scheduled midday cronjob both produced
+correctly-mixed portfolios (large-cap names like NVDA/JPM alongside crypto and screener picks,
+each earnings-blackout-filtered and indicator-backed). The pipeline was confirmed end-to-end —
+Analyst mix pick → Dealer BUY decision → Floor Broker bracket order → fill — on NVDA (13 shares @
+\$223.98, bracket order `880e66c2-f430-41f8-93c4-dbc15dd9f05a`). See `docs/analysis.md`'s
+`2026-08-12 13:35 ET` entry for the full narrative.
 
 ---
 
