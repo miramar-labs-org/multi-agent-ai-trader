@@ -163,6 +163,23 @@ def fetch_crypto_candidates(top_n: int) -> list[dict]:
     return candidates
 
 
+def fetch_large_cap_candidates(symbols: list[str]) -> list[dict]:
+    # Fails open on price-lookup failure (unlike fetch_screener_candidates's fail-closed
+    # behavior) -- these are hand-picked large-cap symbols, not unvetted movers, so a transient
+    # quote hiccup shouldn't silently drop e.g. AAPL from the candidate pool. `price` is purely
+    # informational context for the LLM prompt; nothing downstream depends on it being present.
+    candidates = []
+    for symbol in symbols:
+        entry = {"symbol": symbol}
+        try:
+            entry["price"] = get_current_ask_price(symbol)
+        except Exception as exc:
+            log(f"⚠️ failed to fetch a reference price for large-cap symbol {symbol}: {exc}")
+        candidates.append(entry)
+    log(f"📌 fetched {len(candidates)} large-cap candidate(s)")
+    return candidates
+
+
 def fetch_news(days: int, limit: int = 20) -> str:
     client = NewsClient(
         api_key=os.getenv("ALPACA_PAPER_API_KEY"),

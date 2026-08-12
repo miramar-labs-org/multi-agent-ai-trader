@@ -68,6 +68,26 @@ analyst:
   yahoo_rss_url: "https://feeds.finance.yahoo.com/rss/2.0/headline"
   indicator_fetch_limit: 15   # candidates (by |change_pct|) that get real TAAPI indicator data,
                                # capped for TAAPI's 15s/request free-tier rate limit
+  large_cap_symbols: ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "JPM", "V", "JNJ",
+                       "WMT", "PG", "HD", "MA", "XOM"]
+                               # candidate pool for candidate_mix's large-cap bucket below, and always
+                               # gets real indicator data (fetch_indicators) regardless of the day's
+                               # movers ranking. Order doesn't matter, just needs enough names to
+                               # fill large_cap_pct's target count.
+  candidate_mix:
+    enabled: true              # feature gate: compose the stock+crypto candidate pool as a fixed
+                                # percentage mix (large-cap / crypto / today's screener movers)
+                                # instead of letting the day's movers ranking alone decide what the
+                                # LLM sees. false = fall back to today's screener+crypto-only
+                                # discovery. Config-only change, no redeploy needed.
+    pool_size: 20               # total size of the mixed candidate pool when enabled
+    large_cap_pct: 0.40         # fraction of pool_size drawn from large_cap_symbols
+    crypto_pct: 0.30            # fraction of pool_size drawn from crypto (screener movers + the
+                                 # fixed CRYPTO_WATCHLIST); silently redistributed to the other
+                                 # buckets when trading.enable_crypto is false
+    screener_pct: 0.30          # fraction of pool_size drawn from today's screener movers/most-
+                                 # actives ("weird stocks"), excluding any symbol already in
+                                 # large_cap_symbols
 
 taapi:
   min_request_interval_secs: 15   # matches the TAAPI Free plan's 1 request/15s cap; lower if you upgrade (Basic ~3s, Pro/Expert ~1s)

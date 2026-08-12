@@ -90,6 +90,43 @@ def test_fetch_screener_candidates_defaults_to_no_price_filtering():
     assert sources.fetch_screener_candidates.__defaults__ == (0.0, None, None, ())
 
 
+def test_fetch_large_cap_candidates_returns_one_entry_per_symbol_with_price(monkeypatch):
+    prices = {"AAPL": 230.0, "NVDA": 120.0}
+    monkeypatch.setattr(sources, "get_current_ask_price", lambda symbol: prices[symbol])
+
+    candidates = sources.fetch_large_cap_candidates(["AAPL", "NVDA"])
+
+    assert candidates == [{"symbol": "AAPL", "price": 230.0}, {"symbol": "NVDA", "price": 120.0}]
+
+
+def test_fetch_large_cap_candidates_fails_open_on_price_lookup_failure(monkeypatch):
+    """Unlike fetch_screener_candidates's fail-closed behavior, a large-cap symbol must survive
+    a quote lookup failure -- it's hand-picked, not an unvetted mover, so a transient hiccup
+    shouldn't drop it from the candidate pool the one day it's most useful to have."""
+
+    def fake_get_price(symbol):
+        if symbol == "AAPL":
+            raise RuntimeError("no quote available")
+        return 120.0
+
+    monkeypatch.setattr(sources, "get_current_ask_price", fake_get_price)
+
+    candidates = sources.fetch_large_cap_candidates(["AAPL", "NVDA"])
+
+    assert candidates == [{"symbol": "AAPL"}, {"symbol": "NVDA", "price": 120.0}]
+
+
+def test_fetch_large_cap_candidates_empty_input_returns_empty_list_without_calling_anything(monkeypatch):
+    def fail_if_called(symbol):
+        raise AssertionError("get_current_ask_price must not be called for an empty large-cap list")
+
+    monkeypatch.setattr(sources, "get_current_ask_price", fail_if_called)
+
+    candidates = sources.fetch_large_cap_candidates([])
+
+    assert candidates == []
+
+
 def test_fetch_screener_candidates_drops_extreme_movers_low_dollar_volume_and_suffixes(monkeypatch):
     def fake_get(url, headers=None, timeout=None):
         if "most-actives" in url:

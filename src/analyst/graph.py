@@ -35,35 +35,142 @@ class AnalystState(TypedDict):
     is_midday_run: bool
 
 
+def _by_abs_change_pct(candidate: dict) -> float:
+    # A missing change_pct (e.g. a large-cap symbol with no mover data today) must sort last,
+    # not crash the comparison.
+    return abs(candidate["change_pct"]) if candidate.get("change_pct") is not None else -1
+
+
+def _filter_earnings_blackout(candidates: list[dict], cfg) -> list[dict]:
+    if not cfg.earnings_blackout.enabled or not candidates:
+        return candidates
+    blackout_symbols = sources.fetch_earnings_calendar(
+        [c["symbol"] for c in candidates],
+        cfg.earnings_blackout.days_before,
+        cfg.earnings_blackout.days_after,
+    )
+    if blackout_symbols:
+        log(f"📅 dropping {len(blackout_symbols)} candidate(s) in earnings blackout: {sorted(blackout_symbols)}")
+    return [c for c in candidates if c["symbol"] not in blackout_symbols]
+
+
+def _allocate_bucket_counts(pool_size: int, weights: dict[str, float]) -> dict[str, int]:
+    """Splits `pool_size` slots across buckets proportional to `weights` (need not sum to 1.0 --
+    normalized here), using largest-remainder rounding so the counts always sum to exactly
+    `pool_size`."""
+    total_weight = sum(weights.values())
+    if total_weight <= 0:
+        return {bucket: 0 for bucket in weights}
+    raw = {bucket: pool_size * weight / total_weight for bucket, weight in weights.items()}
+    counts = {bucket: int(value) for bucket, value in raw.items()}
+    remainder = pool_size - sum(counts.values())
+    by_fraction_desc = sorted(weights, key=lambda bucket: raw[bucket] - counts[bucket], reverse=True)
+    for bucket in by_fraction_desc[:remainder]:
+        counts[bucket] += 1
+    return counts
+
+
+def _fill_buckets_with_backfill(pools: dict[str, list], target_counts: dict[str, int]) -> dict[str, list]:
+    """Takes up to `target_counts[bucket]` candidates from each pool (in the pool's given order),
+    then redistributes any shortfall -- a bucket without enough eligible candidates to hit its
+    target, e.g. earnings blackout thinned the large-cap list -- to whichever other bucket(s)
+    still have unused candidates, so a thin day in one bucket doesn't shrink the whole pool when
+    another bucket has spare supply."""
+    taken = {bucket: list(pool[: target_counts[bucket]]) for bucket, pool in pools.items()}
+    shortfall = sum(max(0, target_counts[bucket] - len(pools[bucket])) for bucket in pools)
+    if shortfall > 0:
+        spare = {bucket: pools[bucket][target_counts[bucket]:] for bucket in pools}
+        for bucket in sorted(spare, key=lambda b: len(spare[b]), reverse=True):
+            if shortfall <= 0:
+                break
+            extra = spare[bucket][:shortfall]
+            taken[bucket].extend(extra)
+            shortfall -= len(extra)
+    return taken
+
+
+def _discover_mixed_candidates(cfg, mix_cfg) -> list[dict]:
+    """Composes the stock+crypto candidate pool as a fixed percentage mix -- large-cap names,
+    crypto, and today's screener movers/most-actives ("weird stocks") -- rather than letting the
+    day's movers ranking alone decide what the LLM sees (mega-caps' small daily %-moves rarely
+    compete with a thinly-traded microcap's 20-30%+ swing). See docs/architecture.md."""
+    pool_size = mix_cfg.get("pool_size", 20)
+    crypto_enabled = cfg.trading.enable_crypto
+    weights = {
+        "large_cap": mix_cfg.get("large_cap_pct", 0.4),
+        "crypto": mix_cfg.get("crypto_pct", 0.3) if crypto_enabled else 0.0,
+        "screener": mix_cfg.get("screener_pct", 0.3),
+    }
+    target_counts = _allocate_bucket_counts(pool_size, weights)
+
+    large_cap_pool = sources.fetch_large_cap_candidates(cfg.analyst.get("large_cap_symbols", []))
+    large_cap_symbols = {c["symbol"] for c in large_cap_pool}
+
+    screener_pool = sources.fetch_screener_candidates(
+        cfg.analyst.screener_top_n,
+        cfg.analyst.min_price_usd,
+        max_abs_change_pct=cfg.analyst.get("max_abs_change_pct"),
+        min_dollar_volume=cfg.analyst.get("min_dollar_volume_usd"),
+        excluded_suffixes=cfg.analyst.get("excluded_symbol_suffixes", []),
+    )
+    # A symbol already in large_cap_symbols belongs to that bucket, not the "weird stocks" one.
+    screener_pool = [c for c in screener_pool if c["symbol"] not in large_cap_symbols]
+
+    # Earnings blackout applies to any stock candidate uniformly, same as today -- filtering here
+    # (before allocation) lets a blackout-caused shortfall in one stock bucket get backfilled from
+    # the other, rather than just shrinking the final pool.
+    stock_pool = _filter_earnings_blackout(large_cap_pool + screener_pool, cfg)
+    large_cap_pool = [c for c in stock_pool if c["symbol"] in large_cap_symbols]
+    screener_pool = sorted((c for c in stock_pool if c["symbol"] not in large_cap_symbols), key=_by_abs_change_pct, reverse=True)
+
+    crypto_pool = []
+    if crypto_enabled:
+        crypto_pool = sorted(sources.fetch_crypto_candidates(cfg.analyst.screener_top_n), key=_by_abs_change_pct, reverse=True)
+
+    selected = _fill_buckets_with_backfill(
+        {"large_cap": large_cap_pool, "crypto": crypto_pool, "screener": screener_pool}, target_counts
+    )
+
+    stock_candidates = selected["large_cap"] + selected["screener"]
+    for c in stock_candidates:
+        c["market"] = "stocks"
+    crypto_candidates = selected["crypto"]
+    for c in crypto_candidates:
+        c["market"] = cfg.trading.crypto_taapi_exchange
+
+    log(
+        f"🎛️ candidate mix — target {target_counts}, got {len(selected['large_cap'])} large-cap, "
+        f"{len(crypto_candidates)} crypto, {len(selected['screener'])} screener"
+    )
+    return stock_candidates + crypto_candidates
+
+
 def discover_candidates(state: AnalystState, cfg) -> AnalystState:
     candidates = []
+    mix_cfg = cfg.analyst.get("candidate_mix", {})
+    mix_active = mix_cfg.get("enabled", False) and cfg.trading.enable_stocks and state["stock_market_open"]
 
-    if cfg.trading.enable_stocks and state["stock_market_open"]:
-        stock_candidates = sources.fetch_screener_candidates(
-            cfg.analyst.screener_top_n,
-            cfg.analyst.min_price_usd,
-            max_abs_change_pct=cfg.analyst.get("max_abs_change_pct"),
-            min_dollar_volume=cfg.analyst.get("min_dollar_volume_usd"),
-            excluded_suffixes=cfg.analyst.get("excluded_symbol_suffixes", []),
-        )
-        if cfg.earnings_blackout.enabled:
-            blackout_symbols = sources.fetch_earnings_calendar(
-                [c["symbol"] for c in stock_candidates],
-                cfg.earnings_blackout.days_before,
-                cfg.earnings_blackout.days_after,
+    if mix_active:
+        candidates.extend(_discover_mixed_candidates(cfg, mix_cfg))
+    else:
+        if cfg.trading.enable_stocks and state["stock_market_open"]:
+            stock_candidates = sources.fetch_screener_candidates(
+                cfg.analyst.screener_top_n,
+                cfg.analyst.min_price_usd,
+                max_abs_change_pct=cfg.analyst.get("max_abs_change_pct"),
+                min_dollar_volume=cfg.analyst.get("min_dollar_volume_usd"),
+                excluded_suffixes=cfg.analyst.get("excluded_symbol_suffixes", []),
             )
-            if blackout_symbols:
-                log(f"📅 dropping {len(blackout_symbols)} candidate(s) in earnings blackout: {sorted(blackout_symbols)}")
-            stock_candidates = [c for c in stock_candidates if c["symbol"] not in blackout_symbols]
-        for c in stock_candidates:
-            c["market"] = "stocks"
-        candidates.extend(stock_candidates)
+            stock_candidates = _filter_earnings_blackout(stock_candidates, cfg)
+            for c in stock_candidates:
+                c["market"] = "stocks"
+            candidates.extend(stock_candidates)
 
-    if cfg.trading.enable_crypto:
-        crypto_candidates = sources.fetch_crypto_candidates(cfg.analyst.screener_top_n)
-        for c in crypto_candidates:
-            c["market"] = cfg.trading.crypto_taapi_exchange
-        candidates.extend(crypto_candidates)
+        if cfg.trading.enable_crypto:
+            crypto_candidates = sources.fetch_crypto_candidates(cfg.analyst.screener_top_n)
+            for c in crypto_candidates:
+                c["market"] = cfg.trading.crypto_taapi_exchange
+            candidates.extend(crypto_candidates)
 
     return {**state, "raw_candidates": candidates}
 
@@ -87,12 +194,14 @@ def fetch_indicators(state: AnalystState, cfg) -> AnalystState:
     if not cfg.analyst.enable_indicators:
         log("⏭️ indicators disabled via config — skipping")
         return {**state, "indicator_text": ""}
-    ranked = sorted(
-        state["raw_candidates"],
-        key=lambda c: abs(c["change_pct"]) if c.get("change_pct") is not None else -1,
-        reverse=True,
-    )
+    ranked = sorted(state["raw_candidates"], key=_by_abs_change_pct, reverse=True)
     top_candidates = ranked[: cfg.analyst.indicator_fetch_limit]
+    top_symbols = {c["symbol"] for c in top_candidates}
+    large_cap_symbols = set(cfg.analyst.get("large_cap_symbols", []))
+    for c in ranked:
+        if c["symbol"] in large_cap_symbols and c["symbol"] not in top_symbols:
+            top_candidates.append(c)
+            top_symbols.add(c["symbol"])
 
     lines = []
     for i, candidate in enumerate(top_candidates):

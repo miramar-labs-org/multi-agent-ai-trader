@@ -25,6 +25,7 @@ a new feature ships.
 
 | Date | Feature | Summary | Status |
 |---|---|---|---|
+| 2026-08-12 | Analyst candidate mix | Composes the daily candidate pool as a configurable percentage split (default 40% large-cap / 30% crypto / 30% today's screener movers) instead of letting the day's movers ranking alone decide it, so large-cap names are reliably represented and always get real indicator data — still subject to the earnings blackout filter like any other candidate. | On |
 | 2026-08-11 | Same-symbol stop-loss cooldown | After a symbol stops out, the Dealer pauses new BUY entries for that symbol during the configured lookback window, preventing repeated re-entry into the same failing setup. | On |
 | 2026-08-11 | Dealer same-symbol memory | Dealer prompts now include recent decisions and Floor Broker outcomes for the same symbol, so the AI can see if a setup has already failed today instead of judging each poll in isolation. | On |
 | 2026-08-11 | Symbol-scoped win-rate throttle | The win-rate throttle can now run per symbol instead of globally, so one cluster of bad symbols no longer freezes all BUYs across the whole portfolio. | On |

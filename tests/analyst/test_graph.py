@@ -126,6 +126,209 @@ def test_discover_candidates_skips_earnings_filter_when_disabled_via_config(monk
     assert {c["symbol"] for c in result["raw_candidates"]} == {"MGN", "NVDA"}
 
 
+def _mix_cfg(
+    large_cap_pct=0.4,
+    crypto_pct=0.3,
+    screener_pct=0.3,
+    pool_size=10,
+    enable_crypto=True,
+    earnings_blackout_enabled=False,
+    mix_enabled=True,
+    large_cap_symbols=None,
+):
+    return OmegaConf.create(
+        {
+            "trading": {"enable_stocks": True, "enable_crypto": enable_crypto, "crypto_taapi_exchange": "binance"},
+            "analyst": {
+                "screener_top_n": 20,
+                "min_price_usd": 1.0,
+                "large_cap_symbols": large_cap_symbols if large_cap_symbols is not None else ["AAPL", "NVDA", "MSFT", "TSLA"],
+                "candidate_mix": {
+                    "enabled": mix_enabled,
+                    "pool_size": pool_size,
+                    "large_cap_pct": large_cap_pct,
+                    "crypto_pct": crypto_pct,
+                    "screener_pct": screener_pct,
+                },
+            },
+            "earnings_blackout": {"enabled": earnings_blackout_enabled, "days_before": 2, "days_after": 1},
+        }
+    )
+
+
+def _discover_state():
+    return {
+        "raw_candidates": [],
+        "research_text": "",
+        "indicator_text": "",
+        "selection": None,
+        "stock_market_open": True,
+    }
+
+
+def test_allocate_bucket_counts_splits_proportionally_and_sums_to_pool_size():
+    counts = graph._allocate_bucket_counts(20, {"large_cap": 0.4, "crypto": 0.3, "screener": 0.3})
+
+    assert counts == {"large_cap": 8, "crypto": 6, "screener": 6}
+
+
+def test_allocate_bucket_counts_uses_largest_remainder_to_hit_the_exact_total():
+    counts = graph._allocate_bucket_counts(7, {"large_cap": 0.4, "crypto": 0.3, "screener": 0.3})
+
+    assert sum(counts.values()) == 7
+    assert counts["large_cap"] == 3  # 0.4*7=2.8 -- largest fractional remainder gets the rounding bump
+
+
+def test_allocate_bucket_counts_zero_weight_bucket_gets_zero_slots():
+    counts = graph._allocate_bucket_counts(10, {"large_cap": 0.4, "crypto": 0.0, "screener": 0.3})
+
+    assert counts["crypto"] == 0
+    assert sum(counts.values()) == 10
+
+
+def test_fill_buckets_with_backfill_takes_target_count_when_pools_have_enough_supply():
+    pools = {"a": ["a1", "a2", "a3"], "b": ["b1", "b2"], "c": ["c1", "c2", "c3", "c4"]}
+
+    selected = graph._fill_buckets_with_backfill(pools, {"a": 2, "b": 2, "c": 2})
+
+    assert selected == {"a": ["a1", "a2"], "b": ["b1", "b2"], "c": ["c1", "c2"]}
+
+
+def test_fill_buckets_with_backfill_redistributes_shortfall_from_a_thin_bucket():
+    pools = {"a": ["a1"], "b": ["b1", "b2"], "c": ["c1", "c2", "c3", "c4", "c5"]}
+
+    selected = graph._fill_buckets_with_backfill(pools, {"a": 2, "b": 2, "c": 2})
+
+    assert selected["a"] == ["a1"]
+    assert sum(len(v) for v in selected.values()) == 6  # a's shortfall (1) backfilled from c's spare
+
+
+def test_fill_buckets_with_backfill_shrinks_the_pool_when_total_supply_is_insufficient():
+    pools = {"a": ["a1"], "b": [], "c": ["c1"]}
+
+    selected = graph._fill_buckets_with_backfill(pools, {"a": 2, "b": 2, "c": 2})
+
+    assert sum(len(v) for v in selected.values()) == 2
+
+
+def test_discover_candidates_mix_composes_pool_by_configured_ratios(monkeypatch):
+    monkeypatch.setattr(graph.sources, "fetch_large_cap_candidates", lambda symbols: [{"symbol": s} for s in symbols])
+    monkeypatch.setattr(
+        graph.sources,
+        "fetch_screener_candidates",
+        lambda n, min_price, **kwargs: [
+            {"symbol": "W1", "change_pct": 5.0},
+            {"symbol": "W2", "change_pct": 30.0},
+            {"symbol": "W3", "change_pct": 10.0},
+            {"symbol": "W4", "change_pct": 2.0},
+            {"symbol": "W5", "change_pct": 20.0},
+            {"symbol": "W6", "change_pct": 1.0},
+        ],
+    )
+    monkeypatch.setattr(
+        graph.sources,
+        "fetch_crypto_candidates",
+        lambda n: [
+            {"symbol": "BTC/USD", "change_pct": 3.0},
+            {"symbol": "ETH/USD", "change_pct": 15.0},
+            {"symbol": "SOL/USD", "change_pct": 8.0},
+            {"symbol": "DOGE/USD", "change_pct": 1.0},
+        ],
+    )
+
+    result = graph.discover_candidates(_discover_state(), _mix_cfg(pool_size=10))
+
+    by_market = {}
+    for c in result["raw_candidates"]:
+        by_market.setdefault(c["market"], []).append(c["symbol"])
+    assert sorted(by_market["stocks"]) == sorted(["AAPL", "NVDA", "MSFT", "TSLA", "W2", "W5", "W3"])
+    assert sorted(by_market["binance"]) == sorted(["ETH/USD", "SOL/USD", "BTC/USD"])
+    assert len(result["raw_candidates"]) == 10
+
+
+def test_discover_candidates_mix_excludes_large_cap_symbols_from_the_screener_bucket(monkeypatch):
+    """A symbol on both the large-cap list and today's screener movers (e.g. NVDA having a
+    genuinely huge day) belongs to the large-cap bucket -- it must not also be fetched/tagged as
+    a screener candidate and counted twice."""
+    monkeypatch.setattr(graph.sources, "fetch_large_cap_candidates", lambda symbols: [{"symbol": s} for s in symbols])
+    monkeypatch.setattr(
+        graph.sources,
+        "fetch_screener_candidates",
+        lambda n, min_price, **kwargs: [{"symbol": "NVDA", "change_pct": 50.0}, {"symbol": "W1", "change_pct": 5.0}],
+    )
+    monkeypatch.setattr(graph.sources, "fetch_crypto_candidates", lambda n: [])
+
+    result = graph.discover_candidates(
+        _discover_state(), _mix_cfg(pool_size=6, large_cap_pct=0.5, crypto_pct=0.0, screener_pct=0.5, enable_crypto=False)
+    )
+
+    nvda_entries = [c for c in result["raw_candidates"] if c["symbol"] == "NVDA"]
+    assert len(nvda_entries) == 1
+
+
+def test_discover_candidates_mix_applies_earnings_blackout_to_stock_buckets(monkeypatch):
+    monkeypatch.setattr(graph.sources, "fetch_large_cap_candidates", lambda symbols: [{"symbol": s} for s in symbols])
+    monkeypatch.setattr(
+        graph.sources, "fetch_screener_candidates", lambda n, min_price, **kwargs: [{"symbol": "W1", "change_pct": 5.0}]
+    )
+    monkeypatch.setattr(graph.sources, "fetch_crypto_candidates", lambda n: [])
+    monkeypatch.setattr(graph.sources, "fetch_earnings_calendar", lambda symbols, days_before, days_after: {"AAPL"})
+
+    result = graph.discover_candidates(
+        _discover_state(),
+        _mix_cfg(pool_size=6, large_cap_pct=0.5, crypto_pct=0.0, screener_pct=0.5, enable_crypto=False, earnings_blackout_enabled=True),
+    )
+
+    assert "AAPL" not in {c["symbol"] for c in result["raw_candidates"]}
+
+
+def test_discover_candidates_mix_redistributes_crypto_weight_when_crypto_disabled(monkeypatch):
+    calls = []
+    monkeypatch.setattr(graph.sources, "fetch_large_cap_candidates", lambda symbols: [{"symbol": s} for s in symbols])
+    monkeypatch.setattr(
+        graph.sources,
+        "fetch_screener_candidates",
+        lambda n, min_price, **kwargs: [{"symbol": f"W{i}", "change_pct": float(i)} for i in range(1, 10)],
+    )
+    monkeypatch.setattr(graph.sources, "fetch_crypto_candidates", lambda n: calls.append(1) or [])
+
+    result = graph.discover_candidates(_discover_state(), _mix_cfg(pool_size=10, enable_crypto=False))
+
+    assert calls == []
+    assert len(result["raw_candidates"]) == 10  # crypto's share was redistributed, not left empty
+
+
+def test_discover_candidates_mix_disabled_falls_back_to_legacy_behavior(monkeypatch):
+    monkeypatch.setattr(graph.sources, "fetch_screener_candidates", lambda n, min_price, **kwargs: [{"symbol": "MGN"}])
+    monkeypatch.setattr(graph.sources, "fetch_crypto_candidates", lambda n: [])
+
+    def _fail_if_called(symbols):
+        raise AssertionError("fetch_large_cap_candidates must not be called when candidate_mix is disabled")
+
+    monkeypatch.setattr(graph.sources, "fetch_large_cap_candidates", _fail_if_called)
+
+    result = graph.discover_candidates(_discover_state(), _mix_cfg(mix_enabled=False))
+
+    assert [c["symbol"] for c in result["raw_candidates"]] == ["MGN"]
+
+
+def test_discover_candidates_mix_only_applies_when_stock_market_is_open(monkeypatch):
+    """A market-closed day must still fall back to the existing crypto-only branch, unmixed -- the
+    mix's whole purpose is fixing a stock-screener-ranking problem that doesn't exist when the
+    stock branch isn't running at all."""
+
+    def _fail_if_called(symbols):
+        raise AssertionError("fetch_large_cap_candidates must not be called when the market is closed")
+
+    monkeypatch.setattr(graph.sources, "fetch_large_cap_candidates", _fail_if_called)
+    monkeypatch.setattr(graph.sources, "fetch_crypto_candidates", lambda n: [{"symbol": "BTC/USD"}])
+
+    state = {**_discover_state(), "stock_market_open": False}
+    result = graph.discover_candidates(state, _mix_cfg())
+
+    assert [c["symbol"] for c in result["raw_candidates"]] == ["BTC/USD"]
+
+
 class FakeAccountForPortfolio:
     def __init__(self):
         self.equity = "1000.00"
@@ -349,10 +552,14 @@ def test_crypto_eod_report_posts_only_crypto_positions_and_fills_for_the_prior_d
     assert [p["symbol"] for p in posted["positions"]] == ["BTCUSD"]
 
 
-def _indicator_cfg(indicator_fetch_limit, enable_indicators=True):
+def _indicator_cfg(indicator_fetch_limit, enable_indicators=True, large_cap_symbols=None):
     return OmegaConf.create(
         {
-            "analyst": {"indicator_fetch_limit": indicator_fetch_limit, "enable_indicators": enable_indicators},
+            "analyst": {
+                "indicator_fetch_limit": indicator_fetch_limit,
+                "enable_indicators": enable_indicators,
+                "large_cap_symbols": large_cap_symbols or [],
+            },
             "taapi": {"min_request_interval_secs": 15},
             "indicators": [],
         }
@@ -388,6 +595,68 @@ def test_fetch_indicators_sorts_by_change_pct_and_respects_the_fetch_limit(monke
     assert "C-text" in result["indicator_text"]
     assert "A-text" not in result["indicator_text"]
     assert "D-text" not in result["indicator_text"]
+
+
+def test_fetch_indicators_guarantees_coverage_for_large_cap_symbols_outside_the_ranked_cutoff(monkeypatch):
+    """AAPL has no change_pct (sorts last) and would normally fall outside indicator_fetch_limit
+    -- being on the large-cap list must still get it a real indicator fetch, not just a
+    raw_candidates entry with no numbers behind it."""
+    candidates = [
+        {"symbol": "A", "market": "stocks", "change_pct": 1.0},
+        {"symbol": "B", "market": "stocks", "change_pct": -5.0},
+        {"symbol": "AAPL", "market": "stocks"},
+    ]
+    calls = []
+    monkeypatch.setattr(
+        graph,
+        "fetch_indicators_bulk",
+        lambda indicators_cfg, symbol, exchange, names, log: calls.append(symbol) or f"{symbol}-text",
+    )
+    monkeypatch.setattr(graph.time, "sleep", lambda s: None)
+    state = {"raw_candidates": candidates, "research_text": "", "indicator_text": "", "selection": None}
+
+    result = graph.fetch_indicators(state, _indicator_cfg(indicator_fetch_limit=1, large_cap_symbols=["AAPL"]))
+
+    assert calls == ["B", "AAPL"]
+    assert "AAPL-text" in result["indicator_text"]
+
+
+def test_fetch_indicators_large_cap_symbol_already_in_top_n_is_not_fetched_twice(monkeypatch):
+    candidates = [
+        {"symbol": "AAPL", "market": "stocks", "change_pct": 50.0},
+        {"symbol": "B", "market": "stocks", "change_pct": 1.0},
+    ]
+    calls = []
+    monkeypatch.setattr(
+        graph,
+        "fetch_indicators_bulk",
+        lambda indicators_cfg, symbol, exchange, names, log: calls.append(symbol) or f"{symbol}-text",
+    )
+    monkeypatch.setattr(graph.time, "sleep", lambda s: None)
+    state = {"raw_candidates": candidates, "research_text": "", "indicator_text": "", "selection": None}
+
+    result = graph.fetch_indicators(state, _indicator_cfg(indicator_fetch_limit=1, large_cap_symbols=["AAPL"]))
+
+    assert calls == ["AAPL"]
+
+
+def test_fetch_indicators_empty_large_cap_list_matches_todays_behavior(monkeypatch):
+    candidates = [
+        {"symbol": "A", "market": "stocks", "change_pct": 1.0},
+        {"symbol": "B", "market": "stocks", "change_pct": -5.0},
+    ]
+    calls = []
+    monkeypatch.setattr(
+        graph,
+        "fetch_indicators_bulk",
+        lambda indicators_cfg, symbol, exchange, names, log: calls.append(symbol) or f"{symbol}-text",
+    )
+    monkeypatch.setattr(graph.time, "sleep", lambda s: None)
+    state = {"raw_candidates": candidates, "research_text": "", "indicator_text": "", "selection": None}
+
+    result = graph.fetch_indicators(state, _indicator_cfg(indicator_fetch_limit=1))
+
+    assert calls == ["B"]
 
 
 def test_fetch_indicators_omits_candidates_with_no_indicator_data(monkeypatch):
