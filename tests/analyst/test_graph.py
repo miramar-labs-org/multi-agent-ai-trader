@@ -635,7 +635,7 @@ def test_fetch_indicators_large_cap_symbol_already_in_top_n_is_not_fetched_twice
     monkeypatch.setattr(graph.time, "sleep", lambda s: None)
     state = {"raw_candidates": candidates, "research_text": "", "indicator_text": "", "selection": None}
 
-    result = graph.fetch_indicators(state, _indicator_cfg(indicator_fetch_limit=1, large_cap_symbols=["AAPL"]))
+    graph.fetch_indicators(state, _indicator_cfg(indicator_fetch_limit=1, large_cap_symbols=["AAPL"]))
 
     assert calls == ["AAPL"]
 
@@ -654,7 +654,7 @@ def test_fetch_indicators_empty_large_cap_list_matches_todays_behavior(monkeypat
     monkeypatch.setattr(graph.time, "sleep", lambda s: None)
     state = {"raw_candidates": candidates, "research_text": "", "indicator_text": "", "selection": None}
 
-    result = graph.fetch_indicators(state, _indicator_cfg(indicator_fetch_limit=1))
+    graph.fetch_indicators(state, _indicator_cfg(indicator_fetch_limit=1))
 
     assert calls == ["B"]
 
