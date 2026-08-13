@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "alpaca-trading-backtest": {
+      "source": "alpacahq/alpaca-skills",
+      "sourceType": "github",
+      "skillPath": "skills/trading-api/backtest/SKILL.md",
+      "computedHash": "a0fca148b3a08dab9e3d4c491737a5d98c6f0b133e743482e79ba5cf881c5fbe"
+    }
+  }
+}

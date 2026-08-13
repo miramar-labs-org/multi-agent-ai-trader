@@ -11,6 +11,8 @@ Multi-agent AI trading system (Analyst, Dealer, Floor Broker) trading on Alpaca,
 
 Trades are paper-only — see the [Alpaca paper trading dashboard](https://app.alpaca.markets/paper/dashboard/overview) for live account state, positions, and order history.
 
+![Alpaca Dashboard](./alpaca-dash.png)
+
 ## What this is
 
 Four independently-deployed Kubernetes workloads that together run a daily equities
