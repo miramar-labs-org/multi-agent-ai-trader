@@ -25,6 +25,7 @@ a new feature ships.
 
 | Date | Feature | Summary | Status |
 |---|---|---|---|
+| 2026-08-13 | Dealer OHLCV enrichment | Dealer prompts now include stock-only multi-timeframe Alpaca candle context (5m/1h/1d) and derived market-structure features such as return, volatility, ATR, VWAP distance, relative volume, and EMA context alongside TAAPI's current indicator snapshot. | On |
 | 2026-08-12 | Analyst candidate mix | Composes the daily candidate pool as a configurable percentage split (default 40% large-cap / 30% crypto / 30% today's screener movers) instead of letting the day's movers ranking alone decide it, so large-cap names are reliably represented and always get real indicator data — still subject to the earnings blackout filter like any other candidate. | On |
 | 2026-08-11 | Same-symbol stop-loss cooldown | After a symbol stops out, the Dealer pauses new BUY entries for that symbol during the configured lookback window, preventing repeated re-entry into the same failing setup. | On |
 | 2026-08-11 | Dealer same-symbol memory | Dealer prompts now include recent decisions and Floor Broker outcomes for the same symbol, so the AI can see if a setup has already failed today instead of judging each poll in isolation. | On |
@@ -104,6 +105,10 @@ minutes after the opening bell before its first check, to let opening volatility
 For every symbol on today's watchlist, each cycle:
 
 - Pulls that symbol's current technical indicator readings from the indicator service.
+- For stock symbols, also pulls recent Alpaca OHLCV candles at multiple timeframes and turns
+  them into compact context like recent return, volatility, ATR, relative volume, VWAP distance,
+  distance from recent highs/lows, and moving-average context. Crypto keeps the older
+  indicator-only Dealer path for now.
 - Looks up recent same-symbol history from Postgres — recent Dealer calls, BUY skips/fills, and
   stop-loss/take-profit outcomes — and gives that context to the AI alongside the indicators.
 - Hands those numbers to the AI model with the instruction: "you're an expert technical

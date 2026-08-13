@@ -1,6 +1,7 @@
 import json
 import time
 from datetime import datetime, time as dtime, timedelta
+from uuid import uuid4
 
 import pytz
 from kubernetes.client.exceptions import ApiException
@@ -123,6 +124,9 @@ def main():
                         "budget": entry["budget"],
                         "indicator_names": entry["indicators"],
                         "indicators_text": "",
+                        "cycle_id": str(uuid4()),
+                        "raw_bars": {},
+                        "ohlcv_features_text": "",
                         "signal": None,
                         "execution_result": None,
                     }

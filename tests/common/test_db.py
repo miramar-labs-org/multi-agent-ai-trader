@@ -78,11 +78,18 @@ def test_record_dealer_decision_inserts_expected_row(monkeypatch):
     conn = FakeConnection()
     _patch_pool(monkeypatch, conn)
 
-    db.record_dealer_decision("MGN", "BUY", "strong momentum", 5.0)
+    db.record_dealer_decision(
+        "MGN",
+        "BUY",
+        "strong momentum",
+        5.0,
+        ohlcv_enrichment_active=True,
+        cycle_id="cycle-1",
+    )
 
     sql, params = conn.executed[0]
     assert "INSERT INTO dealer_decisions" in sql
-    assert params == ("MGN", "BUY", "strong momentum", 5.0)
+    assert params == ("MGN", "BUY", "strong momentum", 5.0, True, "cycle-1")
 
 
 def test_record_analyst_pick_inserts_expected_row(monkeypatch):

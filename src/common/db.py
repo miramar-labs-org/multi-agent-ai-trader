@@ -28,6 +28,12 @@ CREATE TABLE IF NOT EXISTS dealer_decisions (
     decided_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+ALTER TABLE dealer_decisions
+    ADD COLUMN IF NOT EXISTS ohlcv_enrichment_active BOOLEAN NOT NULL DEFAULT false;
+
+ALTER TABLE dealer_decisions
+    ADD COLUMN IF NOT EXISTS cycle_id TEXT;
+
 CREATE TABLE IF NOT EXISTS floor_broker_events (
     id SERIAL PRIMARY KEY,
     symbol TEXT NOT NULL,
@@ -54,6 +60,7 @@ CREATE TABLE IF NOT EXISTS eod_report_runs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_dealer_decisions_symbol_date ON dealer_decisions (symbol, decided_at);
+CREATE INDEX IF NOT EXISTS idx_dealer_decisions_cycle_id ON dealer_decisions (cycle_id);
 CREATE INDEX IF NOT EXISTS idx_floor_broker_events_symbol_date ON floor_broker_events (symbol, occurred_at);
 """
 
@@ -105,6 +112,9 @@ def record_dealer_decision(
     action: str,
     reasoning: str | None,
     size_hint: float | None,
+    *,
+    ohlcv_enrichment_active: bool = False,
+    cycle_id: str | None = None,
 ) -> None:
     """Fire-and-forget insert -- never raises, so a DB outage can't block a Dealer decision."""
     try:
@@ -112,10 +122,12 @@ def record_dealer_decision(
         with _get_pool().connection() as conn:
             conn.execute(
                 """
-                INSERT INTO dealer_decisions (symbol, action, reasoning, size_hint)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO dealer_decisions (
+                    symbol, action, reasoning, size_hint, ohlcv_enrichment_active, cycle_id
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
                 """,
-                (symbol, action, reasoning, size_hint),
+                (symbol, action, reasoning, size_hint, ohlcv_enrichment_active, cycle_id),
             )
     except Exception as exc:
         log(f"⚠️ record_dealer_decision failed: {exc}")

@@ -26,6 +26,14 @@ trading:
   enable_crypto: true         # crypto merge/trading verified live (BTC/USD test buy + Analyst crypto picks)
   crypto_taapi_exchange: "binance"   # TAAPI venue used for indicator requests on crypto symbols
 
+ohlcv_enrichment:
+  enabled: true             # Stage 2 Dealer enrichment: config-only off switch if live behavior regresses
+  timeframes: ["5m", "1h", "1d"]
+  bar_count: 60
+  realized_vol_window: 20
+  atr_period: 14
+  distance_window: 20
+
 # Written/updated by /configure-strategy (skills/configure-strategy/SKILL.md); reverted to
 # baseline by /revert-strategy. Enforced directly by src/floor_broker/execution.py -- see that
 # module's buy()/check_pending_fills()/check_crypto_stops() for exactly which fields are live.

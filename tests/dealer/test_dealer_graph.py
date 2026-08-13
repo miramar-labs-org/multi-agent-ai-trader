@@ -10,6 +10,9 @@ def _state(indicators_text: str) -> dict:
         "budget": 100.0,
         "indicator_names": ["ALL"],
         "indicators_text": indicators_text,
+        "cycle_id": "cycle-1",
+        "raw_bars": {},
+        "ohlcv_features_text": "",
         "signal": None,
         "execution_result": None,
     }
@@ -39,14 +42,76 @@ def test_skip_missing_indicators_records_hold_without_calling_llm(monkeypatch):
     monkeypatch.setattr(graph, "ChatOpenAI", _fail_if_called)
     recorded = {}
     monkeypatch.setattr(graph.slack, "notify_dealer_signal", lambda *a, **k: recorded.setdefault("slack", a))
-    monkeypatch.setattr(graph.db, "record_dealer_decision", lambda *a, **k: recorded.setdefault("db", a))
+    monkeypatch.setattr(graph.db, "record_dealer_decision", lambda *a, **k: recorded.setdefault("db", (a, k)))
 
     result = graph.skip_missing_indicators(_state(""), cfg=None)
 
     assert result["signal"]["action"] == "HOLD"
     assert result["execution_result"] == {"status": "skipped", "detail": "missing_indicators"}
     assert recorded["slack"][1] == "HOLD"
-    assert recorded["db"][1] == "HOLD"
+    assert recorded["db"][0][1] == "HOLD"
+    assert recorded["db"][1] == {"ohlcv_enrichment_active": False, "cycle_id": "cycle-1"}
+
+
+def test_fetch_market_data_is_noop_when_disabled(monkeypatch):
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("disabled OHLCV enrichment must not fetch bars")
+
+    monkeypatch.setattr(graph, "fetch_multi_timeframe_bars", _fail_if_called)
+    cfg = OmegaConf.create({"ohlcv_enrichment": {"enabled": False}})
+
+    result = graph.fetch_market_data(_state("rsi: 71.2"), cfg)
+
+    assert result["raw_bars"] == {}
+    assert result["ohlcv_features_text"] == ""
+
+
+def test_fetch_market_data_populates_stock_features(monkeypatch):
+    bars = {"5m": object()}
+    monkeypatch.setattr(graph, "fetch_multi_timeframe_bars", lambda symbol, exchange, cfg: bars)
+    monkeypatch.setattr(graph, "compute_derived_features", lambda df, cfg: {"latest_close": 10.0})
+    monkeypatch.setattr(graph, "format_features_text", lambda features, symbol: "features text")
+    cfg = OmegaConf.create({"ohlcv_enrichment": {"enabled": True}})
+
+    result = graph.fetch_market_data({**_state("rsi: 71.2"), "exchange": "stocks"}, cfg)
+
+    assert result["raw_bars"] == bars
+    assert result["ohlcv_features_text"] == "features text"
+
+
+def test_llm_call_includes_ohlcv_features_when_present(monkeypatch):
+    captured = {}
+
+    class FakeSignal:
+        action = "HOLD"
+
+        def model_dump(self):
+            return {"action": "HOLD", "reasoning": "wait", "size_hint": 0.0, "confidence": 0.0}
+
+    class FakeStructured:
+        def invoke(self, messages):
+            captured["user_prompt"] = messages[-1].content
+            return FakeSignal()
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            pass
+
+        def with_structured_output(self, schema):
+            return FakeStructured()
+
+    cfg = OmegaConf.create(
+        {
+            "llm": {"base_url": "http://llm.test/v1", "model": "test-model", "temperature": 0.0},
+            "strategy": {"enable_dealer_memory": False},
+        }
+    )
+    monkeypatch.setattr(graph, "ChatOpenAI", FakeChatOpenAI)
+
+    graph.llm_call({**_state("rsi: 25"), "ohlcv_features_text": "5m return: 2%"}, cfg)
+
+    assert "Additional OHLCV context" in captured["user_prompt"]
+    assert "5m return: 2%" in captured["user_prompt"]
 
 
 def test_llm_call_includes_recent_same_symbol_memory(monkeypatch):

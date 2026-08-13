@@ -24,7 +24,7 @@ communicate via a shared ConfigMap and plain HTTP, rather than a monolithic loop
                                       ▼
                          ┌─────────────────────────┐
         every 600s  ───► │          Dealer          │  (long-running Deployment)
-        while market     │ indicators → LLM signal  │
+        while market     │ indicators + bars → LLM  │
         is open          └────────────┬─────────────┘
                                       │ HTTP POST /execute
                                       │ (if action != HOLD)
@@ -228,19 +228,24 @@ every 600s poll while the market stays closed for hours. This is distinct from E
 own live status signal, so a genuinely closed market and a stuck/crashed Dealer pod are
 distinguishable from Slack alone.
 
-**Graph** (`src/dealer/graph.py`), a 3-node state machine over `DealerState`:
+**Graph** (`src/dealer/graph.py`), a 4-node state machine over `DealerState`:
 
 | Node | What it does |
 |---|---|
 | `fetch_indicators` | fetches every indicator configured for the symbol (or all of `cfg.indicators` if the entry says `["ALL"]`) from **TAAPI.io** — a third-party technical-analysis API, unrelated to any Miramar platform service — in a single `/bulk` POST request (`indicators.py`), and builds a natural-language indicator text block |
-| `llm_call` | the decision LLM call — see below. When `strategy.enable_dealer_memory` is true, it also appends recent same-symbol Dealer decisions and Floor Broker events from Postgres as prompt context |
+| `fetch_market_data` | gated by `ohlcv_enrichment.enabled` — for stock entries only (`exchange == "stocks"`), fetches Alpaca OHLCV bars at the configured timeframes (`5m`, `1h`, `1d` by default) via `src.common.bars.fetch_multi_timeframe_bars`, computes derived market-structure features (`src.dealer.features`), and formats a compact prompt block. Crypto entries skip this node cleanly and keep the indicator-only path |
+| `llm_call` | the decision LLM call — see below. It receives TAAPI indicators first, optional OHLCV-derived context second, and, when `strategy.enable_dealer_memory` is true, recent same-symbol Dealer decisions and Floor Broker events from Postgres as the final prompt context |
 | `call_floor_broker` | HTTP POST to Floor Broker if action != HOLD; a BUY is additionally refused locally (never forwarded) by macro blackout, same-symbol stop cooldown, win-rate throttle, confidence, or authorized-budget gates — see [Risk controls](#risk-controls-and-failure-handling) |
 
 ```mermaid
 flowchart TD
-    A[fetch_indicators] --> B[llm_call]
-    B --> C[call_floor_broker]
-    C --> D([END])
+    A[fetch_indicators] --> B{indicator text?}
+    B -- no --> E[skip_missing_indicators]
+    B -- yes --> C[fetch_market_data]
+    C --> D[llm_call]
+    D --> F[call_floor_broker]
+    E --> G([END])
+    F --> G
 ```
 
 **LLM call:** same pattern as Analyst — `ChatOpenAI(base_url=cfg.llm.base_url, ...).with_structured_output(Signal)`.
@@ -266,6 +271,12 @@ When `strategy.enable_dealer_memory` is true, a same-symbol memory block is adde
 prompt. It is intentionally advisory: the LLM sees recent `BUY`/`HOLD`/`SELL` reasoning plus
 recent fills/skips/stops for the same symbol, but deterministic skip logic still owns hard
 safety rules such as stop-loss cooldown.
+
+When `ohlcv_enrichment.enabled` is true, stock symbols also get a separate "Additional OHLCV
+context" prompt block generated from Alpaca bars. This is context only: it does not change the
+`Signal` schema and it cannot gate, veto, or resize trades. The audit row records whether usable
+OHLCV context was actually present via `dealer_decisions.ohlcv_enrichment_active`, plus a
+per-symbol-cycle `cycle_id` for later ablation queries.
 
 **Dispatch to Floor Broker** — plain in-cluster HTTP, no message queue:
 ```python
@@ -734,7 +745,9 @@ first use — there is no separate migrations step or Job. `dealer_decisions` re
 Dealer's decision only, with no execution-outcome columns; `/analyst-explain` correlates it to
 `floor_broker_events` at query time by symbol + same-day timestamp proximity, not a shared
 foreign key — deliberately, since a decision and its downstream execution event are written by
-two different processes (Dealer, Floor Broker) that don't share a request context.
+two different processes (Dealer, Floor Broker) that don't share a request context. It also
+includes `cycle_id` and `ohlcv_enrichment_active` for Dealer-input ablation; these are audit
+fields, not coordination fields.
 `position_opens` is different in kind from the other three — not an append-only event log, but
 a single current-state row per open symbol (`symbol` primary key, `opened_at`), upserted on a
 BUY fill and deleted on a SELL fill; it exists purely to answer "how long has this position
@@ -834,6 +847,9 @@ trade attribution without adding a separate trade-ledger table yet.
 | `trading` | `enable_stocks` | when true, Analyst screens/picks equities, and Dealer processes/merges stock symbols; set false to pause equities handling entirely |
 | `trading` | `enable_crypto` | when true, Analyst also screens/picks from a fixed crypto watchlist (`BTC/USD`, `ETH/USD`, `SOL/USD`) via `fetch_crypto_candidates()`, Dealer also polls merged-in crypto positions, and `merge_held_positions()` folds pre-existing crypto positions into the watchlist |
 | `trading` | `crypto_taapi_exchange` | TAAPI venue name (e.g. `"binance"`) used as the `exchange` for crypto positions merged in by `merge_held_positions()` — TAAPI's `/bulk` API requires an actual venue, not the literal word "crypto" |
+| `ohlcv_enrichment` | `enabled` | Dealer-side prompt enrichment gate. When true, stock symbols get multi-timeframe Alpaca OHLCV-derived context before the LLM call; crypto symbols skip cleanly. Config-only, no redeploy |
+| `ohlcv_enrichment` | `timeframes`, `bar_count` | candle windows fetched for Dealer enrichment (`["5m", "1h", "1d"]`, 60 bars each by default) |
+| `ohlcv_enrichment` | `realized_vol_window`, `atr_period`, `distance_window` | lookback periods used to derive volatility, ATR, relative volume, distance-from-high/low, VWAP distance, and moving-average context |
 | `strategy` | `daily_profit_target_usd`, `daily_loss_limit_usd` | Floor Broker BUY preflight gates based on Alpaca account equity versus `last_equity`; reaching either target skips new BUY exposure while SELL remains allowed |
 | `strategy` | `crypto_slP`, `crypto_tpP` | synthetic crypto stop-loss/take-profit multipliers applied after a crypto BUY fill, because Alpaca has no crypto bracket orders |
 | `strategy` | `position_sizing`, `risk_per_trade_usd` | when `position_sizing: risk_based`, Floor Broker caps the effective BUY budget so a full stop-loss hit risks at most `risk_per_trade_usd`; it only scales down from the Analyst-authorized budget |

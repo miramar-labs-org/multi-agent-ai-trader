@@ -8,9 +8,11 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 
 from src.common import db, slack
+from src.common.bars import fetch_multi_timeframe_bars
 from src.common.config import load_config
 from src.common.logging import get_logger
 from src.common.indicators import fetch_indicators_bulk
+from src.dealer.features import compute_derived_features, format_features_text
 from src.dealer.schema import Signal
 
 log = get_logger("DEALER")
@@ -22,6 +24,9 @@ class DealerState(TypedDict):
     budget: float
     indicator_names: list[str]
     indicators_text: str
+    cycle_id: str
+    raw_bars: dict
+    ohlcv_features_text: str
     signal: dict | None
     execution_result: dict | None
 
@@ -33,6 +38,24 @@ def fetch_indicators(state: DealerState, cfg) -> DealerState:
 
     indicators_text = fetch_indicators_bulk(cfg.indicators, state["symbol"], state["exchange"], names, log)
     return {**state, "indicators_text": indicators_text}
+
+
+def fetch_market_data(state: DealerState, cfg) -> DealerState:
+    if not cfg.get("ohlcv_enrichment", {}).get("enabled", False):
+        return {**state, "raw_bars": {}, "ohlcv_features_text": ""}
+
+    raw_bars = fetch_multi_timeframe_bars(state["symbol"], state["exchange"], cfg)
+    features_by_timeframe = {
+        timeframe: features
+        for timeframe, bars in raw_bars.items()
+        if (features := compute_derived_features(bars, cfg))
+    }
+    features_text = format_features_text(features_by_timeframe, state["symbol"])
+    if features_text:
+        log(f"📊 OHLCV enrichment ready for {state['symbol']} ({', '.join(features_by_timeframe)})")
+    else:
+        log(f"⚠️ OHLCV enrichment produced no usable features for {state['symbol']}")
+    return {**state, "raw_bars": raw_bars, "ohlcv_features_text": features_text}
 
 
 def llm_call(state: DealerState, cfg) -> DealerState:
@@ -56,6 +79,8 @@ def llm_call(state: DealerState, cfg) -> DealerState:
     )
     memory_text = _symbol_memory_text(state["symbol"], cfg)
     user_prompt = f"Indicators for {state['symbol']}:\n{state['indicators_text']}"
+    if state.get("ohlcv_features_text"):
+        user_prompt += f"\n\nAdditional OHLCV context:\n{state['ohlcv_features_text']}"
     if memory_text:
         user_prompt += f"\n\nRecent same-symbol trading history:\n{memory_text}"
 
@@ -81,7 +106,14 @@ def skip_missing_indicators(state: DealerState, cfg) -> DealerState:
     )
     log(f"⏭️  {reasoning}")
     slack.notify_dealer_signal(state["symbol"], "HOLD", reasoning)
-    db.record_dealer_decision(state["symbol"], "HOLD", reasoning, None)
+    db.record_dealer_decision(
+        state["symbol"],
+        "HOLD",
+        reasoning,
+        None,
+        ohlcv_enrichment_active=False,
+        cycle_id=state.get("cycle_id"),
+    )
     return {
         **state,
         "signal": {"action": "HOLD", "reasoning": reasoning, "size_hint": None, "confidence": 0.0},
@@ -226,7 +258,14 @@ def _win_rate_throttle_active(cfg, symbol: str | None = None) -> str | None:
 def call_floor_broker(state: DealerState, cfg) -> DealerState:
     signal = state["signal"]
     slack.notify_dealer_signal(state["symbol"], signal["action"], signal["reasoning"])
-    db.record_dealer_decision(state["symbol"], signal["action"], signal["reasoning"], signal.get("size_hint"))
+    db.record_dealer_decision(
+        state["symbol"],
+        signal["action"],
+        signal["reasoning"],
+        signal.get("size_hint"),
+        ohlcv_enrichment_active=bool(state.get("ohlcv_features_text")),
+        cycle_id=state.get("cycle_id"),
+    )
 
     if signal["action"] == "HOLD":
         return {**state, "execution_result": {"status": "skipped", "detail": "HOLD"}}
@@ -361,6 +400,7 @@ def build_graph():
     # must be visible within load_config()'s refresh window without a Dealer restart.
     graph = StateGraph(DealerState)
     graph.add_node("fetch_indicators", lambda state: fetch_indicators(state, load_config()))
+    graph.add_node("fetch_market_data", lambda state: fetch_market_data(state, load_config()))
     graph.add_node("llm_call", lambda state: llm_call(state, load_config()))
     graph.add_node("skip_missing_indicators", lambda state: skip_missing_indicators(state, load_config()))
     graph.add_node("call_floor_broker", lambda state: call_floor_broker(state, load_config()))
@@ -369,8 +409,9 @@ def build_graph():
     graph.add_conditional_edges(
         "fetch_indicators",
         _route_after_indicators,
-        {"llm_call": "llm_call", "skip_missing_indicators": "skip_missing_indicators"},
+        {"llm_call": "fetch_market_data", "skip_missing_indicators": "skip_missing_indicators"},
     )
+    graph.add_edge("fetch_market_data", "llm_call")
     graph.add_edge("llm_call", "call_floor_broker")
     graph.add_edge("skip_missing_indicators", END)
     graph.add_edge("call_floor_broker", END)

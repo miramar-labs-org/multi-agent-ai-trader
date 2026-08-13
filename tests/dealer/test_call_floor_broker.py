@@ -28,6 +28,9 @@ def _state(action: str, budget: float, size_hint: float = 1.0, confidence: float
         "symbol": "MGN",
         "exchange": "stocks",
         "budget": budget,
+        "cycle_id": "cycle-1",
+        "raw_bars": {},
+        "ohlcv_features_text": "",
         "signal": {"action": action, "reasoning": "test", "size_hint": size_hint, "confidence": confidence},
         "execution_result": None,
     }
@@ -40,6 +43,19 @@ def _silence_slack(monkeypatch):
     # fake `requests.post` these tests install for the Floor Broker call.
     monkeypatch.setattr(graph.slack, "notify_dealer_signal", lambda *a, **k: None)
     monkeypatch.setattr(graph.slack, "notify_floor_broker_result", lambda *a, **k: None)
+    monkeypatch.setattr(graph.db, "record_dealer_decision", lambda *a, **k: None)
+    monkeypatch.setattr(graph.db, "record_floor_broker_event", lambda *a, **k: None)
+
+
+def test_call_floor_broker_records_ohlcv_audit_fields(monkeypatch):
+    recorded = {}
+    monkeypatch.setattr(graph.slack, "notify_dealer_signal", lambda *a, **k: None)
+    monkeypatch.setattr(graph.db, "record_dealer_decision", lambda *a, **k: recorded.update(args=a, kwargs=k))
+
+    result = graph.call_floor_broker({**_state("HOLD", budget=5000.0), "ohlcv_features_text": "features"}, _cfg())
+
+    assert result["execution_result"] == {"status": "skipped", "detail": "HOLD"}
+    assert recorded["kwargs"] == {"ohlcv_enrichment_active": True, "cycle_id": "cycle-1"}
 
 
 def test_buy_on_held_only_position_is_skipped_without_calling_floor_broker(monkeypatch):
