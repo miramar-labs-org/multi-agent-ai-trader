@@ -1,6 +1,8 @@
 import json
-from datetime import date
+from datetime import datetime
 from pathlib import Path
+
+import pytz
 
 from src.common.logging import get_logger
 from src.common.market_calendar import is_stock_market_open
@@ -12,6 +14,10 @@ BADGES_DIR = Path(__file__).resolve().parents[2] / "badges"
 HISTORY_FILE = BADGES_DIR / "pl_history.json"
 
 
+def _now_eastern() -> datetime:
+    return datetime.now(pytz.timezone("US/Eastern"))
+
+
 def _load_history() -> dict:
     if not HISTORY_FILE.exists():
         return {}
@@ -19,7 +25,7 @@ def _load_history() -> dict:
 
 
 def main():
-    today = date.today()
+    today = _now_eastern().date()
 
     if not is_stock_market_open(today):
         log(f"📅 {today} was not a trading day — leaving badges unchanged.")
