@@ -31,7 +31,7 @@ def test_open_market_writes_both_badge_files(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "_now_eastern", lambda: _LATE_ET_INSTANT)
     monkeypatch.setattr(main, "is_stock_market_open", lambda day: True)
     badges_dir = _use_tmp_badges_dir(monkeypatch, tmp_path)
-    monkeypatch.setattr(main, "fetch_pl_summary", lambda history_pl: {"today_pl": 50.0, "ytd_pl": -100.0})
+    monkeypatch.setattr(main, "fetch_pl_summary", lambda today, history_pl: {"today_pl": 50.0, "ytd_pl": -100.0})
 
     main.main()
 
@@ -45,7 +45,7 @@ def test_open_market_persists_todays_pl_into_the_history_file(monkeypatch, tmp_p
     badges_dir = _use_tmp_badges_dir(monkeypatch, tmp_path)
     monkeypatch.setattr(main, "_now_eastern", lambda: _LATE_ET_INSTANT)
     monkeypatch.setattr(main, "is_stock_market_open", lambda day: True)
-    monkeypatch.setattr(main, "fetch_pl_summary", lambda history_pl: {"today_pl": 50.0, "ytd_pl": -100.0})
+    monkeypatch.setattr(main, "fetch_pl_summary", lambda today, history_pl: {"today_pl": 50.0, "ytd_pl": -100.0})
 
     main.main()
 
@@ -61,7 +61,7 @@ def test_open_market_merges_todays_pl_with_existing_history(monkeypatch, tmp_pat
     monkeypatch.setattr(main, "is_stock_market_open", lambda day: True)
     received = {}
 
-    def _fake_fetch(history_pl):
+    def _fake_fetch(today, history_pl):
         received["history_pl"] = dict(history_pl)
         return {"today_pl": -20.0, "ytd_pl": -70.0}
 
@@ -81,7 +81,7 @@ def test_history_dates_by_eastern_trading_day_not_utc_rollover(monkeypatch, tmp_
     badges_dir = _use_tmp_badges_dir(monkeypatch, tmp_path)
     monkeypatch.setattr(main, "_now_eastern", lambda: _LATE_ET_INSTANT)
     monkeypatch.setattr(main, "is_stock_market_open", lambda day: True)
-    monkeypatch.setattr(main, "fetch_pl_summary", lambda history_pl: {"today_pl": 154.77, "ytd_pl": 84.35})
+    monkeypatch.setattr(main, "fetch_pl_summary", lambda today, history_pl: {"today_pl": 154.77, "ytd_pl": 84.35})
 
     main.main()
 

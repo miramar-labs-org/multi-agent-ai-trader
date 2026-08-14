@@ -32,7 +32,7 @@ def main():
         return
 
     history_pl = _load_history()
-    summary = fetch_pl_summary(history_pl)
+    summary = fetch_pl_summary(today, history_pl)
     BADGES_DIR.mkdir(exist_ok=True)
     (BADGES_DIR / "today-pl.json").write_text(json.dumps(build_badge_payload("Today's P/L", summary["today_pl"])))
     (BADGES_DIR / "ytd-pl.json").write_text(json.dumps(build_badge_payload("YTD P/L", summary["ytd_pl"])))
