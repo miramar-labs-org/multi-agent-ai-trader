@@ -461,6 +461,89 @@ async def _select_option_contract_async(state: DealerState, cfg, signal: dict) -
     return structured_llm.invoke(messages)
 
 
+def _route_after_llm_call(state: DealerState, cfg) -> str:
+    if cfg.get("options_trading", {}).get("enabled", False):
+        return "select_option_contract"
+    return "call_floor_broker"
+
+
+def call_floor_broker_option(state: DealerState, cfg) -> DealerState:
+    option_pick = state.get("option_pick")
+    if not option_pick:
+        return {**state, "execution_result": {"status": "skipped", "reason": "no_option_pick", "detail": "no option contract was selected"}}
+
+    action = state["signal"]["action"]
+
+    expiration = datetime.strptime(option_pick["expiration"], "%Y-%m-%d").date()
+    today = datetime.now(pytz.timezone("US/Eastern")).date()
+    dte = (expiration - today).days
+    if not (cfg.options_trading.dte_min <= dte <= cfg.options_trading.dte_max):
+        result = {
+            "status": "skipped",
+            "reason": "dte_out_of_range",
+            "detail": f"DTE {dte} outside [{cfg.options_trading.dte_min}, {cfg.options_trading.dte_max}]",
+        }
+        graph_slack_and_record(state, action, result)
+        return {**state, "execution_result": result}
+
+    delta = abs(option_pick["delta"])
+    if not (cfg.options_trading.target_delta_min <= delta <= cfg.options_trading.target_delta_max):
+        result = {
+            "status": "skipped",
+            "reason": "delta_out_of_range",
+            "detail": f"delta {delta} outside [{cfg.options_trading.target_delta_min}, {cfg.options_trading.target_delta_max}]",
+        }
+        graph_slack_and_record(state, action, result)
+        return {**state, "execution_result": result}
+
+    premium = option_pick["premium"]
+    qty = int(cfg.strategy.risk_per_trade_usd // (premium * 100)) if premium > 0 else 0
+    if qty < 1:
+        result = {
+            "status": "skipped",
+            "reason": "qty_zero",
+            "detail": f"risk_per_trade_usd={cfg.strategy.risk_per_trade_usd} affords 0 contracts at premium ${premium}",
+        }
+        graph_slack_and_record(state, action, result)
+        return {**state, "execution_result": result}
+
+    payload = {
+        "contract_symbol": option_pick["contract_symbol"],
+        "side": "BUY",
+        "qty": qty,
+        "symbol": state["symbol"],
+        "right": option_pick["right"],
+        "strike": option_pick["strike"],
+        "expiration": option_pick["expiration"],
+        "delta": option_pick["delta"],
+        "premium": premium,
+        "reasoning": option_pick["reasoning"],
+        "cycle_id": state.get("cycle_id"),
+    }
+
+    try:
+        response = requests.post(f"{cfg.floor_broker.base_url}/execute-option", json=payload, timeout=30)
+        if response.status_code != 200:
+            log(f"💥 floor broker option error: {response.status_code} {response.text}")
+            result = {"status": "error", "detail": response.text}
+            graph_slack_and_record(state, action, result)
+            return {**state, "execution_result": result}
+        result = response.json()
+        slack.notify_floor_broker_result(state["symbol"], action, result["status"], result["detail"], reason=result.get("reason"))
+        db.record_floor_broker_event(state["symbol"], f"option_{result['status']}", result["detail"])
+        return {**state, "execution_result": result}
+    except requests.RequestException as exc:
+        log(f"💥 floor broker option request failed: {exc}")
+        result = {"status": "error", "detail": str(exc)}
+        graph_slack_and_record(state, action, result)
+        return {**state, "execution_result": result}
+
+
+def graph_slack_and_record(state: DealerState, action: str, result: dict) -> None:
+    slack.notify_floor_broker_result(state["symbol"], action, result["status"], result["detail"], reason=result.get("reason"))
+    db.record_floor_broker_event(state["symbol"], "skip" if result["status"] == "skipped" else result["status"], result["detail"])
+
+
 def build_graph():
     # Each lambda calls load_config() fresh at invocation time (once per node per graph run,
     # i.e. once per Dealer poll cycle per symbol) rather than baking one cfg into the closure at
@@ -471,7 +554,9 @@ def build_graph():
     graph.add_node("fetch_market_data", lambda state: fetch_market_data(state, load_config()))
     graph.add_node("llm_call", lambda state: llm_call(state, load_config()))
     graph.add_node("skip_missing_indicators", lambda state: skip_missing_indicators(state, load_config()))
+    graph.add_node("select_option_contract", lambda state: select_option_contract(state, load_config()))
     graph.add_node("call_floor_broker", lambda state: call_floor_broker(state, load_config()))
+    graph.add_node("call_floor_broker_option", lambda state: call_floor_broker_option(state, load_config()))
 
     graph.set_entry_point("fetch_indicators")
     graph.add_conditional_edges(
@@ -480,8 +565,14 @@ def build_graph():
         {"llm_call": "fetch_market_data", "skip_missing_indicators": "skip_missing_indicators"},
     )
     graph.add_edge("fetch_market_data", "llm_call")
-    graph.add_edge("llm_call", "call_floor_broker")
+    graph.add_conditional_edges(
+        "llm_call",
+        lambda state: _route_after_llm_call(state, load_config()),
+        {"call_floor_broker": "call_floor_broker", "select_option_contract": "select_option_contract"},
+    )
+    graph.add_edge("select_option_contract", "call_floor_broker_option")
     graph.add_edge("skip_missing_indicators", END)
     graph.add_edge("call_floor_broker", END)
+    graph.add_edge("call_floor_broker_option", END)
 
     return graph.compile()

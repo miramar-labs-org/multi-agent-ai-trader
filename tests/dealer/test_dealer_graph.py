@@ -1,3 +1,6 @@
+from datetime import datetime, timedelta
+
+import pytz
 from omegaconf import OmegaConf
 
 from src.dealer import graph
@@ -215,3 +218,144 @@ def test_select_option_contract_returns_pick_dict(monkeypatch):
 
     assert result["option_pick"]["contract_symbol"] == "AAPL250117C00200000"
     assert result["option_pick"]["right"] == "call"
+
+
+def _option_cfg(**overrides):
+    base = {
+        "floor_broker": {"base_url": "http://floor-broker.test:8000"},
+        "strategy": {"risk_per_trade_usd": 100},
+        "options_trading": {
+            "dte_min": 14,
+            "dte_max": 45,
+            "target_delta_min": 0.30,
+            "target_delta_max": 0.60,
+        },
+    }
+    base["options_trading"].update(overrides)
+    return OmegaConf.create(base)
+
+
+def _far_expiration(days: int) -> str:
+    return (datetime.now(pytz.timezone("US/Eastern")) + timedelta(days=days)).date().isoformat()
+
+
+def test_call_floor_broker_option_skips_when_dte_out_of_range(monkeypatch):
+    monkeypatch.setattr(graph.slack, "notify_floor_broker_result", lambda *a, **k: None)
+    monkeypatch.setattr(graph.db, "record_floor_broker_event", lambda *a, **k: None)
+    cfg = _option_cfg()
+    state = {
+        **_state("rsi: 71.2"),
+        "signal": {"action": "BUY", "confidence": 0.9, "reasoning": "r"},
+        "option_pick": {
+            "contract_symbol": "AAPL250117C00200000",
+            "strike": 200.0,
+            "expiration": _far_expiration(2),
+            "right": "call",
+            "delta": 0.45,
+            "premium": 3.20,
+            "reasoning": "r",
+        },
+    }
+
+    result = graph.call_floor_broker_option(state, cfg)
+
+    assert result["execution_result"]["status"] == "skipped"
+    assert result["execution_result"]["reason"] == "dte_out_of_range"
+
+
+def test_call_floor_broker_option_skips_when_delta_out_of_range(monkeypatch):
+    monkeypatch.setattr(graph.slack, "notify_floor_broker_result", lambda *a, **k: None)
+    monkeypatch.setattr(graph.db, "record_floor_broker_event", lambda *a, **k: None)
+    cfg = _option_cfg()
+    state = {
+        **_state("rsi: 71.2"),
+        "signal": {"action": "BUY", "confidence": 0.9, "reasoning": "r"},
+        "option_pick": {
+            "contract_symbol": "AAPL250117C00200000",
+            "strike": 200.0,
+            "expiration": _far_expiration(20),
+            "right": "call",
+            "delta": 0.15,
+            "premium": 3.20,
+            "reasoning": "r",
+        },
+    }
+
+    result = graph.call_floor_broker_option(state, cfg)
+
+    assert result["execution_result"]["status"] == "skipped"
+    assert result["execution_result"]["reason"] == "delta_out_of_range"
+
+
+def test_call_floor_broker_option_skips_when_qty_would_be_zero(monkeypatch):
+    monkeypatch.setattr(graph.slack, "notify_floor_broker_result", lambda *a, **k: None)
+    monkeypatch.setattr(graph.db, "record_floor_broker_event", lambda *a, **k: None)
+    cfg = _option_cfg()
+    state = {
+        **_state("rsi: 71.2"),
+        "signal": {"action": "BUY", "confidence": 0.9, "reasoning": "r"},
+        "option_pick": {
+            "contract_symbol": "AAPL250117C00200000",
+            "strike": 200.0,
+            "expiration": _far_expiration(20),
+            "right": "call",
+            "delta": 0.45,
+            "premium": 50.0,
+            "reasoning": "r",
+        },
+    }
+
+    result = graph.call_floor_broker_option(state, cfg)
+
+    assert result["execution_result"]["status"] == "skipped"
+    assert result["execution_result"]["reason"] == "qty_zero"
+
+
+def test_call_floor_broker_option_posts_to_execute_option(monkeypatch):
+    monkeypatch.setattr(graph.slack, "notify_floor_broker_result", lambda *a, **k: None)
+    monkeypatch.setattr(graph.db, "record_floor_broker_event", lambda *a, **k: None)
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"status": "submitted", "detail": "option buy order submitted: order-1"}
+
+    def _fake_post(url, json, timeout):
+        captured["url"] = url
+        captured["json"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr(graph.requests, "post", _fake_post)
+    cfg = _option_cfg()
+    state = {
+        **_state("rsi: 71.2"),
+        "signal": {"action": "BUY", "confidence": 0.9, "reasoning": "r"},
+        "option_pick": {
+            "contract_symbol": "AAPL250117C00200000",
+            "strike": 200.0,
+            "expiration": _far_expiration(20),
+            "right": "call",
+            "delta": 0.45,
+            "premium": 0.50,
+            "reasoning": "r",
+        },
+    }
+
+    result = graph.call_floor_broker_option(state, cfg)
+
+    assert captured["url"] == "http://floor-broker.test:8000/execute-option"
+    assert captured["json"]["contract_symbol"] == "AAPL250117C00200000"
+    assert captured["json"]["qty"] == 2  # floor(100 / (0.50 * 100)) == floor(2.0) == 2
+    assert result["execution_result"]["status"] == "submitted"
+
+
+def test_route_after_llm_call_selects_option_branch_when_enabled():
+    cfg = OmegaConf.create({"options_trading": {"enabled": True}})
+    assert graph._route_after_llm_call({}, cfg) == "select_option_contract"
+
+
+def test_route_after_llm_call_selects_stock_branch_when_disabled():
+    cfg = OmegaConf.create({"options_trading": {"enabled": False}})
+    assert graph._route_after_llm_call({}, cfg) == "call_floor_broker"
