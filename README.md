@@ -20,7 +20,7 @@ trading loop against Alpaca's **paper** trading account:
 
 - **Analyst** — a `CronJob` that runs once a day before market open, screens for candidate
   symbols, decides a tradeable watchlist for the day, and posts a Morning Report to Slack.
-  Optionally (`analyst.enable_midday_run`) runs again around midday and posts a Midday Update
+  Optionally (`analyst.midday_run.enabled`) runs again around midday and posts a Midday Update
   instead of a second Morning Report.
 - **Dealer** — a long-running `Deployment` that polls every 10 minutes while the market is
   open, pulls technical indicators for each watchlist symbol, and asks an LLM whether to
@@ -93,7 +93,7 @@ kubectl create secret generic mlabs-api-keys -n multi-agent-ai-trader \
 
 At minimum, set `llm.base_url` to your DGX's Ollama endpoint. Also worth checking:
 `trading.market_override` (forces "market open" for testing outside trading hours),
-`trading.enable_stocks`/`trading.enable_crypto` (independently gate equities/crypto for both
+`trading.stocks.enabled`/`trading.crypto.enabled` (independently gate equities/crypto for both
 Analyst's daily candidate screening and Dealer's poll loop — crypto also merges pre-existing
 positions into the watchlist), `analyst.default_budget`/`max_universe_size`, and the
 `slack`/`langsmith` `enabled` flags.
@@ -131,7 +131,7 @@ context, and parse the response into a strict structured-output schema (via Lang
 [LangGraph](https://langchain-ai.github.io/langgraph/) state machines:
 
 - **Analyst** (9 nodes): discover screener candidates (stocks and/or a fixed crypto watchlist,
-  per `trading.enable_stocks`/`enable_crypto`) → apply stock-candidate quality filters
+  per `trading.stocks.enabled`/`crypto.enabled`) → apply stock-candidate quality filters
   (`min_price_usd`, `max_abs_change_pct`, `min_dollar_volume_usd`, excluded suffixes) → fetch
   news/RSS research → fetch real TAAPI indicators for the top candidates by move size → fetch
   its own recent track record (past picks, Dealer decisions, Floor Broker outcomes, read from
@@ -139,8 +139,8 @@ context, and parse the response into a strict structured-output schema (via Lang
   10 symbols with a budget and rationale each → validate each pick's exchange against the actual
   candidate it came from (dropping any hallucinated symbol) → write the `portfolio` ConfigMap →
   if crypto is enabled, post a crypto-only EOD report to Slack. News, indicators, track record,
-  and the P&L snapshot are each individually feature-gated (`analyst.enable_news`/
-  `enable_indicators`/`enable_track_record`/`enable_position_pnl`).
+  and the P&L snapshot are each individually feature-gated (`analyst.news.enabled`/
+  `indicators.enabled`/`track_record.enabled`/`position_pnl.enabled`).
 - **Dealer** (3 nodes, per symbol per poll): fetch technical indicators → LLM decides
   BUY/HOLD/SELL with recent same-symbol history in the prompt when enabled → apply local BUY
   gates (macro blackout, same-symbol stop cooldown, win-rate throttle, confidence, budget) → if

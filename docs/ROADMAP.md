@@ -900,7 +900,7 @@ every open stock position via the existing `sell()` path — crypto is 24/7 and 
 Runs entirely in-process so the eventual fill is picked up automatically by the already-running
 `poll_pending_fills()` thread, the same way it already handles Dealer-initiated sells — no new
 CronJob, image, or deploy manifest needed. Off by default; toggling is a config-only change (no
-rebuild/redeploy), same live-reload story as `analyst.enable_midday_run`.
+rebuild/redeploy), same live-reload story as `analyst.midday_run.enabled`.
 
 Tests: `tests/floor_broker/test_execution.py` (`check_eod_flatten()` — disabled/closed-market/
 not-yet-in-window no-ops, sells stocks and skips crypto, excludes a `skipped` sell from returned
@@ -972,7 +972,7 @@ files on an open one).
 
 **Done.** Two independent, config-gated risk controls addressing gap-risk windows the Analyst/
 Dealer previously had zero structured awareness of (the only prior "research" input was
-unstructured headline text, `analyst.enable_news`).
+unstructured headline text, `analyst.news.enabled`).
 
 **Per-symbol earnings blackout** — new `earnings_blackout` block (`config.yaml`, default
 `enabled: false`). When on, `discover_candidates` (`src/analyst/graph.py`) drops any stock
@@ -1067,7 +1067,7 @@ a new `analyst.large_cap_symbols` list (15 blue-chip names) via `sources.fetch_l
 — fails *open* on a quote-lookup failure (unlike the screener's fail-closed behavior), since a
 hand-picked large-cap symbol carries none of the illiquid-mover risk the fail-closed path exists to
 guard against. The crypto bucket is silently redistributed to the other two buckets when
-`trading.enable_crypto` is false. All existing downstream risk controls (earnings blackout, macro
+`trading.crypto.enabled` is false. All existing downstream risk controls (earnings blackout, macro
 blackout, spread guard, daily P&L halt, position caps) apply unchanged to every symbol regardless
 of which bucket it came from — the mix only changes what reaches the candidate pool, not what
 happens after. `enabled: false` reverts to today's screener-only discovery; the whole feature is a

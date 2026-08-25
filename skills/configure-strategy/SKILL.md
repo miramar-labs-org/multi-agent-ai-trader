@@ -76,8 +76,8 @@ When a daily limit (profit or loss) is hit, what happens to positions already op
 ## Step 6 — Exposure caps (AskUserQuestion)
 
 - Max concurrent positions / universe size (current default `max_universe_size: 10`).
-- Whether to include stocks, crypto, or both (`trading.enable_stocks` /
-  `trading.enable_crypto`).
+- Whether to include stocks, crypto, or both (`trading.stocks.enabled` /
+  `trading.crypto.enabled`).
 
 ## Step 7 — Synthesize and confirm before writing
 

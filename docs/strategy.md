@@ -244,7 +244,7 @@ apply to it. Scoped independently of `halt_behavior`: this isn't a halt conditio
 always-evaluated opt-in schedule that runs regardless of daily profit/loss state.
 
 Off by default; toggling is a config-only change (no rebuild/redeploy), same live-reload story as
-`analyst.enable_midday_run`. See `docs/ROADMAP.md` P1.10 and `docs/architecture.md`'s config
+`analyst.midday_run.enabled`. See `docs/ROADMAP.md` P1.10 and `docs/architecture.md`'s config
 reference / Risk controls section for implementation details.
 
 ## 2026-08-05 — Conditional (aggregate-P&L-gated) EOD flatten
@@ -268,7 +268,7 @@ pre-existing positions on Floor Broker startup. See `docs/ROADMAP.md` P1.11 and
 
 Two new, independently-toggled risk controls (both default `enabled: false`), addressing gap-risk
 windows the Analyst/Dealer previously had zero structured awareness of — the only prior
-"research" input was unstructured headline text (`analyst.enable_news`).
+"research" input was unstructured headline text (`analyst.news.enabled`).
 
 **Earnings blackout** (`earnings_blackout`, per-symbol) — `discover_candidates`
 (`src/analyst/graph.py`) drops any stock screener candidate reporting earnings within
