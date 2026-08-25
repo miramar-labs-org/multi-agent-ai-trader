@@ -22,8 +22,10 @@ trading:
   pollsecs: 600
   buffer: 15
   market_override: false
-  enable_stocks: true         # set false to pause Analyst/Dealer handling of equities entirely
-  enable_crypto: true         # crypto merge/trading verified live (BTC/USD test buy + Analyst crypto picks)
+  stocks:
+    enabled: true         # set false to pause Analyst/Dealer handling of equities entirely
+  crypto:
+    enabled: true         # crypto merge/trading verified live (BTC/USD test buy + Analyst crypto picks)
   crypto_taapi_exchange: "binance"   # TAAPI venue used for indicator requests on crypto symbols
 
 ohlcv_enrichment:
@@ -252,7 +254,7 @@ analyst:
     large_cap_pct: 0.40         # fraction of pool_size drawn from large_cap_symbols
     crypto_pct: 0.30            # fraction of pool_size drawn from crypto (screener movers + the
                                  # fixed CRYPTO_WATCHLIST); silently redistributed to the other
-                                 # buckets when trading.enable_crypto is false
+                                 # buckets when trading.crypto.enabled is false
     screener_pct: 0.30          # fraction of pool_size drawn from today's screener movers/most-
                                  # actives ("weird stocks"), excluding any symbol already in
                                  # large_cap_symbols

@@ -14,7 +14,7 @@ def _state(raw_candidates, picks):
 
 
 def _cfg(enable_crypto: bool):
-    return OmegaConf.create({"trading": {"enable_crypto": enable_crypto}})
+    return OmegaConf.create({"trading": {"crypto": {"enabled": enable_crypto}}})
 
 
 def test_discover_candidates_skips_stocks_when_market_closed(monkeypatch):
@@ -24,7 +24,7 @@ def test_discover_candidates_skips_stocks_when_market_closed(monkeypatch):
     monkeypatch.setattr(graph.sources, "fetch_crypto_candidates", lambda n: [{"symbol": "BTC/USD"}])
     cfg = OmegaConf.create(
         {
-            "trading": {"enable_stocks": True, "enable_crypto": True, "crypto_taapi_exchange": "binance"},
+            "trading": {"stocks": {"enabled": True}, "crypto": {"enabled": True}, "crypto_taapi_exchange": "binance"},
             "analyst": {"screener_top_n": 20},
             "earnings_blackout": {"enabled": False},
         }
@@ -48,7 +48,7 @@ def test_discover_candidates_includes_stocks_when_market_open(monkeypatch):
     monkeypatch.setattr(graph.sources, "fetch_crypto_candidates", lambda n: [])
     cfg = OmegaConf.create(
         {
-            "trading": {"enable_stocks": True, "enable_crypto": False, "crypto_taapi_exchange": "binance"},
+            "trading": {"stocks": {"enabled": True}, "crypto": {"enabled": False}, "crypto_taapi_exchange": "binance"},
             "analyst": {"screener_top_n": 20, "min_price_usd": 1.0},
             "earnings_blackout": {"enabled": False},
         }
@@ -76,7 +76,7 @@ def test_discover_candidates_drops_earnings_blackout_symbols(monkeypatch):
     monkeypatch.setattr(graph.sources, "fetch_earnings_calendar", lambda symbols, days_before, days_after: {"NVDA"})
     cfg = OmegaConf.create(
         {
-            "trading": {"enable_stocks": True, "enable_crypto": False, "crypto_taapi_exchange": "binance"},
+            "trading": {"stocks": {"enabled": True}, "crypto": {"enabled": False}, "crypto_taapi_exchange": "binance"},
             "analyst": {"screener_top_n": 20, "min_price_usd": 1.0},
             "earnings_blackout": {"enabled": True, "days_before": 2, "days_after": 1},
         }
@@ -108,7 +108,7 @@ def test_discover_candidates_skips_earnings_filter_when_disabled_via_config(monk
     monkeypatch.setattr(graph.sources, "fetch_earnings_calendar", _fail_if_called)
     cfg = OmegaConf.create(
         {
-            "trading": {"enable_stocks": True, "enable_crypto": False, "crypto_taapi_exchange": "binance"},
+            "trading": {"stocks": {"enabled": True}, "crypto": {"enabled": False}, "crypto_taapi_exchange": "binance"},
             "analyst": {"screener_top_n": 20, "min_price_usd": 1.0},
             "earnings_blackout": {"enabled": False},
         }
@@ -138,7 +138,7 @@ def _mix_cfg(
 ):
     return OmegaConf.create(
         {
-            "trading": {"enable_stocks": True, "enable_crypto": enable_crypto, "crypto_taapi_exchange": "binance"},
+            "trading": {"stocks": {"enabled": True}, "crypto": {"enabled": enable_crypto}, "crypto_taapi_exchange": "binance"},
             "analyst": {
                 "screener_top_n": 20,
                 "min_price_usd": 1.0,
@@ -355,7 +355,7 @@ def test_write_portfolio_passes_market_status_to_slack(monkeypatch):
         "selection": {"symbols": []},
         "stock_market_open": False,
     }
-    cfg = OmegaConf.create({"trading": {"enable_crypto": True}})
+    cfg = OmegaConf.create({"trading": {"crypto": {"enabled": True}}})
 
     graph.write_portfolio(state, cfg)
 
@@ -380,7 +380,7 @@ def test_write_portfolio_uses_midday_title_and_emoji_on_a_midday_run(monkeypatch
         "stock_market_open": True,
         "is_midday_run": True,
     }
-    cfg = OmegaConf.create({"trading": {"enable_crypto": True}})
+    cfg = OmegaConf.create({"trading": {"crypto": {"enabled": True}}})
 
     graph.write_portfolio(state, cfg)
 

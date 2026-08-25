@@ -95,7 +95,7 @@ def _discover_mixed_candidates(cfg, mix_cfg) -> list[dict]:
     day's movers ranking alone decide what the LLM sees (mega-caps' small daily %-moves rarely
     compete with a thinly-traded microcap's 20-30%+ swing). See docs/architecture.md."""
     pool_size = mix_cfg.get("pool_size", 20)
-    crypto_enabled = cfg.trading.enable_crypto
+    crypto_enabled = cfg.trading.crypto.enabled
     weights = {
         "large_cap": mix_cfg.get("large_cap_pct", 0.4),
         "crypto": mix_cfg.get("crypto_pct", 0.3) if crypto_enabled else 0.0,
@@ -148,12 +148,12 @@ def _discover_mixed_candidates(cfg, mix_cfg) -> list[dict]:
 def discover_candidates(state: AnalystState, cfg) -> AnalystState:
     candidates = []
     mix_cfg = cfg.analyst.get("candidate_mix", {})
-    mix_active = mix_cfg.get("enabled", False) and cfg.trading.enable_stocks and state["stock_market_open"]
+    mix_active = mix_cfg.get("enabled", False) and cfg.trading.stocks.enabled and state["stock_market_open"]
 
     if mix_active:
         candidates.extend(_discover_mixed_candidates(cfg, mix_cfg))
     else:
-        if cfg.trading.enable_stocks and state["stock_market_open"]:
+        if cfg.trading.stocks.enabled and state["stock_market_open"]:
             stock_candidates = sources.fetch_screener_candidates(
                 cfg.analyst.screener_top_n,
                 cfg.analyst.min_price_usd,
@@ -166,7 +166,7 @@ def discover_candidates(state: AnalystState, cfg) -> AnalystState:
                 c["market"] = "stocks"
             candidates.extend(stock_candidates)
 
-        if cfg.trading.enable_crypto:
+        if cfg.trading.crypto.enabled:
             crypto_candidates = sources.fetch_crypto_candidates(cfg.analyst.screener_top_n)
             for c in crypto_candidates:
                 c["market"] = cfg.trading.crypto_taapi_exchange
@@ -427,7 +427,7 @@ def write_portfolio(state: AnalystState, cfg) -> AnalystState:
         account_summary,
         payload["symbols"],
         stock_market_open=state["stock_market_open"],
-        crypto_enabled=cfg.trading.enable_crypto,
+        crypto_enabled=cfg.trading.crypto.enabled,
         title="Midday Update" if state.get("is_midday_run") else "Morning Market Report",
         emoji="🕐" if state.get("is_midday_run") else "🌅",
     )
@@ -440,7 +440,7 @@ def crypto_eod_report(state: AnalystState, cfg) -> AnalystState:
     after today's new picks go out in write_portfolio()'s notify_morning_report(). Skipped
     entirely on a midday run -- it already ran this morning and only ever reports on the prior
     calendar day, so a second run has nothing new to say."""
-    if state.get("is_midday_run") or not cfg.trading.enable_crypto:
+    if state.get("is_midday_run") or not cfg.trading.crypto.enabled:
         return state
 
     report_date = (datetime.now(pytz.timezone("US/Eastern")) - timedelta(days=1)).date().isoformat()
