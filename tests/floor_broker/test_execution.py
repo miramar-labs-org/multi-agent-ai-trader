@@ -1657,3 +1657,75 @@ def test_buy_skips_when_state_not_reconciled(monkeypatch):
         "detail": "tracked state not yet reconciled with Alpaca after restart",
     }
     assert client.submitted == []
+
+
+def test_buy_option_submits_order_and_tracks_position(monkeypatch):
+    monkeypatch.setattr(execution, "is_state_reconciled", lambda: True)
+    recorded_db = {}
+    monkeypatch.setattr(execution.db, "record_options_trade_opened", lambda *a, **k: recorded_db.setdefault("opened", (a, k)))
+
+    class FakeOrder:
+        id = "order-opt-1"
+
+    class FakeTradingClient2:
+        def submit_order(self, req):
+            recorded_db["req"] = req
+            return FakeOrder()
+
+    monkeypatch.setattr(execution, "trading_client2", FakeTradingClient2())
+
+    result = execution.buy_option(
+        "AAPL250117C00200000", 2, 3.20, "call", 200.0, "2025-01-17", 0.45, "test reasoning", "AAPL", "cycle-1"
+    )
+
+    assert result["status"] == "submitted"
+    assert result["order_id"] == "order-opt-1"
+    assert "opened" in recorded_db
+    with execution._state_lock:
+        assert execution._option_positions["AAPL250117C00200000"]["entry_premium"] == 3.20
+        assert execution._option_positions["AAPL250117C00200000"]["qty"] == 2
+
+
+def test_buy_option_refuses_when_state_not_reconciled(monkeypatch):
+    monkeypatch.setattr(execution, "is_state_reconciled", lambda: False)
+
+    result = execution.buy_option(
+        "AAPL250117C00200000", 2, 3.20, "call", 200.0, "2025-01-17", 0.45, "test reasoning", "AAPL", "cycle-1"
+    )
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "state_not_reconciled"
+
+
+def test_sell_option_submits_order_and_drops_tracking(monkeypatch):
+    with execution._state_lock:
+        execution._option_positions["AAPL250117C00200000"] = {
+            "symbol": "AAPL", "right": "call", "strike": 200.0, "expiration": "2025-01-17",
+            "delta": 0.45, "entry_premium": 3.20, "qty": 2,
+        }
+    recorded_db = {}
+    monkeypatch.setattr(execution.db, "record_options_trade_closed", lambda *a, **k: recorded_db.setdefault("closed", (a, k)))
+
+    class FakePosition:
+        qty = "2"
+        current_price = "4.50"
+
+    class FakeOrder:
+        id = "order-opt-2"
+
+    class FakeTradingClient2:
+        def get_open_position(self, contract_symbol):
+            return FakePosition()
+
+        def submit_order(self, req):
+            return FakeOrder()
+
+    monkeypatch.setattr(execution, "trading_client2", FakeTradingClient2())
+
+    result = execution.sell_option("AAPL250117C00200000", reason="take_profit")
+
+    assert result["status"] == "submitted"
+    assert result["order_id"] == "order-opt-2"
+    assert recorded_db["closed"][0] == ("AAPL250117C00200000", "take_profit", 4.50)
+    with execution._state_lock:
+        assert "AAPL250117C00200000" not in execution._option_positions

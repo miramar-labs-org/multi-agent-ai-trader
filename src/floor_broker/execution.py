@@ -1,7 +1,9 @@
 import json
 import threading
 import time
+from datetime import datetime
 
+import pytz
 from alpaca.common.exceptions import APIError
 from alpaca.trading.enums import AssetClass, OrderClass, OrderSide, OrderStatus, OrderType, TimeInForce
 from alpaca.trading.requests import (
@@ -13,7 +15,13 @@ from alpaca.trading.requests import (
 )
 
 from src.common import db, kill_switch
-from src.common.alpaca_client import get_current_ask_price, get_current_bid_price, trading_client
+from src.common.alpaca_client import (
+    get_current_ask_price,
+    get_current_bid_price,
+    get_current_option_mid_price,
+    trading_client,
+    trading_client2,
+)
 from src.common.config import load_config
 from src.common.logging import get_logger
 from src.common.symbols import alpaca_order_symbol, canonical_crypto_symbol, is_usd_crypto_symbol
@@ -70,6 +78,12 @@ _pending_fills: dict[str, dict] = {}
 # _tracked_brackets/_pending_fills: a Floor Broker restart drops tracking for any crypto position
 # still open at the time, silently losing its stop/target until the next manual Dealer SELL.
 _crypto_stops: dict[str, tuple[float, float]] = {}
+
+# Tracks every open option position this process itself opened, keyed by contract_symbol, value
+# {symbol, right, strike, expiration, delta, entry_premium, qty}. Options have no native bracket/
+# OCO support any more than crypto does, so check_option_stops() below is the entire synthetic
+# exit mechanism for options -- same in-memory-only, no-restart-recovery caveat as _crypto_stops.
+_option_positions: dict[str, dict] = {}
 
 # False from process start until reconcile_tracked_state_once() has succeeded at least once.
 # buy() refuses new BUYs while this is False (see below) -- submitting a fresh order before
@@ -933,3 +947,80 @@ def sell(symbol: str, reason: str = "dealer_signal") -> dict:
         except APIError as retry_exc:
             log(f"💥  sell retry failed for {symbol}: {retry_exc}")
             raise
+
+
+def buy_option(
+    contract_symbol: str,
+    qty: int,
+    entry_premium: float,
+    right: str,
+    strike: float,
+    expiration: str,
+    delta: float | None,
+    reasoning: str | None,
+    symbol: str,
+    cycle_id: str | None,
+) -> dict:
+    if not is_state_reconciled():
+        log(f"⚠️  refusing option BUY for {contract_symbol} -- tracked state not yet reconciled with Alpaca")
+        return {"status": "skipped", "reason": "state_not_reconciled", "detail": "tracked state not yet reconciled with Alpaca"}
+
+    req = MarketOrderRequest(symbol=contract_symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
+    try:
+        order = trading_client2.submit_order(req)
+    except APIError as exc:
+        log(f"💥  option buy order failed for {contract_symbol}: {exc}")
+        return {"status": "error", "detail": str(exc)}
+
+    log(f"✅  option buy order submitted: {order.id}")
+    with _state_lock:
+        _option_positions[contract_symbol] = {
+            "symbol": symbol,
+            "right": right,
+            "strike": strike,
+            "expiration": expiration,
+            "delta": delta,
+            "entry_premium": entry_premium,
+            "qty": qty,
+        }
+    db.record_options_trade_opened(symbol, contract_symbol, right, strike, expiration, delta, entry_premium, qty, reasoning, cycle_id)
+
+    return {
+        "status": "submitted",
+        "reason": "opening_position",
+        "detail": f"option buy order submitted: {order.id}",
+        "order_id": str(order.id),
+    }
+
+
+def sell_option(contract_symbol: str, reason: str = "dealer_signal") -> dict:
+    try:
+        position = trading_client2.get_open_position(contract_symbol)
+    except APIError as exc:
+        log(f"⚠️  no open option position of {contract_symbol} to sell: {exc}")
+        return {"status": "skipped", "detail": "no open position"}
+
+    qty = abs(int(float(position.qty)))
+    if qty <= 0:
+        return {"status": "skipped", "detail": "no open position"}
+
+    req = MarketOrderRequest(symbol=contract_symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
+    try:
+        order = trading_client2.submit_order(req)
+    except APIError as exc:
+        log(f"💥  option sell order failed for {contract_symbol}: {exc}")
+        return {"status": "error", "detail": str(exc)}
+
+    log(f"✅  option sell order submitted: {order.id}")
+    with _state_lock:
+        _option_positions.pop(contract_symbol, None)
+
+    exit_premium = float(position.current_price) if position.current_price is not None else None
+    db.record_options_trade_closed(contract_symbol, reason, exit_premium)
+
+    return {
+        "status": "submitted",
+        "reason": reason,
+        "detail": f"option sell order submitted: {order.id}",
+        "order_id": str(order.id),
+    }
