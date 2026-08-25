@@ -315,3 +315,51 @@ def test_execute_option_rejects_non_buy_side():
     )
 
     assert response.status_code == 422
+
+
+def test_execute_option_rejects_notional_above_ceiling():
+    response = _client().post(
+        "/execute-option",
+        json={
+            "contract_symbol": "AAPL250117C00200000",
+            "side": "BUY",
+            "qty": 1000,
+            "symbol": "AAPL",
+            "right": "call",
+            "strike": 200.0,
+            "expiration": "2025-01-17",
+            "delta": 0.45,
+            "premium": app_module.MAX_OPTION_NOTIONAL / (1000 * 100) + 0.01,
+            "reasoning": "test",
+            "cycle_id": "cycle-1",
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_execute_option_accepts_notional_at_ceiling(monkeypatch):
+    monkeypatch.setattr(
+        app_module.execution,
+        "buy_option",
+        lambda *a, **k: {"status": "submitted", "reason": "opening_position", "detail": "ok", "order_id": "order-1"},
+    )
+
+    response = _client().post(
+        "/execute-option",
+        json={
+            "contract_symbol": "AAPL250117C00200000",
+            "side": "BUY",
+            "qty": 1000,
+            "symbol": "AAPL",
+            "right": "call",
+            "strike": 200.0,
+            "expiration": "2025-01-17",
+            "delta": 0.45,
+            "premium": app_module.MAX_OPTION_NOTIONAL / (1000 * 100),
+            "reasoning": "test",
+            "cycle_id": "cycle-1",
+        },
+    )
+
+    assert response.status_code == 200

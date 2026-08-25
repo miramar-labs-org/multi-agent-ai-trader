@@ -17,6 +17,14 @@ log = get_logger("FLOOR")
 # order. 20x config.yaml's analyst.default_budget (5000).
 MAX_BUDGET = 100_000.0
 
+# Same category of guard as MAX_BUDGET above, for the options path -- a hard, non-configurable
+# ceiling on a single option order's notional (qty * premium * 100) as a last-line-of-defense
+# against a units bug or a wildly hallucinated premium/qty reaching Alpaca. Distinct from
+# config.yaml's options_trading.max_notional_usd, which is the real, configurable, re-quoted-
+# against-the-market business-rule cap enforced inside buy_option() itself (Step 3 below) --
+# this pydantic ceiling is only the outer sanity bound on the raw request.
+MAX_OPTION_NOTIONAL = 100_000.0
+
 # Alpaca tickers: letters/digits, with an optional single "/" for crypto pairs (e.g. "BTC/USD")
 # or "." for dual-class shares and warrants/units (e.g. "BRK.B", "DSX.WS") -- both come straight
 # from Alpaca's own screener/assets universe, so Floor Broker must accept whatever shape Alpaca
@@ -89,6 +97,14 @@ class ExecuteOptionRequest(BaseModel):
     premium: float = Field(gt=0)
     reasoning: str | None = None
     cycle_id: str | None = None
+
+    @field_validator("premium")
+    @classmethod
+    def _notional_within_ceiling(cls, v: float, info) -> float:
+        qty = info.data.get("qty")
+        if qty is not None and qty * v * 100 > MAX_OPTION_NOTIONAL:
+            raise ValueError(f"notional (qty * premium * 100) exceeds ceiling of {MAX_OPTION_NOTIONAL}")
+        return v
 
 
 class ExecuteOptionResponse(BaseModel):

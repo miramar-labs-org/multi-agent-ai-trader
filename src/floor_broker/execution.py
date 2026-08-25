@@ -1012,6 +1012,21 @@ def buy_option(
     if skip is not None:
         return skip
 
+    try:
+        live_mid = get_current_option_mid_price(contract_symbol)
+    except APIError as exc:
+        log(f"💥  failed to re-quote {contract_symbol} before BUY: {exc}")
+        return {"status": "error", "detail": f"failed to fetch live quote for {contract_symbol}: {exc}"}
+
+    notional = qty * live_mid * 100
+    if notional > cfg.options_trading.max_notional_usd:
+        log(f"🛑  option BUY notional (${notional:.2f}) exceeds cap (${cfg.options_trading.max_notional_usd}) -- skipping {contract_symbol}")
+        return {
+            "status": "skipped",
+            "reason": "notional_cap_exceeded",
+            "detail": f"live-quoted notional ${notional:.2f} (qty={qty} @ live mid ${live_mid:.2f}) exceeds cap ${cfg.options_trading.max_notional_usd}",
+        }
+
     req = MarketOrderRequest(symbol=contract_symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
     try:
         order = trading_client2.submit_order(req)

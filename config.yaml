@@ -99,6 +99,7 @@ options_trading:
   min_volume: 10
   options_slP: 0.50         # synthetic stop-loss, fraction of entry premium
   options_tpP: 1.75         # synthetic take-profit, fraction of entry premium
+  max_notional_usd: 2000    # hard cap on a single option order's live-quoted notional (qty * mid-price * 100); re-quoted against the market at BUY time, not the LLM-claimed premium (20x strategy.risk_per_trade_usd's default of 100)
 
 eod_flatten:
   enabled: true   # feature gate: when false, poll_eod_flatten() (src/floor_broker/main.py) short-
