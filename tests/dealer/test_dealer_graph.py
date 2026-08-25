@@ -163,3 +163,55 @@ def test_llm_call_includes_recent_same_symbol_memory(monkeypatch):
     assert "Recent same-symbol trading history" in captured["user_prompt"]
     assert "prior buy" in captured["user_prompt"]
     assert "stop_loss leg filled" in captured["user_prompt"]
+
+
+def test_select_option_contract_is_noop_when_disabled(monkeypatch):
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("disabled options_trading must not call MCP tools")
+
+    monkeypatch.setattr(graph, "_select_option_contract_async", _fail_if_called)
+    cfg = OmegaConf.create({"options_trading": {"enabled": False}})
+    state = {**_state("rsi: 71.2"), "signal": {"action": "BUY", "confidence": 0.9, "reasoning": "r"}}
+
+    result = graph.select_option_contract(state, cfg)
+
+    assert result["option_pick"] is None
+
+
+def test_select_option_contract_is_noop_on_hold(monkeypatch):
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("a HOLD signal must not trigger option contract search")
+
+    monkeypatch.setattr(graph, "_select_option_contract_async", _fail_if_called)
+    cfg = OmegaConf.create(
+        {"options_trading": {"enabled": True}, "strategy": {"min_confidence": 0.6}}
+    )
+    state = {**_state("rsi: 71.2"), "signal": {"action": "HOLD", "confidence": 0.9, "reasoning": "r"}}
+
+    result = graph.select_option_contract(state, cfg)
+
+    assert result["option_pick"] is None
+
+
+def test_select_option_contract_returns_pick_dict(monkeypatch):
+    async def _fake_select(state, cfg, signal):
+        return graph.OptionContractPick(
+            contract_symbol="AAPL250117C00200000",
+            strike=200.0,
+            expiration="2025-01-17",
+            right="call",
+            delta=0.45,
+            premium=3.20,
+            reasoning="within delta/DTE window with sufficient OI",
+        )
+
+    monkeypatch.setattr(graph, "_select_option_contract_async", _fake_select)
+    cfg = OmegaConf.create(
+        {"options_trading": {"enabled": True}, "strategy": {"min_confidence": 0.6}}
+    )
+    state = {**_state("rsi: 71.2"), "signal": {"action": "BUY", "confidence": 0.9, "reasoning": "r"}}
+
+    result = graph.select_option_contract(state, cfg)
+
+    assert result["option_pick"]["contract_symbol"] == "AAPL250117C00200000"
+    assert result["option_pick"]["right"] == "call"

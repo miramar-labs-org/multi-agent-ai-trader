@@ -128,6 +128,7 @@ def main():
                         "raw_bars": {},
                         "ohlcv_features_text": "",
                         "signal": None,
+                        "option_pick": None,
                         "execution_result": None,
                     }
                     graph.invoke(state, config={"tags": ["dealer"]})

@@ -1,9 +1,10 @@
+import asyncio
 from datetime import datetime, timedelta
 from typing import TypedDict
 
 import pytz
 import requests
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 
@@ -13,9 +14,12 @@ from src.common.config import load_config
 from src.common.logging import get_logger
 from src.common.indicators import fetch_indicators_bulk
 from src.dealer.features import compute_derived_features, format_features_text
-from src.dealer.schema import Signal
+from src.dealer.mcp_options import get_options_tools
+from src.dealer.schema import OptionContractPick, Signal
 
 log = get_logger("DEALER")
+
+_MAX_TOOL_CALL_ROUNDS = 6
 
 
 class DealerState(TypedDict):
@@ -28,6 +32,7 @@ class DealerState(TypedDict):
     raw_bars: dict
     ohlcv_features_text: str
     signal: dict | None
+    option_pick: dict | None
     execution_result: dict | None
 
 
@@ -391,6 +396,69 @@ def call_floor_broker(state: DealerState, cfg) -> DealerState:
         slack.notify_floor_broker_result(state["symbol"], signal["action"], "error", str(exc))
         db.record_floor_broker_event(state["symbol"], "error", str(exc))
         return {**state, "execution_result": {"status": "error", "detail": str(exc)}}
+
+
+def select_option_contract(state: DealerState, cfg) -> DealerState:
+    if not cfg.get("options_trading", {}).get("enabled", False):
+        return {**state, "option_pick": None}
+
+    signal = state["signal"]
+    if signal["action"] == "HOLD" or signal.get("confidence", 1.0) < cfg.strategy.min_confidence:
+        return {**state, "option_pick": None}
+
+    try:
+        pick = asyncio.run(_select_option_contract_async(state, cfg, signal))
+    except Exception as exc:
+        log(f"💥 option contract selection failed for {state['symbol']}: {exc}")
+        return {**state, "option_pick": None}
+
+    return {**state, "option_pick": pick.model_dump() if pick else None}
+
+
+async def _select_option_contract_async(state: DealerState, cfg, signal: dict) -> OptionContractPick | None:
+    tools = await get_options_tools()
+    tools_by_name = {t.name: t for t in tools}
+
+    llm = ChatOpenAI(base_url=cfg.llm.base_url, model=cfg.llm.model, temperature=cfg.llm.temperature)
+    agent_llm = llm.bind_tools(tools)
+    right = "call" if signal["action"] == "BUY" else "put"
+
+    messages = [
+        SystemMessage(
+            content=(
+                "You are an options contract selector for a paper-trading account. Use the "
+                "provided Alpaca tools to look up the option chain, quotes, and Greeks for the "
+                "given underlying symbol, then pick exactly one contract that fits the stated "
+                "constraints."
+            )
+        ),
+        HumanMessage(
+            content=(
+                f"Underlying: {state['symbol']}\n"
+                f"Desired right: {right}\n"
+                f"Days-to-expiration window: {cfg.options_trading.dte_min}-{cfg.options_trading.dte_max}\n"
+                f"Target delta window: {cfg.options_trading.target_delta_min}-{cfg.options_trading.target_delta_max}\n"
+                f"Minimum open interest: {cfg.options_trading.min_open_interest}\n"
+                f"Minimum volume: {cfg.options_trading.min_volume}\n"
+                f"Dealer reasoning for the underlying signal: {signal['reasoning']}\n\n"
+                "Call tools as needed to find chain/quote/Greeks data, then respond with your "
+                "final pick."
+            )
+        ),
+    ]
+
+    for _ in range(_MAX_TOOL_CALL_ROUNDS):
+        response = agent_llm.invoke(messages)
+        messages.append(response)
+        if not response.tool_calls:
+            break
+        for call in response.tool_calls:
+            tool = tools_by_name[call["name"]]
+            result = await tool.ainvoke(call["args"])
+            messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
+
+    structured_llm = llm.with_structured_output(OptionContractPick)
+    return structured_llm.invoke(messages)
 
 
 def build_graph():
