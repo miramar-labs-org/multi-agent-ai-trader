@@ -264,3 +264,54 @@ def test_flatten_crypto_notifies_slack_and_reraises_on_unexpected_error(monkeypa
 
     assert response.status_code == 500
     assert "error" in calls
+
+
+def test_execute_option_returns_result_from_buy_option(monkeypatch):
+    captured = {}
+
+    def _fake_buy_option(contract_symbol, qty, premium, right, strike, expiration, delta, reasoning, symbol, cycle_id):
+        captured["args"] = (contract_symbol, qty, premium, right, strike, expiration, delta, reasoning, symbol, cycle_id)
+        return {"status": "submitted", "reason": "opening_position", "detail": "option buy order submitted: order-1", "order_id": "order-1"}
+
+    monkeypatch.setattr(app_module.execution, "buy_option", _fake_buy_option)
+
+    response = _client().post(
+        "/execute-option",
+        json={
+            "contract_symbol": "AAPL250117C00200000",
+            "side": "BUY",
+            "qty": 2,
+            "symbol": "AAPL",
+            "right": "call",
+            "strike": 200.0,
+            "expiration": "2025-01-17",
+            "delta": 0.45,
+            "premium": 3.20,
+            "reasoning": "test",
+            "cycle_id": "cycle-1",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "submitted"
+    assert captured["args"][0] == "AAPL250117C00200000"
+    assert captured["args"][1] == 2
+
+
+def test_execute_option_rejects_non_buy_side():
+    response = _client().post(
+        "/execute-option",
+        json={
+            "contract_symbol": "AAPL250117C00200000",
+            "side": "SELL",
+            "qty": 2,
+            "symbol": "AAPL",
+            "right": "call",
+            "strike": 200.0,
+            "expiration": "2025-01-17",
+            "delta": 0.45,
+            "premium": 3.20,
+        },
+    )
+
+    assert response.status_code == 422

@@ -75,6 +75,29 @@ class ExecuteResponse(BaseModel):
     tp_price: float | None = None
 
 
+class ExecuteOptionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    contract_symbol: str
+    side: Literal["BUY"]
+    qty: int = Field(gt=0)
+    symbol: str
+    right: Literal["call", "put"]
+    strike: float = Field(gt=0)
+    expiration: str
+    delta: float | None = None
+    premium: float = Field(gt=0)
+    reasoning: str | None = None
+    cycle_id: str | None = None
+
+
+class ExecuteOptionResponse(BaseModel):
+    status: Literal["executed", "submitted", "skipped", "error"]
+    detail: str
+    reason: str | None = None
+    order_id: str | None = None
+
+
 class FlattenCryptoResponse(BaseModel):
     status: Literal["ok", "error"]
     events: list[dict] = Field(default_factory=list)
@@ -103,6 +126,31 @@ def execute(req: ExecuteRequest):
     except Exception as exc:
         log(f"💥  unexpected error on {req.action} {req.symbol}: {exc}")
         slack.notify_error("FLOOR", f"unexpected error on {req.action} {req.symbol}: {exc}")
+        raise
+
+
+@app.post("/execute-option", response_model=ExecuteOptionResponse)
+def execute_option(req: ExecuteOptionRequest):
+    try:
+        result = execution.buy_option(
+            req.contract_symbol,
+            req.qty,
+            req.premium,
+            req.right,
+            req.strike,
+            req.expiration,
+            req.delta,
+            req.reasoning,
+            req.symbol,
+            req.cycle_id,
+        )
+        return ExecuteOptionResponse(**result)
+    except APIError as exc:
+        log(f"💥  option BUY {req.contract_symbol} failed: {exc}")
+        return ExecuteOptionResponse(status="error", detail=str(exc))
+    except Exception as exc:
+        log(f"💥  unexpected error on option BUY {req.contract_symbol}: {exc}")
+        slack.notify_error("FLOOR", f"unexpected error on option BUY {req.contract_symbol}: {exc}")
         raise
 
 
