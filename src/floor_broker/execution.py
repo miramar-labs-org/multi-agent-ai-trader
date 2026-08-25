@@ -536,9 +536,10 @@ def reconstruct_tracked_state(
     )
 
 
-def _fetch_open_position(symbol: str):
+def _fetch_open_position(symbol: str, client=None):
+    client = client or trading_client
     try:
-        return trading_client.get_open_position(alpaca_order_symbol(symbol))
+        return client.get_open_position(alpaca_order_symbol(symbol))
     except APIError:
         return None
 
@@ -637,7 +638,8 @@ def bracket_buy_with_SLTP(
     )
 
 
-def _buy_preflight_skip(symbol: str, cfg) -> dict | None:
+def _buy_preflight_skip(symbol: str, cfg, client=None) -> dict | None:
+    client = client or trading_client
     if not is_state_reconciled():
         log(f"🛑  BUY {symbol} rejected -- tracked state not yet reconciled with Alpaca")
         return {
@@ -650,7 +652,7 @@ def _buy_preflight_skip(symbol: str, cfg) -> dict | None:
         log(f"🛑  BUY kill switch active -- skipping BUY {symbol}")
         return {"status": "skipped", "reason": "buy_kill_switch_active", "detail": "BUY kill switch is active"}
 
-    account = trading_client.get_account()
+    account = client.get_account()
     daily_pnl = float(account.equity) - float(account.last_equity)
     if daily_pnl >= cfg.strategy.daily_profit_target_usd:
         log(f"🛑  daily profit target reached (${daily_pnl:.2f}) -- skipping BUY {symbol}")
@@ -712,15 +714,16 @@ def _risk_based_budget_cap(slP: float, cfg) -> float | None:
     return risk_usd / (1 - slP)
 
 
-def _max_concurrent_positions_skip(symbol: str, cfg) -> dict | None:
+def _max_concurrent_positions_skip(symbol: str, cfg, client=None) -> dict | None:
     """Refuses a new BUY once the number of currently-open positions is at/above
     strategy.max_concurrent_positions -- topping up a symbol that's already open doesn't add a
     new position, so it's exempt (checked via _fetch_open_position, same as
     _remaining_budget_or_skip's own top-up check)."""
-    if _fetch_open_position(symbol) is not None:
+    client = client or trading_client
+    if _fetch_open_position(symbol, client=client) is not None:
         return None
 
-    open_count = len(trading_client.get_all_positions())
+    open_count = len(client.get_all_positions())
     limit = cfg.strategy.max_concurrent_positions
     if open_count >= limit:
         log(f"🛑  max concurrent positions reached ({open_count}/{limit}) -- skipping new BUY {symbol}")
@@ -999,9 +1002,15 @@ def buy_option(
     symbol: str,
     cycle_id: str | None,
 ) -> dict:
-    if not is_state_reconciled():
-        log(f"⚠️  refusing option BUY for {contract_symbol} -- tracked state not yet reconciled with Alpaca")
-        return {"status": "skipped", "reason": "state_not_reconciled", "detail": "tracked state not yet reconciled with Alpaca"}
+    cfg = load_config()  # fresh (within its own refresh window) so a live strategy change never needs a restart
+
+    skip = _buy_preflight_skip(contract_symbol, cfg, client=trading_client2)
+    if skip is not None:
+        return skip
+
+    skip = _max_concurrent_positions_skip(contract_symbol, cfg, client=trading_client2)
+    if skip is not None:
+        return skip
 
     req = MarketOrderRequest(symbol=contract_symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
     try:

@@ -223,7 +223,12 @@ def test_select_option_contract_returns_pick_dict(monkeypatch):
 def _option_cfg(**overrides):
     base = {
         "floor_broker": {"base_url": "http://floor-broker.test:8000"},
-        "strategy": {"risk_per_trade_usd": 100},
+        "macro_blackout": {"enabled": False, "dates": []},
+        "strategy": {
+            "risk_per_trade_usd": 100,
+            "win_rate_throttle": {"enabled": False},
+            "symbol_stop_cooldown": {"enabled": False},
+        },
         "options_trading": {
             "dte_min": 14,
             "dte_max": 45,
@@ -349,6 +354,164 @@ def test_call_floor_broker_option_posts_to_execute_option(monkeypatch):
     assert captured["json"]["contract_symbol"] == "AAPL250117C00200000"
     assert captured["json"]["qty"] == 2  # floor(100 / (0.50 * 100)) == floor(2.0) == 2
     assert result["execution_result"]["status"] == "submitted"
+
+
+def _base_option_gate_cfg(**strategy_overrides):
+    strategy = {
+        "risk_per_trade_usd": 100,
+        "win_rate_throttle": {"enabled": False},
+        "symbol_stop_cooldown": {"enabled": False},
+        "min_confidence": 0.6,
+    }
+    strategy.update(strategy_overrides)
+    return OmegaConf.create(
+        {
+            "floor_broker": {"base_url": "http://floor-broker.test:8000"},
+            "macro_blackout": {"enabled": False, "dates": []},
+            "strategy": strategy,
+            "options_trading": {
+                "dte_min": 14,
+                "dte_max": 45,
+                "target_delta_min": 0.30,
+                "target_delta_max": 0.60,
+            },
+            "analyst": {"track_record_days": 5},
+        }
+    )
+
+
+def _option_pick_state(action: str = "BUY"):
+    return {
+        **_state("rsi: 71.2"),
+        "signal": {"action": action, "confidence": 0.9, "reasoning": "r"},
+        "option_pick": {
+            "contract_symbol": "AAPL250117C00200000",
+            "strike": 200.0,
+            "expiration": _far_expiration(20),
+            "right": "call",
+            "delta": 0.45,
+            "premium": 0.50,
+            "reasoning": "r",
+        },
+    }
+
+
+def test_call_floor_broker_option_skips_buy_during_macro_blackout(monkeypatch):
+    monkeypatch.setattr(graph.slack, "notify_floor_broker_result", lambda *a, **k: None)
+    monkeypatch.setattr(graph.db, "record_floor_broker_event", lambda *a, **k: None)
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("Floor Broker must not be called during a macro blackout")
+
+    monkeypatch.setattr(graph.requests, "post", _fail_if_called)
+
+    cfg = _base_option_gate_cfg()
+    today = datetime.now(pytz.timezone("US/Eastern")).date().isoformat()
+    cfg.macro_blackout.enabled = True
+    cfg.macro_blackout.dates = [{"date": today, "label": "CPI release"}]
+
+    result = graph.call_floor_broker_option(_option_pick_state(), cfg)
+
+    assert result["execution_result"]["status"] == "skipped"
+    assert result["execution_result"]["reason"] == "macro_blackout"
+
+
+def test_call_floor_broker_option_skips_buy_when_symbol_recently_stopped_out(monkeypatch):
+    monkeypatch.setattr(graph.slack, "notify_floor_broker_result", lambda *a, **k: None)
+    monkeypatch.setattr(graph.db, "record_floor_broker_event", lambda *a, **k: None)
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("Floor Broker must not be called while symbol cooldown is active")
+
+    monkeypatch.setattr(graph.requests, "post", _fail_if_called)
+
+    cfg = _base_option_gate_cfg(
+        symbol_stop_cooldown={"enabled": True}, symbol_stop_cooldown_days=1, max_symbol_stop_losses=1
+    )
+    monkeypatch.setattr(
+        graph.db,
+        "fetch_symbol_floor_broker_events_since",
+        lambda symbol, since_date, limit=100: [{"event_type": "fill", "detail": "stop_loss leg filled: order-1"}],
+    )
+
+    result = graph.call_floor_broker_option(_option_pick_state(), cfg)
+
+    assert result["execution_result"]["status"] == "skipped"
+    assert result["execution_result"]["reason"] == "symbol_stop_cooldown"
+
+
+def test_call_floor_broker_option_skips_buy_when_win_rate_below_minimum(monkeypatch):
+    monkeypatch.setattr(graph.slack, "notify_floor_broker_result", lambda *a, **k: None)
+    monkeypatch.setattr(graph.db, "record_floor_broker_event", lambda *a, **k: None)
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("Floor Broker must not be called while the win-rate throttle is active")
+
+    monkeypatch.setattr(graph.requests, "post", _fail_if_called)
+
+    cfg = _base_option_gate_cfg(
+        win_rate_throttle={"enabled": True},
+        win_rate_throttle_scope="global",
+        min_win_rate=0.3,
+        win_rate_min_sample=5,
+    )
+    events = [{"event_type": "fill", "detail": "stop_loss leg filled: order-1"}] * 4 + [
+        {"event_type": "fill", "detail": "take_profit leg filled: order-1"}
+    ]
+    monkeypatch.setattr(graph.db, "fetch_floor_broker_events_since", lambda since_date: events)
+
+    result = graph.call_floor_broker_option(_option_pick_state(), cfg)
+
+    assert result["execution_result"]["status"] == "skipped"
+    assert result["execution_result"]["reason"] == "win_rate_throttle"
+
+
+def test_call_floor_broker_option_sell_bypasses_buy_only_gates(monkeypatch):
+    """A SELL (closing an existing option position) must never be blocked by the BUY-only gates --
+    same parity as call_floor_broker's own stock-path gates, which are also `if action == "BUY":`
+    guarded."""
+    monkeypatch.setattr(graph.slack, "notify_floor_broker_result", lambda *a, **k: None)
+    monkeypatch.setattr(graph.db, "record_floor_broker_event", lambda *a, **k: None)
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"status": "submitted", "detail": "option sell order submitted: order-1"}
+
+    def _fake_post(url, json, timeout):
+        captured["json"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr(graph.requests, "post", _fake_post)
+
+    cfg = _base_option_gate_cfg()
+    today = datetime.now(pytz.timezone("US/Eastern")).date().isoformat()
+    cfg.macro_blackout.enabled = True
+    cfg.macro_blackout.dates = [{"date": today, "label": "CPI release"}]
+
+    result = graph.call_floor_broker_option(_option_pick_state(action="SELL"), cfg)
+
+    assert result["execution_result"]["status"] == "submitted"
+    assert captured["json"]["side"] == "BUY"  # payload's `side` is hardcoded BUY-only today (unrelated, pre-existing)
+
+
+def test_call_floor_broker_option_skips_when_risk_per_trade_usd_not_configured(monkeypatch):
+    monkeypatch.setattr(graph.slack, "notify_floor_broker_result", lambda *a, **k: None)
+    monkeypatch.setattr(graph.db, "record_floor_broker_event", lambda *a, **k: None)
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("Floor Broker must not be called when risk_per_trade_usd is unset")
+
+    monkeypatch.setattr(graph.requests, "post", _fail_if_called)
+
+    cfg = _base_option_gate_cfg(risk_per_trade_usd=None)
+
+    result = graph.call_floor_broker_option(_option_pick_state(), cfg)
+
+    assert result["execution_result"]["status"] == "skipped"
+    assert result["execution_result"]["reason"] == "risk_per_trade_usd_not_configured"
 
 
 def test_route_after_llm_call_selects_option_branch_when_enabled():

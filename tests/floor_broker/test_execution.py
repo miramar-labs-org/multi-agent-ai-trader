@@ -1669,6 +1669,15 @@ def test_buy_option_submits_order_and_tracks_position(monkeypatch):
         id = "order-opt-1"
 
     class FakeTradingClient2:
+        def get_account(self):
+            return FakeAccount()
+
+        def get_open_position(self, symbol):
+            raise APIError("no position")
+
+        def get_all_positions(self):
+            return []
+
         def submit_order(self, req):
             recorded_db["req"] = req
             return FakeOrder()
@@ -1696,6 +1705,98 @@ def test_buy_option_refuses_when_state_not_reconciled(monkeypatch):
 
     assert result["status"] == "skipped"
     assert result["reason"] == "state_not_reconciled"
+
+
+def test_buy_option_refuses_when_kill_switch_active(monkeypatch):
+    monkeypatch.setattr(execution, "is_state_reconciled", lambda: True)
+    monkeypatch.setattr(execution.kill_switch, "buy_kill_switch_active", lambda: True)
+
+    class FakeTradingClient2:
+        pass  # kill switch trips before any client method is called
+
+    monkeypatch.setattr(execution, "trading_client2", FakeTradingClient2())
+
+    result = execution.buy_option(
+        "AAPL250117C00200000", 2, 3.20, "call", 200.0, "2025-01-17", 0.45, "test reasoning", "AAPL", "cycle-1"
+    )
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "buy_kill_switch_active"
+
+
+def test_buy_option_refuses_when_daily_loss_limit_reached_on_account_2(monkeypatch):
+    """The daily P&L check must read account 2's own equity/last_equity (via trading_client2), not
+    account 1's -- this is the account-isolation half of C1's fix."""
+    monkeypatch.setattr(execution, "is_state_reconciled", lambda: True)
+
+    class FakeTradingClient2:
+        def get_account(self):
+            return FakeAccount(equity="99400.0", last_equity="100000.0")  # -$600, past -$500 limit in _FAKE_CFG
+
+    monkeypatch.setattr(execution, "trading_client2", FakeTradingClient2())
+
+    result = execution.buy_option(
+        "AAPL250117C00200000", 2, 3.20, "call", 200.0, "2025-01-17", 0.45, "test reasoning", "AAPL", "cycle-1"
+    )
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "daily_loss_limit_reached"
+
+
+def test_buy_option_refuses_when_max_concurrent_positions_reached_on_account_2(monkeypatch):
+    monkeypatch.setattr(execution, "is_state_reconciled", lambda: True)
+
+    class FakeTradingClient2:
+        def get_account(self):
+            return FakeAccount()
+
+        def get_open_position(self, symbol):
+            raise APIError("no position")
+
+        def get_all_positions(self):
+            return [object()] * 10  # _FAKE_CFG.strategy.max_concurrent_positions == 10
+
+    monkeypatch.setattr(execution, "trading_client2", FakeTradingClient2())
+
+    result = execution.buy_option(
+        "AAPL250117C00200000", 2, 3.20, "call", 200.0, "2025-01-17", 0.45, "test reasoning", "AAPL", "cycle-1"
+    )
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "max_concurrent_positions_reached"
+
+
+def test_buy_option_proceeds_when_contract_already_open_regardless_of_max_concurrent_positions(monkeypatch):
+    """Topping up / re-buying an already-open contract is exempt from the max-concurrent-positions
+    cap, same as _max_concurrent_positions_skip's existing stock-path behavior."""
+    monkeypatch.setattr(execution, "is_state_reconciled", lambda: True)
+    monkeypatch.setattr(execution.db, "record_options_trade_opened", lambda *a, **k: None)
+
+    class FakeOrder:
+        id = "order-opt-3"
+
+    class FakeTradingClient2:
+        def get_account(self):
+            return FakeAccount()
+
+        def get_open_position(self, symbol):
+            return object()  # contract already open -- exempt from the concurrent-positions cap
+
+        def get_all_positions(self):
+            return [object()] * 10  # at the cap, but exempt applies before this is even checked
+
+        def submit_order(self, req):
+            return FakeOrder()
+
+    monkeypatch.setattr(execution, "trading_client2", FakeTradingClient2())
+
+    result = execution.buy_option(
+        "AAPL250117C00200000", 2, 3.20, "call", 200.0, "2025-01-17", 0.45, "test reasoning", "AAPL", "cycle-1"
+    )
+
+    assert result["status"] == "submitted"
+    with execution._state_lock:
+        del execution._option_positions["AAPL250117C00200000"]
 
 
 def test_sell_option_submits_order_and_drops_tracking(monkeypatch):

@@ -474,6 +474,40 @@ def call_floor_broker_option(state: DealerState, cfg) -> DealerState:
 
     action = state["signal"]["action"]
 
+    if action == "BUY":
+        blackout_label = _macro_blackout_active(cfg)
+        if blackout_label:
+            log(f"⏭️  option BUY for {state['symbol']} skipped -- macro blackout ({blackout_label})")
+            result = {
+                "status": "skipped",
+                "reason": "macro_blackout",
+                "detail": f"new BUY entries paused for macro blackout: {blackout_label}",
+            }
+            graph_slack_and_record(state, action, result)
+            return {**state, "execution_result": result}
+
+        cooldown_reason = _symbol_stop_cooldown_active(state["symbol"], cfg)
+        if cooldown_reason:
+            log(f"⏭️  option BUY for {state['symbol']} skipped -- {cooldown_reason}")
+            result = {
+                "status": "skipped",
+                "reason": "symbol_stop_cooldown",
+                "detail": f"new BUY entry paused: {cooldown_reason}",
+            }
+            graph_slack_and_record(state, action, result)
+            return {**state, "execution_result": result}
+
+        throttle_reason = _win_rate_throttle_active(cfg, state["symbol"])
+        if throttle_reason:
+            log(f"⏭️  option BUY for {state['symbol']} skipped -- {throttle_reason}")
+            result = {
+                "status": "skipped",
+                "reason": "win_rate_throttle",
+                "detail": f"new BUY entries paused: {throttle_reason}",
+            }
+            graph_slack_and_record(state, action, result)
+            return {**state, "execution_result": result}
+
     expiration = datetime.strptime(option_pick["expiration"], "%Y-%m-%d").date()
     today = datetime.now(pytz.timezone("US/Eastern")).date()
     dte = (expiration - today).days
@@ -492,6 +526,15 @@ def call_floor_broker_option(state: DealerState, cfg) -> DealerState:
             "status": "skipped",
             "reason": "delta_out_of_range",
             "detail": f"delta {delta} outside [{cfg.options_trading.target_delta_min}, {cfg.options_trading.target_delta_max}]",
+        }
+        graph_slack_and_record(state, action, result)
+        return {**state, "execution_result": result}
+
+    if not cfg.strategy.risk_per_trade_usd:
+        result = {
+            "status": "skipped",
+            "reason": "risk_per_trade_usd_not_configured",
+            "detail": "strategy.risk_per_trade_usd is not configured",
         }
         graph_slack_and_record(state, action, result)
         return {**state, "execution_result": result}
