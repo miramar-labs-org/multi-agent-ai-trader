@@ -175,7 +175,7 @@ def _classify_exit_event(event: dict) -> str | None:
 def _symbol_memory_text(symbol: str, cfg) -> str:
     """Returns compact recent same-symbol context for the Dealer prompt. This is advisory context
     only: DB failures fail open so a transient logging-store outage does not block decisions."""
-    if not cfg.strategy.get("enable_dealer_memory", True):
+    if not cfg.strategy.get("dealer_memory", {}).get("enabled", True):
         return ""
     days = cfg.strategy.get("symbol_memory_days", 2)
     limit = cfg.strategy.get("symbol_memory_limit", 8)
@@ -202,7 +202,7 @@ def _symbol_memory_text(symbol: str, cfg) -> str:
 def _symbol_stop_cooldown_active(symbol: str, cfg) -> str | None:
     """Blocks repeated same-symbol BUYs after recent stop-outs. This is deterministic risk
     control, separate from the LLM's interpretation of recent history."""
-    if not cfg.strategy.get("enable_symbol_stop_cooldown", True):
+    if not cfg.strategy.get("symbol_stop_cooldown", {}).get("enabled", True):
         return None
     days = cfg.strategy.get("symbol_stop_cooldown_days", 1)
     max_stops = cfg.strategy.get("max_symbol_stop_losses", 1)
@@ -228,7 +228,7 @@ def _win_rate_throttle_active(cfg, symbol: str | None = None) -> str | None:
     evaluating at all, so a handful of early trades can't trip the throttle on noise. Discretionary
     dealer-triggered SELLs, eod_flatten, and BUY opens are excluded from the count -- see
     _classify_exit_event."""
-    if not cfg.strategy.get("enable_win_rate_throttle", True):
+    if not cfg.strategy.get("win_rate_throttle", {}).get("enabled", True):
         return None
 
     since_date = (datetime.now(pytz.timezone("US/Eastern")) - timedelta(days=cfg.analyst.track_record_days)).date()

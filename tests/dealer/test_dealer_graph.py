@@ -103,7 +103,7 @@ def test_llm_call_includes_ohlcv_features_when_present(monkeypatch):
     cfg = OmegaConf.create(
         {
             "llm": {"base_url": "http://llm.test/v1", "model": "test-model", "temperature": 0.0},
-            "strategy": {"enable_dealer_memory": False},
+            "strategy": {"dealer_memory": {"enabled": False}},
         }
     )
     monkeypatch.setattr(graph, "ChatOpenAI", FakeChatOpenAI)
@@ -138,7 +138,7 @@ def test_llm_call_includes_recent_same_symbol_memory(monkeypatch):
     cfg = OmegaConf.create(
         {
             "llm": {"base_url": "http://llm.test/v1", "model": "test-model", "temperature": 0.0},
-            "strategy": {"enable_dealer_memory": True, "symbol_memory_days": 2, "symbol_memory_limit": 4},
+            "strategy": {"dealer_memory": {"enabled": True}, "symbol_memory_days": 2, "symbol_memory_limit": 4},
         }
     )
     monkeypatch.setattr(graph, "ChatOpenAI", FakeChatOpenAI)

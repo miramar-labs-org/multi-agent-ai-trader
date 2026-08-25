@@ -73,14 +73,17 @@ strategy:
   win_rate_min_sample: 5          # minimum completed TP/SL exits required before the win-rate
                                    # throttle evaluates at all, so a handful of early trades can't
                                    # trip it on noise
-  enable_win_rate_throttle: true  # feature gate: config-only change, no redeploy needed
+  win_rate_throttle:
+    enabled: true  # feature gate: config-only change, no redeploy needed
   win_rate_throttle_scope: symbol  # "symbol" avoids one cluster of bad names pausing all BUYs;
                                    # set "global" to restore portfolio-wide behavior
-  enable_symbol_stop_cooldown: true  # blocks same-symbol re-entry after recent stop-loss exits
+  symbol_stop_cooldown:
+    enabled: true  # blocks same-symbol re-entry after recent stop-loss exits
   symbol_stop_cooldown_days: 1       # lookback window for same-symbol stop-loss cooldown
   max_symbol_stop_losses: 1          # one stop-loss in the window pauses new BUYs for that symbol
-  enable_dealer_memory: true         # include recent same-symbol decisions/execution outcomes in
-                                     # Dealer's prompt so it can see failed re-entry patterns
+  dealer_memory:
+    enabled: true         # include recent same-symbol decisions/execution outcomes in
+                           # Dealer's prompt so it can see failed re-entry patterns
   symbol_memory_days: 2
   symbol_memory_limit: 8
   max_bid_ask_spread_pct: 0.03       # stock BUYs skip when spread/ask exceeds this fraction

@@ -49,10 +49,12 @@ strategy:
   risk_per_trade_usd: null        # recorded intent only -- see position_sizing note above
   max_concurrent_positions: 10    # recorded intent only -- analyst.max_universe_size already caps concurrent picks
   win_rate_throttle_scope: symbol
-  enable_symbol_stop_cooldown: true
+  symbol_stop_cooldown:
+    enabled: true
   symbol_stop_cooldown_days: 1
   max_symbol_stop_losses: 1
-  enable_dealer_memory: true
+  dealer_memory:
+    enabled: true
   symbol_memory_days: 2
   symbol_memory_limit: 8
   max_bid_ask_spread_pct: 0.03
