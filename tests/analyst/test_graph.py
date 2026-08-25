@@ -557,7 +557,7 @@ def _indicator_cfg(indicator_fetch_limit, enable_indicators=True, large_cap_symb
         {
             "analyst": {
                 "indicator_fetch_limit": indicator_fetch_limit,
-                "enable_indicators": enable_indicators,
+                "indicators": {"enabled": enable_indicators},
                 "large_cap_symbols": large_cap_symbols or [],
             },
             "taapi": {"min_request_interval_secs": 15},
@@ -687,7 +687,7 @@ def test_fetch_indicators_skipped_when_disabled_via_config(monkeypatch):
 def test_fetch_research_includes_news_and_headlines_when_enabled(monkeypatch):
     monkeypatch.setattr(graph.sources, "fetch_news", lambda days: "MGN announces earnings beat")
     monkeypatch.setattr(graph.sources, "fetch_yahoo_rss_headlines", lambda url: "Market rallies on Fed news")
-    cfg = OmegaConf.create({"analyst": {"news_days": 2, "yahoo_rss_url": "http://x", "enable_news": True}})
+    cfg = OmegaConf.create({"analyst": {"news_days": 2, "yahoo_rss_url": "http://x", "news": {"enabled": True}}})
     state = {"raw_candidates": [], "research_text": "", "indicator_text": "", "selection": None}
 
     result = graph.fetch_research(state, cfg)
@@ -702,7 +702,7 @@ def test_fetch_research_skipped_when_disabled_via_config(monkeypatch):
     calls = []
     monkeypatch.setattr(graph.sources, "fetch_news", lambda days: calls.append(1) or "news")
     monkeypatch.setattr(graph.sources, "fetch_yahoo_rss_headlines", lambda url: calls.append(1) or "headlines")
-    cfg = OmegaConf.create({"analyst": {"news_days": 2, "yahoo_rss_url": "http://x", "enable_news": False}})
+    cfg = OmegaConf.create({"analyst": {"news_days": 2, "yahoo_rss_url": "http://x", "news": {"enabled": False}}})
     state = {"raw_candidates": [], "research_text": "", "indicator_text": "", "selection": None}
 
     result = graph.fetch_research(state, cfg)
@@ -821,7 +821,7 @@ def test_llm_select_prompt_includes_pnl_text(monkeypatch):
 
 def _track_record_cfg(track_record_days, enable_track_record=True):
     return OmegaConf.create(
-        {"analyst": {"track_record_days": track_record_days, "enable_track_record": enable_track_record}}
+        {"analyst": {"track_record_days": track_record_days, "track_record": {"enabled": enable_track_record}}}
     )
 
 
@@ -893,7 +893,7 @@ def test_fetch_track_record_includes_pick_history_when_enabled(monkeypatch):
 
 
 def _pnl_cfg(enable_position_pnl=True):
-    return OmegaConf.create({"analyst": {"enable_position_pnl": enable_position_pnl}})
+    return OmegaConf.create({"analyst": {"position_pnl": {"enabled": enable_position_pnl}}})
 
 
 def _pnl_state():

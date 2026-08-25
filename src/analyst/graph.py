@@ -176,7 +176,7 @@ def discover_candidates(state: AnalystState, cfg) -> AnalystState:
 
 
 def fetch_research(state: AnalystState, cfg) -> AnalystState:
-    if not cfg.analyst.enable_news:
+    if not cfg.analyst.news.enabled:
         log("⏭️ news feeds disabled via config — skipping")
         return {**state, "research_text": ""}
     news = sources.fetch_news(cfg.analyst.news_days)
@@ -191,7 +191,7 @@ def fetch_indicators(state: AnalystState, cfg) -> AnalystState:
     `indicator_fetch_limit` candidates -- TAAPI's free-tier rate limit is 1 request/15s
     (cfg.taapi.min_request_interval_secs), and fetching every screened candidate would make the
     daily CronJob run take far longer than warranted for candidates the LLM is unlikely to pick."""
-    if not cfg.analyst.enable_indicators:
+    if not cfg.analyst.indicators.enabled:
         log("⏭️ indicators disabled via config — skipping")
         return {**state, "indicator_text": ""}
     ranked = sorted(state["raw_candidates"], key=_by_abs_change_pct, reverse=True)
@@ -231,7 +231,7 @@ def fetch_track_record(state: AnalystState, cfg) -> AnalystState:
     date bound, so on a midday run this DOES surface the same day's earlier morning-run picks
     (and any Dealer/Floor Broker activity on them since) as track record, which is useful signal
     for the midday LLM pass, not a bug."""
-    if not cfg.analyst.enable_track_record:
+    if not cfg.analyst.track_record.enabled:
         log("⏭️ track record disabled via config — skipping")
         return {**state, "track_record_text": ""}
 
@@ -281,7 +281,7 @@ def fetch_position_pnl(state: AnalystState, cfg) -> AnalystState:
     fetch_indicators: a transient Alpaca API error degrades to an empty snapshot for this run
     rather than failing the whole Analyst run, since this is supplementary context, not a trading
     gate."""
-    if not cfg.analyst.enable_position_pnl:
+    if not cfg.analyst.position_pnl.enabled:
         log("⏭️ position P&L snapshot disabled via config — skipping")
         return {**state, "pnl_text": ""}
 
