@@ -88,6 +88,18 @@ strategy:
   symbol_memory_limit: 8
   max_bid_ask_spread_pct: 0.03       # stock BUYs skip when spread/ask exceeds this fraction
 
+options_trading:
+  enabled: false            # top-level feature gate
+  dte_min: 14
+  dte_max: 45
+  dte_force_close: 3        # force-close regardless of P&L once DTE drops to/below this
+  target_delta_min: 0.30
+  target_delta_max: 0.60
+  min_open_interest: 100
+  min_volume: 10
+  options_slP: 0.50         # synthetic stop-loss, fraction of entry premium
+  options_tpP: 1.75         # synthetic take-profit, fraction of entry premium
+
 eod_flatten:
   enabled: true   # feature gate: when false, poll_eod_flatten() (src/floor_broker/main.py) short-
                    # circuits every iteration before touching the clock or Alpaca positions -- off
