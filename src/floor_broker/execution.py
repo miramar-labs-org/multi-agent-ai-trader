@@ -297,6 +297,44 @@ def check_crypto_stops() -> list[dict]:
     return events
 
 
+def check_option_stops() -> list[dict]:
+    cfg = load_config()
+    if not cfg.get("options_trading", {}).get("enabled", False):
+        return []
+
+    events = []
+    with _state_lock:
+        tracked = list(_option_positions.items())
+
+    today = datetime.now(pytz.timezone("US/Eastern")).date()
+    for contract_symbol, ctx in tracked:
+        try:
+            mid = get_current_option_mid_price(contract_symbol)
+        except APIError as exc:
+            log(f"💥  failed to fetch quote for tracked option {contract_symbol}: {exc}")
+            continue
+
+        expiration = datetime.strptime(ctx["expiration"], "%Y-%m-%d").date()
+        dte = (expiration - today).days
+        entry_premium = ctx["entry_premium"]
+        sl_price = entry_premium * cfg.options_trading.options_slP
+        tp_price = entry_premium * cfg.options_trading.options_tpP
+
+        if dte <= cfg.options_trading.dte_force_close:
+            reason = "dte_force_close"
+        elif mid <= sl_price:
+            reason = "stop_loss"
+        elif mid >= tp_price:
+            reason = "take_profit"
+        else:
+            continue
+
+        result = sell_option(contract_symbol, reason=reason)
+        events.append({"symbol": ctx["symbol"], "contract_symbol": contract_symbol, "reason": reason, "premium": mid, "sell_result": result})
+
+    return events
+
+
 def check_eod_flatten() -> list[dict]:
     """Feature-gated (strategy config eod_flatten.enabled, off by default). When enabled and
     Alpaca's live clock reports the market is within eod_flatten.minutes_before_close minutes of

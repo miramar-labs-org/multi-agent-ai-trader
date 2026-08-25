@@ -3,6 +3,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
+import pytz
 from alpaca.common.exceptions import APIError
 from alpaca.trading.enums import AssetClass, OrderSide, OrderStatus, OrderType
 from omegaconf import OmegaConf
@@ -1729,3 +1730,60 @@ def test_sell_option_submits_order_and_drops_tracking(monkeypatch):
     assert recorded_db["closed"][0] == ("AAPL250117C00200000", "take_profit", 4.50)
     with execution._state_lock:
         assert "AAPL250117C00200000" not in execution._option_positions
+
+
+def test_check_option_stops_is_noop_when_disabled(monkeypatch):
+    monkeypatch.setattr(execution, "load_config", lambda: OmegaConf.create({"options_trading": {"enabled": False}}))
+    with execution._state_lock:
+        execution._option_positions["AAPL250117C00200000"] = {
+            "symbol": "AAPL", "right": "call", "strike": 200.0, "expiration": "2099-01-17",
+            "delta": 0.45, "entry_premium": 3.20, "qty": 2,
+        }
+
+    events = execution.check_option_stops()
+
+    assert events == []
+    with execution._state_lock:
+        del execution._option_positions["AAPL250117C00200000"]
+
+
+def test_check_option_stops_triggers_stop_loss(monkeypatch):
+    cfg = OmegaConf.create({"options_trading": {"enabled": True, "options_slP": 0.50, "options_tpP": 1.75, "dte_force_close": 3}})
+    monkeypatch.setattr(execution, "load_config", lambda: cfg)
+    monkeypatch.setattr(execution, "get_current_option_mid_price", lambda contract_symbol: 1.50)  # entry 3.20 * 0.50 = 1.60 -> 1.50 <= 1.60 triggers SL
+    sell_calls = []
+    monkeypatch.setattr(execution, "sell_option", lambda contract_symbol, reason: sell_calls.append((contract_symbol, reason)) or {"status": "submitted", "detail": "x", "order_id": "o1"})
+
+    far_expiration = "2099-01-17"
+    with execution._state_lock:
+        execution._option_positions["AAPL250117C00200000"] = {
+            "symbol": "AAPL", "right": "call", "strike": 200.0, "expiration": far_expiration,
+            "delta": 0.45, "entry_premium": 3.20, "qty": 2,
+        }
+
+    events = execution.check_option_stops()
+
+    assert len(events) == 1
+    assert events[0]["reason"] == "stop_loss"
+    assert sell_calls == [("AAPL250117C00200000", "stop_loss")]
+
+
+def test_check_option_stops_force_closes_near_expiration(monkeypatch):
+    cfg = OmegaConf.create({"options_trading": {"enabled": True, "options_slP": 0.50, "options_tpP": 1.75, "dte_force_close": 3}})
+    monkeypatch.setattr(execution, "load_config", lambda: cfg)
+    monkeypatch.setattr(execution, "get_current_option_mid_price", lambda contract_symbol: 3.20)  # flat P&L, would not otherwise trigger
+    sell_calls = []
+    monkeypatch.setattr(execution, "sell_option", lambda contract_symbol, reason: sell_calls.append((contract_symbol, reason)) or {"status": "submitted", "detail": "x", "order_id": "o1"})
+
+    near_expiration = (datetime.now(pytz.timezone("US/Eastern")) + timedelta(days=1)).date().isoformat()
+    with execution._state_lock:
+        execution._option_positions["AAPL250117C00200000"] = {
+            "symbol": "AAPL", "right": "call", "strike": 200.0, "expiration": near_expiration,
+            "delta": 0.45, "entry_premium": 3.20, "qty": 2,
+        }
+
+    events = execution.check_option_stops()
+
+    assert len(events) == 1
+    assert events[0]["reason"] == "dte_force_close"
+    assert sell_calls == [("AAPL250117C00200000", "dte_force_close")]

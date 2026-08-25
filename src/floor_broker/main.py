@@ -72,6 +72,21 @@ def poll_bracket_fills():
                     event["sell_result"]["detail"],
                     price=event["bid_price"],
                 )
+            for event in execution.check_option_stops():
+                log(f"🎯 synthetic {event['reason']} triggered for {event['contract_symbol']} @ {event['premium']}")
+                slack.notify_floor_broker_result(
+                    event["symbol"],
+                    "SELL",
+                    event["sell_result"]["status"],
+                    f"synthetic {event['reason']} triggered @ {event['premium']}: {event['sell_result']['detail']}",
+                    reason=event["reason"],
+                )
+                db.record_floor_broker_event(
+                    event["symbol"],
+                    f"synthetic_{event['reason']}",
+                    event["sell_result"]["detail"],
+                    price=event["premium"],
+                )
         except Exception as exc:
             log(f"💥 bracket-fill poll failed: {exc}")
         time.sleep(BRACKET_FILL_POLL_INTERVAL_S)
