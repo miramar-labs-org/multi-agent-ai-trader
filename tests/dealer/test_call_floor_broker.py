@@ -14,9 +14,9 @@ def _cfg():
             "macro_blackout": {"enabled": False, "dates": []},
             "strategy": {
                 "min_confidence": 0.6,
-                "enable_win_rate_throttle": False,
-                "enable_symbol_stop_cooldown": False,
-                "enable_dealer_memory": False,
+                "win_rate_throttle": {"enabled": False},
+                "symbol_stop_cooldown": {"enabled": False},
+                "dealer_memory": {"enabled": False},
             },
             "analyst": {"track_record_days": 5},
         }
@@ -338,7 +338,7 @@ def test_classify_exit_event_ignores_non_exit_events():
 
 def _win_rate_cfg(min_win_rate=0.3, win_rate_min_sample=5):
     cfg = _cfg()
-    cfg.strategy.enable_win_rate_throttle = True
+    cfg.strategy.win_rate_throttle.enabled = True
     cfg.strategy.win_rate_throttle_scope = "global"
     cfg.strategy.min_win_rate = min_win_rate
     cfg.strategy.win_rate_min_sample = win_rate_min_sample
@@ -377,7 +377,7 @@ def test_buy_is_skipped_when_symbol_recently_stopped_out(monkeypatch):
     _silence_slack(monkeypatch)
     monkeypatch.setattr(graph, "_is_quad_witching_day", lambda d: False)
     cfg = _cfg()
-    cfg.strategy.enable_symbol_stop_cooldown = True
+    cfg.strategy.symbol_stop_cooldown.enabled = True
     cfg.strategy.symbol_stop_cooldown_days = 1
     cfg.strategy.max_symbol_stop_losses = 1
     monkeypatch.setattr(
@@ -401,7 +401,7 @@ def test_buy_proceeds_when_symbol_cooldown_has_no_recent_stop(monkeypatch):
     _silence_slack(monkeypatch)
     monkeypatch.setattr(graph, "_is_quad_witching_day", lambda d: False)
     cfg = _cfg()
-    cfg.strategy.enable_symbol_stop_cooldown = True
+    cfg.strategy.symbol_stop_cooldown.enabled = True
     monkeypatch.setattr(
         graph.db,
         "fetch_symbol_floor_broker_events_since",
@@ -468,7 +468,7 @@ def test_buy_proceeds_when_exit_sample_size_is_below_the_minimum(monkeypatch):
 
 
 def test_buy_proceeds_when_win_rate_throttle_disabled(monkeypatch):
-    """enable_win_rate_throttle: false must be a config-only no-op, matching macro_blackout's own
+    """win_rate_throttle.enabled: false must be a config-only no-op, matching macro_blackout's own
     feature-gate precedent -- the db call is never even made."""
     _silence_slack(monkeypatch)
     monkeypatch.setattr(graph, "_is_quad_witching_day", lambda d: False)
@@ -487,7 +487,7 @@ def test_buy_proceeds_when_win_rate_throttle_disabled(monkeypatch):
     monkeypatch.setattr(graph.requests, "post", lambda url, json, timeout: FakeResponse())
 
     cfg = _win_rate_cfg(min_win_rate=0.99, win_rate_min_sample=0)
-    cfg.strategy.enable_win_rate_throttle = False
+    cfg.strategy.win_rate_throttle.enabled = False
 
     result = graph.call_floor_broker(_state("BUY", budget=5000.0), cfg)
 

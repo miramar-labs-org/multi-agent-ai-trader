@@ -17,7 +17,7 @@ def main():
     langsmith.configure(cfg)
 
     is_midday_run = os.environ.get("ANALYST_RUN_LABEL") == "midday"
-    if is_midday_run and not cfg.analyst.enable_midday_run:
+    if is_midday_run and not cfg.analyst.midday_run.enabled:
         log("⏭️ midday run disabled via config — exiting without a graph run")
         return
 

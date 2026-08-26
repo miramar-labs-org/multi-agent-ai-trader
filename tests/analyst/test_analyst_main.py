@@ -14,7 +14,7 @@ class FakeGraph:
 
 
 def _cfg(enable_midday_run=False):
-    return OmegaConf.create({"analyst": {"enable_midday_run": enable_midday_run}})
+    return OmegaConf.create({"analyst": {"midday_run": {"enabled": enable_midday_run}}})
 
 
 def test_main_threads_stock_market_open_true_into_initial_state(monkeypatch):
@@ -47,7 +47,7 @@ def test_main_threads_stock_market_open_false_into_initial_state_on_a_closed_day
 def test_main_exits_before_building_the_graph_when_midday_run_disabled_via_config(monkeypatch):
     """The midday CronJob always fires on schedule -- the feature gate must short-circuit main()
     entirely (before build_graph()/graph.invoke() are even called) when
-    analyst.enable_midday_run is false, not just skip a downstream step."""
+    analyst.midday_run.enabled is false, not just skip a downstream step."""
     monkeypatch.setenv("ANALYST_RUN_LABEL", "midday")
     monkeypatch.setattr(main, "load_config", lambda: _cfg(enable_midday_run=False))
     monkeypatch.setattr(main.langsmith, "configure", lambda cfg: None)

@@ -136,16 +136,16 @@ Miramar platform endpoint.
 BUY signals are now gated locally in this order before the HTTP call:
 
 1. `macro_blackout` — whole-day scheduled macro/quad-witching pause.
-2. `strategy.enable_symbol_stop_cooldown` — same-symbol stop-loss cooldown, using
+2. `strategy.symbol_stop_cooldown.enabled` — same-symbol stop-loss cooldown, using
    `db.fetch_symbol_floor_broker_events_since()` and `_classify_exit_event()`.
-3. `strategy.enable_win_rate_throttle` — trailing TP/SL win-rate throttle. The scope is
+3. `strategy.win_rate_throttle.enabled` — trailing TP/SL win-rate throttle. The scope is
    `strategy.win_rate_throttle_scope`: `symbol` reads only same-symbol events; `global` restores
    the older portfolio-wide behavior.
 4. `strategy.min_confidence` — low-confidence BUY skip.
 5. Authorized-budget checks — held-only entries (`budget=0`) and `size_hint=0`.
 
 `llm_call()` also includes a compact "Recent same-symbol trading history" block when
-`strategy.enable_dealer_memory` is true. It is advisory prompt context only: DB read failures
+`strategy.dealer_memory.enabled` is true. It is advisory prompt context only: DB read failures
 log a warning and fail open, while the deterministic cooldown above is the hard re-entry guard.
 
 ## Floor Broker — the only order-placement path

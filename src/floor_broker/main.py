@@ -72,6 +72,21 @@ def poll_bracket_fills():
                     event["sell_result"]["detail"],
                     price=event["bid_price"],
                 )
+            for event in execution.check_option_stops():
+                log(f"🎯 synthetic {event['reason']} triggered for {event['contract_symbol']} @ {event['premium']}")
+                slack.notify_floor_broker_result(
+                    event["symbol"],
+                    "SELL",
+                    event["sell_result"]["status"],
+                    f"synthetic {event['reason']} triggered @ {event['premium']}: {event['sell_result']['detail']}",
+                    reason=event["reason"],
+                )
+                db.record_floor_broker_event(
+                    event["symbol"],
+                    f"synthetic_{event['reason']}",
+                    event["sell_result"]["detail"],
+                    price=event["premium"],
+                )
         except Exception as exc:
             log(f"💥 bracket-fill poll failed: {exc}")
         time.sleep(BRACKET_FILL_POLL_INTERVAL_S)
@@ -123,6 +138,51 @@ def poll_pending_fills():
                     )
         except Exception as exc:
             log(f"💥 pending-fill poll failed: {exc}")
+        time.sleep(PENDING_FILL_POLL_INTERVAL_S)
+
+
+def poll_pending_option_fills():
+    """Runs for the lifetime of the process, watching for the fill of option BUY orders
+    buy_option() itself submitted -- mirrors poll_pending_fills() but against account 2
+    (trading_client2), via execution.check_pending_option_fills(). _option_positions and the
+    options_trades DB row are only written on a confirmed fill (see check_pending_option_fills()'s
+    docstring); an order that never fills produces no phantom tracked state or DB row."""
+    while True:
+        try:
+            for event in execution.check_pending_option_fills():
+                action = event.get("action", "BUY")
+                reason = event["reason"] if action == "SELL" else "opening_position"
+                if event["kind"] == "fill":
+                    log(f"💰 option {action} filled for {event['contract_symbol']} @ {event['fill_price']}")
+                    slack.notify_floor_broker_result(
+                        event["symbol"],
+                        action,
+                        "executed",
+                        f"option {action.lower()} order filled: {event['order_id']}",
+                        reason=reason,
+                        fill_price=event["fill_price"],
+                    )
+                    db.record_floor_broker_event(
+                        event["symbol"],
+                        "fill",
+                        f"option {action.lower()} order filled: {event['order_id']}",
+                        qty=event.get("qty"),
+                        price=event["fill_price"],
+                    )
+                else:
+                    log(f"⚠️ option {action} {event['contract_symbol']} closed with no fill: {event['order_status']}")
+                    slack.notify_floor_broker_result(
+                        event["symbol"],
+                        action,
+                        "no_fill",
+                        f"option order {event['order_status']}, never filled: {event['order_id']}",
+                        reason=reason,
+                    )
+                    db.record_floor_broker_event(
+                        event["symbol"], "no_fill", f"option order {event['order_status']}, never filled: {event['order_id']}"
+                    )
+        except Exception as exc:
+            log(f"💥 pending-option-fill poll failed: {exc}")
         time.sleep(PENDING_FILL_POLL_INTERVAL_S)
 
 
@@ -202,6 +262,7 @@ def main():
     threading.Thread(target=poll_reconciliation, daemon=True).start()
     threading.Thread(target=poll_bracket_fills, daemon=True).start()
     threading.Thread(target=poll_pending_fills, daemon=True).start()
+    threading.Thread(target=poll_pending_option_fills, daemon=True).start()
     threading.Thread(target=poll_kill_switch, daemon=True).start()
     threading.Thread(target=poll_eod_flatten, daemon=True).start()
     threading.Thread(target=poll_symbol_bases, daemon=True).start()

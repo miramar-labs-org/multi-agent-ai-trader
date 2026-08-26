@@ -3,12 +3,12 @@ from datetime import datetime, timedelta
 
 import pytz
 import requests
-from alpaca.trading.enums import AssetClass
+from alpaca.trading.enums import AssetClass, PositionSide
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 
 from src.common import slack
-from src.common.alpaca_client import trading_client
+from src.common.alpaca_client import trading_client, trading_client2
 from src.common.config import load_config
 from src.common.logging import get_logger
 from src.common.market_calendar import get_stock_market_hours
@@ -18,6 +18,7 @@ log = get_logger("POWER")
 NAMESPACE = "multi-agent-ai-trader"
 POLL_INTERVAL_S = 5
 CRYPTO_FLAT_TIMEOUT_S = 60
+OPTIONS_FLAT_TIMEOUT_S = 60
 FLOOR_BROKER_READY_TIMEOUT_S = 60
 OLLAMA_STOP_TIMEOUT_S = 10
 OLLAMA_PRELOAD_TIMEOUT_S = 60
@@ -57,6 +58,21 @@ def _wait_until_crypto_flat(timeout_s: int = CRYPTO_FLAT_TIMEOUT_S) -> bool:
     deadline = time.monotonic() + timeout_s
     while True:
         positions = [p for p in trading_client.get_all_positions() if p.asset_class == AssetClass.CRYPTO]
+        if not positions:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(POLL_INTERVAL_S)
+
+
+def _wait_until_options_flat(timeout_s: int = OPTIONS_FLAT_TIMEOUT_S) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while True:
+        positions = [
+            p
+            for p in trading_client2.get_all_positions()
+            if p.asset_class == AssetClass.US_OPTION and getattr(p, "side", PositionSide.LONG) == PositionSide.LONG
+        ]
         if not positions:
             return True
         if time.monotonic() >= deadline:
@@ -115,8 +131,12 @@ def _start_ollama_model(cfg) -> None:
 def _power_down(apps_v1, cfg) -> None:
     """Dealer stops first (no state/positions, safe to kill immediately) so it can't fire a new
     BUY mid-flatten. Floor Broker stays up until crypto is confirmed flat -- it's the only thing
-    enforcing crypto's synthetic stop-loss/take-profit, so scaling it to 0 with a position still
-    open would leave that position completely unprotected overnight."""
+    enforcing crypto's synthetic stop-loss/take-profit, so scaling it to 0 with a crypto position
+    still open would leave that position completely unprotected overnight. Options are different:
+    they don't trade 24/7 and stay protected by dte_force_close/synthetic SL-TP resuming the moment
+    Floor Broker is back up, so a failed/incomplete options flatten is logged and Slack-notified but
+    never blocks power-down -- unlike crypto, retrying it later cannot succeed anyway once the
+    options market has closed for the day (flatten_all_options() submits DAY-TIF orders)."""
     _scale(apps_v1, "dealer", 0)
 
     if cfg.power_schedule.manage_ollama_model:
@@ -138,9 +158,33 @@ def _power_down(apps_v1, cfg) -> None:
         slack.notify_error("POWER", "power-down aborted -- crypto positions still open after flatten timeout")
         return
 
+    option_events = []
+    if cfg.power_schedule.get("flatten_options_before_powerdown", False):
+        try:
+            resp = requests.post(f"{cfg.floor_broker.base_url}/flatten-options", timeout=30)
+            resp.raise_for_status()
+            option_events = resp.json().get("events", [])
+            options_flat = _wait_until_options_flat()
+        except Exception as exc:
+            log(f"💥  flatten-options request/wait failed (power-down continuing): {exc}")
+            slack.notify_error("POWER", f"flatten-options request/wait failed, power-down continuing: {exc}")
+        else:
+            if not options_flat:
+                log(
+                    "⚠️  option positions still open after flatten timeout -- power-down continuing "
+                    "(they stay protected by dte_force_close/synthetic SL-TP once Floor Broker restarts)"
+                )
+                slack.notify_error(
+                    "POWER",
+                    "option positions still open after flatten timeout -- power-down continuing",
+                )
+
     _scale(apps_v1, "floor-broker", 0)
-    slack.notify_power_state("powered_down", f"{len(events)} crypto position(s) flattened first.")
-    log(f"✅ powered down ({len(events)} crypto position(s) flattened)")
+    slack.notify_power_state(
+        "powered_down",
+        f"{len(events)} crypto position(s) flattened first, {len(option_events)} option position(s) flattened first.",
+    )
+    log(f"✅ powered down ({len(events)} crypto position(s), {len(option_events)} option position(s) flattened)")
 
 
 def _power_up(apps_v1, cfg) -> None:

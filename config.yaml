@@ -22,8 +22,10 @@ trading:
   pollsecs: 600
   buffer: 15
   market_override: false
-  enable_stocks: true         # set false to pause Analyst/Dealer handling of equities entirely
-  enable_crypto: true         # crypto merge/trading verified live (BTC/USD test buy + Analyst crypto picks)
+  stocks:
+    enabled: true         # set false to pause Analyst/Dealer handling of equities entirely
+  crypto:
+    enabled: true         # crypto merge/trading verified live (BTC/USD test buy + Analyst crypto picks)
   crypto_taapi_exchange: "binance"   # TAAPI venue used for indicator requests on crypto symbols
 
 ohlcv_enrichment:
@@ -71,17 +73,33 @@ strategy:
   win_rate_min_sample: 5          # minimum completed TP/SL exits required before the win-rate
                                    # throttle evaluates at all, so a handful of early trades can't
                                    # trip it on noise
-  enable_win_rate_throttle: true  # feature gate: config-only change, no redeploy needed
+  win_rate_throttle:
+    enabled: true  # feature gate: config-only change, no redeploy needed
   win_rate_throttle_scope: symbol  # "symbol" avoids one cluster of bad names pausing all BUYs;
                                    # set "global" to restore portfolio-wide behavior
-  enable_symbol_stop_cooldown: true  # blocks same-symbol re-entry after recent stop-loss exits
+  symbol_stop_cooldown:
+    enabled: true  # blocks same-symbol re-entry after recent stop-loss exits
   symbol_stop_cooldown_days: 1       # lookback window for same-symbol stop-loss cooldown
   max_symbol_stop_losses: 1          # one stop-loss in the window pauses new BUYs for that symbol
-  enable_dealer_memory: true         # include recent same-symbol decisions/execution outcomes in
-                                     # Dealer's prompt so it can see failed re-entry patterns
+  dealer_memory:
+    enabled: true         # include recent same-symbol decisions/execution outcomes in
+                           # Dealer's prompt so it can see failed re-entry patterns
   symbol_memory_days: 2
   symbol_memory_limit: 8
   max_bid_ask_spread_pct: 0.03       # stock BUYs skip when spread/ask exceeds this fraction
+
+options_trading:
+  enabled: false            # top-level feature gate
+  dte_min: 14
+  dte_max: 45
+  dte_force_close: 3        # force-close regardless of P&L once DTE drops to/below this
+  target_delta_min: 0.30
+  target_delta_max: 0.60
+  min_open_interest: 100
+  min_volume: 10
+  options_slP: 0.50         # synthetic stop-loss, fraction of entry premium
+  options_tpP: 1.75         # synthetic take-profit, fraction of entry premium
+  max_notional_usd: 2000    # hard cap on a single option order's live-quoted notional (qty * mid-price * 100); re-quoted against the market at BUY time, not the LLM-claimed premium (20x strategy.risk_per_trade_usd's default of 100)
 
 eod_flatten:
   enabled: true   # feature gate: when false, poll_eod_flatten() (src/floor_broker/main.py) short-
@@ -122,6 +140,18 @@ power_schedule:
                                # power-up -- it's an optimization, not a safety control.
                                            # Stocks need no equivalent flag: eod_flatten already
                                            # unconditionally flattens them near close.
+  flatten_options_before_powerdown: false  # unlike crypto, options don't trade 24/7 and are already
+                                            # force-closed by dte_force_close well before expiration --
+                                            # this exists purely as an operator escape hatch, mirroring
+                                            # flatten_crypto_before_powerdown's role, not because an
+                                            # open option position left overnight is otherwise as
+                                            # exposed as crypto is. Off by default: even when enabled,
+                                            # a failed/incomplete flatten never blocks power-down (see
+                                            # _power_down in power_scheduler/main.py) -- retrying after
+                                            # the options market has closed for the day cannot succeed
+                                            # anyway, and the position stays protected by
+                                            # dte_force_close/synthetic SL-TP once Floor Broker is
+                                            # back up.
 
 earnings_blackout:
   enabled: true    # feature gate: when false, discover_candidates() never calls Finnhub and the
@@ -195,24 +225,29 @@ eod_report:
 analyst:
   schedule: "55 8 * * *"      # informational copy of the CronJob's own spec.schedule — 08:55 America/New_York
                                # daily (spec.timeZone), ~30min before the 9:30 ET open
-  enable_midday_run: true     # feature gate: optional second Analyst run at ~12:30pm ET to catch
-                               # intraday movers/news the 08:55 run missed. Opt-in, now enabled.
-                               # Toggling this is a config-only change -- no rebuild/redeploy needed,
-                               # see src/common/config.py.
+  midday_run:
+    enabled: true     # feature gate: optional second Analyst run at ~12:30pm ET to catch
+                      # intraday movers/news the 08:55 run missed. Opt-in, now enabled.
+                      # Toggling this is a config-only change -- no rebuild/redeploy needed,
+                      # see src/common/config.py.
   midday_schedule: "30 12 * * *"   # informational copy of k8s/analyst-midday-cronjob-k3s.yaml's own
                                     # spec.schedule -- not read by code, keep in sync by hand (same
                                     # convention as the `schedule` field above)
-  enable_news: true           # feature gate: Alpaca News API + Yahoo RSS headlines as an Analyst input
-  enable_indicators: true     # feature gate: TAAPI technical indicator data as an Analyst input
-  enable_track_record: true   # feature gate: Analyst's own recent pick history + Dealer/Floor
-                               # Broker outcomes as an Analyst input (read-only Postgres query)
+  news:
+    enabled: true           # feature gate: Alpaca News API + Yahoo RSS headlines as an Analyst input
+  indicators:
+    enabled: true     # feature gate: TAAPI technical indicator data as an Analyst input
+  track_record:
+    enabled: true   # feature gate: Analyst's own recent pick history + Dealer/Floor
+                     # Broker outcomes as an Analyst input (read-only Postgres query)
   track_record_days: 5        # lookback window in calendar days; excludes today by construction
                                # -- this node runs before write_portfolio's DB write in the same run
-  enable_position_pnl: true   # feature gate: live unrealized P&L snapshot of currently-open Alpaca
-                               # positions (stocks + crypto) as an Analyst input -- a fresh
-                               # trading_client.get_all_positions() call each run, point-in-time
-                               # only, not persisted, not compared across days; complements the
-                               # qualitative track_record above rather than replacing it
+  position_pnl:
+    enabled: true   # feature gate: live unrealized P&L snapshot of currently-open Alpaca
+                     # positions (stocks + crypto) as an Analyst input -- a fresh
+                     # trading_client.get_all_positions() call each run, point-in-time
+                     # only, not persisted, not compared across days; complements the
+                     # qualitative track_record above rather than replacing it
   max_universe_size: 10
   default_budget: 5000
   max_total_budget_usd: 50000  # last-line-of-defense cap on the sum of every pick's budget in one
@@ -252,7 +287,7 @@ analyst:
     large_cap_pct: 0.40         # fraction of pool_size drawn from large_cap_symbols
     crypto_pct: 0.30            # fraction of pool_size drawn from crypto (screener movers + the
                                  # fixed CRYPTO_WATCHLIST); silently redistributed to the other
-                                 # buckets when trading.enable_crypto is false
+                                 # buckets when trading.crypto.enabled is false
     screener_pct: 0.30          # fraction of pool_size drawn from today's screener movers/most-
                                  # actives ("weird stocks"), excluding any symbol already in
                                  # large_cap_symbols

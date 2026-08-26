@@ -1,9 +1,12 @@
 import json
+import re
 import threading
 import time
+from datetime import datetime
 
+import pytz
 from alpaca.common.exceptions import APIError
-from alpaca.trading.enums import AssetClass, OrderClass, OrderSide, OrderStatus, OrderType, TimeInForce
+from alpaca.trading.enums import AssetClass, OrderClass, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce
 from alpaca.trading.requests import (
     GetOrderByIdRequest,
     GetOrdersRequest,
@@ -13,7 +16,14 @@ from alpaca.trading.requests import (
 )
 
 from src.common import db, kill_switch
-from src.common.alpaca_client import get_current_ask_price, get_current_bid_price, trading_client
+from src.common.alpaca_client import (
+    get_current_ask_price,
+    get_current_bid_price,
+    get_current_option_ask_price,
+    get_current_option_mid_price,
+    trading_client,
+    trading_client2,
+)
 from src.common.config import load_config
 from src.common.logging import get_logger
 from src.common.symbols import alpaca_order_symbol, canonical_crypto_symbol, is_usd_crypto_symbol
@@ -25,6 +35,26 @@ MIN_CRYPTO_NOTIONAL = 10.0  # Alpaca rejects a crypto notional below this (code 
 ORDER_NOT_FOUND_CODE = 40410000  # Alpaca's code for "no order exists with that id"
 
 _TERMINAL_NO_FILL = {OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED}
+
+# Options-only (account 2) terminal/non-terminal classification for check_pending_option_fills().
+# Deliberately NOT shared with _TERMINAL_NO_FILL (account 1's check_pending_fills() uses that one
+# and is out of scope for the options mechanism). Everything NOT in this set is terminal for
+# options pending-fill purposes -- fix-loop round 2, finding 1 (remaining half): the prior
+# `!= PARTIALLY_FILLED` check correctly handled the with-fill branch but the no-fill branch's
+# `in _TERMINAL_NO_FILL` only caught CANCELED/EXPIRED/REJECTED, leaking any other zero-fill
+# terminal status (DONE_FOR_DAY, REPLACED, STOPPED, SUSPENDED) forever. Verified against every
+# member of alpaca.trading.enums.OrderStatus (17 total).
+_OPTION_NON_TERMINAL = {
+    OrderStatus.NEW,
+    OrderStatus.PARTIALLY_FILLED,
+    OrderStatus.ACCEPTED,
+    OrderStatus.PENDING_NEW,
+    OrderStatus.ACCEPTED_FOR_BIDDING,
+    OrderStatus.HELD,
+    OrderStatus.PENDING_CANCEL,
+    OrderStatus.PENDING_REPLACE,
+    OrderStatus.PENDING_REVIEW,
+}
 
 _RECONCILE_MAX_STARTUP_ATTEMPTS = 5
 _RECONCILE_BACKOFF_BASE_S = 5.0
@@ -71,6 +101,21 @@ _pending_fills: dict[str, dict] = {}
 # still open at the time, silently losing its stop/target until the next manual Dealer SELL.
 _crypto_stops: dict[str, tuple[float, float]] = {}
 
+# Tracks every open option position this process itself opened, keyed by contract_symbol, value
+# {symbol, right, strike, expiration, delta, entry_premium, qty}. Options have no native bracket/
+# OCO support any more than crypto does, so check_option_stops() below is the entire synthetic
+# exit mechanism for options -- same in-memory-only, no-restart-recovery caveat as _crypto_stops.
+_option_positions: dict[str, dict] = {}
+
+# Tracks every option BUY order buy_option() itself submitted, keyed by order id, so
+# check_pending_option_fills() can later confirm the fill and only then commit the position into
+# _option_positions and record it to the DB -- mirrors _pending_fills/check_pending_fills() for the
+# stock/crypto path, except this one polls trading_client2 (account 2, options-only) since option
+# orders never touch trading_client (account 1) and so cannot share that dict or poller. In-memory
+# only, same restart caveat as _pending_fills: an option BUY that fills in the gap between the pod
+# dying and reconstruct_tracked_state() running still produces no Slack notice for that fill.
+_pending_option_fills: dict[str, dict] = {}
+
 # False from process start until reconcile_tracked_state_once() has succeeded at least once.
 # buy() refuses new BUYs while this is False (see below) -- submitting a fresh order before
 # Alpaca's live open-order state has been reconciled into _pending_fills/_tracked_brackets risks
@@ -88,6 +133,14 @@ def _is_order_not_found(exc: APIError) -> bool:
         return exc.code == ORDER_NOT_FOUND_CODE
     except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
         return False
+
+
+def _is_position_not_found_error(exc: APIError) -> bool:
+    """True only for a confirmed HTTP 404 (no such position). Any other status -- or an error shape
+    with no discoverable HTTP status -- must be treated as transient rather than assumed to mean
+    not-found, since dropping tracked state should require positive confirmation, not just an
+    unparseable or non-404 error."""
+    return exc.status_code == 404
 
 
 def _pending_fills_snapshot() -> list[tuple[str, dict]]:
@@ -160,6 +213,58 @@ def _set_pending_fill(order_id: str, ctx: dict) -> None:
         _pending_fills[order_id] = ctx
 
 
+def _pending_option_fills_snapshot() -> list[tuple[str, dict]]:
+    with _state_lock:
+        return [(order_id, ctx.copy()) for order_id, ctx in _pending_option_fills.items()]
+
+
+def _drop_pending_option_fill(order_id: str) -> None:
+    with _state_lock:
+        _pending_option_fills.pop(order_id, None)
+
+
+def _increment_pending_option_poll_failures(order_id: str) -> int:
+    with _state_lock:
+        ctx = _pending_option_fills.get(order_id)
+        if ctx is None:
+            return 0
+        ctx["poll_failures"] = ctx.get("poll_failures", 0) + 1
+        return ctx["poll_failures"]
+
+
+def _clear_pending_option_poll_failures(order_id: str) -> None:
+    with _state_lock:
+        ctx = _pending_option_fills.get(order_id)
+        if ctx is not None:
+            ctx.pop("poll_failures", None)
+
+
+def _set_pending_option_fill(order_id: str, ctx: dict) -> None:
+    with _state_lock:
+        _pending_option_fills[order_id] = ctx
+
+
+def _drop_pending_option_fills_for_contract(contract_symbol: str) -> None:
+    """Drops every _pending_option_fills entry tracking contract_symbol -- called at every
+    sell_option() exit that drops (or, since external review finding 1, is about to replace) tracking
+    for a contract (fix-loop round 1, finding 3). A partially-filled BUY order stays in
+    _pending_option_fills until fully terminal (finding 1), so there's a window where
+    check_option_stops() can sell the already-filled portion of a position via sell_option() while an
+    outstanding partial-fill BUY for that same contract is still tracked here. Left alone, the next
+    check_pending_option_fills() poll would resurrect _option_positions for a contract whose sell is
+    already in flight (or, worse, already sold and DB-closed), leaving a phantom in-memory-only
+    position with no DB backing. Deliberately does not touch the underlying Alpaca order -- no
+    cancel_related_orders() call -- this is in-memory tracking cleanup only; the order itself is
+    left to resolve on its own (self-limiting: the next poll or sell_option() call finds no position
+    and pops).
+
+    Must be called while _state_lock is already held (every call site in sell_option() already holds
+    it around this call)."""
+    stale_order_ids = [order_id for order_id, ctx in _pending_option_fills.items() if ctx.get("contract_symbol") == contract_symbol]
+    for order_id in stale_order_ids:
+        _pending_option_fills.pop(order_id, None)
+
+
 def _stop_tracking_symbol(symbol: str) -> None:
     with _state_lock:
         _tracked_brackets.pop(symbol, None)
@@ -205,6 +310,204 @@ def check_pending_fills() -> list[dict]:
         elif order.status in _TERMINAL_NO_FILL:
             events.append({**ctx, "kind": "terminal", "order_id": order_id, "order_status": order.status.value})
             _drop_pending_fill(order_id)
+
+    return events
+
+
+def check_pending_option_fills() -> list[dict]:
+    """Polls every pending option order for its own fill -- both BUY orders buy_option() itself
+    submitted and, since external review finding 1, SELL orders sell_option() submitted -- mirroring
+    check_pending_fills() but against trading_client2 (account 2, options-only) -- option orders never
+    touch trading_client (account 1), so the two mechanisms cannot share one dict or one poller.
+    Entries are distinguished by ctx["action"] ("BUY" or "SELL"), each handled by its own branch below.
+
+    BUY branch: _option_positions and the options_trades DB row are only written here, on a confirmed
+    fill, using the real fill_price -- never in buy_option() itself, which only knows the pre-trade
+    quoted ask. This is what stops a rejected/canceled/unfilled option BUY from leaving behind phantom
+    tracked state, and what keeps check_option_stops()'s synthetic SL/TP math anchored to the real
+    entry price rather than a stale pre-trade quote.
+
+    SELL branch (external review finding 1): mirrors the BUY branch's confirmed-fill gating so an
+    option exit is only reported/DB-closed once Alpaca actually confirms the fill, not on submit --
+    sell_option() itself no longer pops _option_positions or closes the DB row synchronously; it only
+    registers the pending SELL here. A terminal no-fill SELL (canceled/rejected/expired) leaves
+    _option_positions tracked, exactly as if the sell had never been attempted. Unlike the BUY branch,
+    a PARTIALLY_FILLED SELL whose order is still non-terminal is left alone entirely -- no DB write,
+    no event, no state change -- until the order finishes filling or goes terminal; closing on the
+    first partial fill would drop protection for real still-open qty at Alpaca (external review
+    finding 2, 2026-08-26 round 2). And once such a SELL does go terminal without having filled the
+    whole tracked qty (e.g. canceled after only 1 of 2 contracts sold), the position is not popped
+    wholesale -- only the sold qty is subtracted from _option_positions, the DB row is updated (not
+    closed) with the remaining qty, and the position stays tracked/protected for the remainder
+    (external review finding 1, 2026-08-26 round 3).
+
+    Same transient-vs-terminal distinction as check_pending_fills: a non-404 APIError keeps the order
+    tracked and just records the failure; only a confirmed 404 drops it without a fill ever observed.
+
+    A PARTIALLY_FILLED BUY order updates _option_positions and the DB row on every poll but stays in
+    _pending_option_fills -- the first observation of any fill (partial or full) does the initial
+    DB INSERT (db.record_options_trade_opened) and emits the one "fill" event/Slack notification for
+    this order id; every later observation of the same still-open order instead does a DB UPDATE
+    (db.record_options_trade_updated) and emits no new event, keyed off ctx["db_row_opened"] (which
+    may already be seeded True by reconcile_tracked_state_once() if this order was reconstructed for
+    a contract that already had an open DB row -- see finding 2, fix-loop round 1). The entry is only
+    dropped from _pending_option_fills once order.status leaves _OPTION_NON_TERMINAL (fix-loop round
+    2, finding 1's remaining half) -- this now covers every real Alpaca terminal status, with or
+    without a fill (e.g. done_for_day, replaced, stopped, suspended), not just
+    FILLED/CANCELED/EXPIRED/REJECTED, so an unusual status never leaks this entry forever. The same
+    set is used for the zero-fill branch below, so PENDING_CANCEL/PENDING_REPLACE/PENDING_REVIEW are
+    correctly kept non-terminal in both branches.
+
+    check_pending_option_fills() re-checks _pending_option_fills membership under _state_lock
+    immediately before writing _option_positions or making the terminal-drop/reseed decision
+    (fix-loop round 2, new issue A) -- get_order_by_id() above is a network call made outside any
+    lock, so a concurrent sell_option() can drop this order's tracking in that window; if it did,
+    this poll skips the order entirely rather than resurrecting a phantom position or orphaning a
+    DB row."""
+    events = []
+    for order_id, ctx in _pending_option_fills_snapshot():
+        try:
+            order = trading_client2.get_order_by_id(order_id)
+        except APIError as exc:
+            if _is_order_not_found(exc):
+                log(f"⚠️  pending option order {order_id} ({ctx['contract_symbol']}) no longer exists on Alpaca -- dropping")
+                _drop_pending_option_fill(order_id)
+            else:
+                failures = _increment_pending_option_poll_failures(order_id)
+                log(f"💥  poll failure #{failures} for pending option order {order_id} ({ctx['contract_symbol']}): {exc}")
+            continue
+
+        _clear_pending_option_poll_failures(order_id)
+        ctx.pop("poll_failures", None)
+
+        if ctx.get("action") == "SELL":
+            # Only a confirmed *terminal* fill (or a zero-fill terminal status) resolves this SELL --
+            # a PARTIALLY_FILLED SELL whose order is still open (still in _OPTION_NON_TERMINAL) leaves
+            # real qty still open at Alpaca; treating that first partial fill as done would drop
+            # check_option_stops()'s protection for the unsold remainder and report the trade closed
+            # while it isn't (external review finding 2, 2026-08-26 round 2 -- the first version of
+            # this fix, external review finding 1, 2026-08-26, closed _option_positions/the DB row on
+            # ANY observed fill, partial or not). This entry is deliberately left tracked and
+            # untouched in that case -- the next poll re-checks the same order until it either
+            # finishes filling or goes terminal.
+            is_terminal = order.status not in _OPTION_NON_TERMINAL
+            if order.filled_avg_price is not None:
+                if not is_terminal:
+                    continue
+                fill_price = float(order.filled_avg_price)
+                filled_qty = int(float(order.filled_qty)) if getattr(order, "filled_qty", None) else None
+                with _state_lock:
+                    if order_id not in _pending_option_fills:
+                        # A concurrent poll or another sell_option() call already handled this order
+                        # -- same resurrection guard as the BUY branch below (fix-loop round 2, new
+                        # issue A).
+                        continue
+                    position = _option_positions.get(ctx["contract_symbol"])
+                    tracked_qty = position["qty"] if position else None
+                    entry_premium = position["entry_premium"] if position else None
+                    # A terminal SELL (e.g. the remainder got canceled/expired after only partially
+                    # filling) doesn't necessarily mean the whole tracked position sold -- sell_option()
+                    # always sizes its order to the full tracked qty at submit time, so filled_qty short
+                    # of tracked_qty means real qty is still open at Alpaca (external review finding 1,
+                    # 2026-08-26 round 3). remaining_qty defaults to 0 (treated as a full close) if
+                    # either qty is unknown -- the same "when in doubt, don't leave a phantom untracked
+                    # position half-closed" default the pre-round-3 code always used.
+                    remaining_qty = tracked_qty - filled_qty if tracked_qty is not None and filled_qty is not None else 0
+                    if remaining_qty > 0:
+                        position["qty"] = remaining_qty
+                        fully_closed = False
+                    else:
+                        _option_positions.pop(ctx["contract_symbol"], None)
+                        fully_closed = True
+                    _pending_option_fills.pop(order_id, None)
+                if fully_closed:
+                    db.record_options_trade_closed(ctx["contract_symbol"], ctx["reason"], fill_price)
+                else:
+                    log(
+                        f"⚠️  option SELL {order_id} for {ctx['contract_symbol']} went terminal after only "
+                        f"partially filling ({filled_qty}/{tracked_qty}) -- {remaining_qty} still open at "
+                        "Alpaca, position stays tracked for the remainder"
+                    )
+                    # entry_premium (cost basis of the still-open remainder), not fill_price (this
+                    # SELL's exit price), is what belongs in the still-open row -- record_options_trade_
+                    # updated() sets both columns together (it's designed for a BUY's running average
+                    # cost as it fills further), so entry_premium must be re-passed unchanged here.
+                    db.record_options_trade_updated(ctx["contract_symbol"], entry_premium, remaining_qty)
+                event = {**ctx, "kind": "fill", "order_id": order_id, "fill_price": fill_price}
+                if filled_qty is not None:
+                    event["qty"] = float(filled_qty)
+                events.append(event)
+            elif is_terminal:
+                with _state_lock:
+                    _pending_option_fills.pop(order_id, None)
+                events.append({**ctx, "kind": "terminal", "order_id": order_id, "order_status": order.status.value})
+            continue
+
+        if order.filled_avg_price is not None:
+            fill_price = float(order.filled_avg_price)
+            filled_qty = int(float(order.filled_qty)) if getattr(order, "filled_qty", None) else ctx["qty"]
+            db_row_was_open = ctx.get("db_row_opened", False)
+            # Snapshot the fill event now, before ctx is possibly mutated below (db_row_opened is
+            # set True inside the lock for a still-open partial fill) -- this preserves the
+            # pre-round-2 event shape (no db_row_opened key ever leaking into the emitted event).
+            fill_event = None if db_row_was_open else {**ctx, "kind": "fill", "order_id": order_id, "fill_price": fill_price, "qty": filled_qty}
+            # Terminal here means order.status has left _OPTION_NON_TERMINAL: a full fill, or a
+            # partial fill that will never grow further because the order itself resolved
+            # (canceled/expired/rejected/done_for_day/replaced/stopped/suspended after partially
+            # filling). Fix-loop round 2, finding 1's remaining half.
+            is_terminal = order.status not in _OPTION_NON_TERMINAL
+            with _state_lock:
+                if order_id not in _pending_option_fills:
+                    # A concurrent sell_option() (or another poll) already dropped this contract's
+                    # tracking between the get_order_by_id() call above and this lock -- the
+                    # position was sold out from under this poll. Do not resurrect
+                    # _option_positions/_pending_option_fills, and do not write a DB row for it
+                    # (fix-loop round 2, new issue A).
+                    continue
+                _option_positions[ctx["contract_symbol"]] = {
+                    "symbol": ctx["symbol"],
+                    "right": ctx["right"],
+                    "strike": ctx["strike"],
+                    "expiration": ctx["expiration"],
+                    "delta": ctx["delta"],
+                    "entry_premium": fill_price,
+                    "qty": filled_qty,
+                }
+                if is_terminal:
+                    _pending_option_fills.pop(order_id, None)
+                else:
+                    ctx["db_row_opened"] = True
+                    _pending_option_fills[order_id] = ctx
+
+            if db_row_was_open:
+                db.record_options_trade_updated(ctx["contract_symbol"], fill_price, filled_qty)
+            else:
+                # Re-check _option_positions right before the INSERT (external review finding 2,
+                # 2026-08-26): the in-memory write above happened under _state_lock, released before
+                # this DB call, so a concurrent sell_option() + confirmed SELL fill could already have
+                # closed this same contract in the gap, whose db.record_options_trade_closed() UPDATE
+                # then no-ops (no open row exists yet) -- inserting here afterward would leave a
+                # phantom "open" row for a position that's actually closed. Skipping the INSERT when
+                # the position's no longer tracked avoids that phantom row; the tradeoff is losing
+                # this one trade's DB record entirely in that narrow window, which is judged better
+                # than a permanently-wrong open row. Still emits the fill event either way so the
+                # BUY's own fill is never silently dropped from Slack/notifications.
+                with _state_lock:
+                    still_open = ctx["contract_symbol"] in _option_positions
+                if still_open:
+                    db.record_options_trade_opened(
+                        ctx["symbol"], ctx["contract_symbol"], ctx["right"], ctx["strike"], ctx["expiration"],
+                        ctx["delta"], fill_price, filled_qty, ctx["reasoning"], ctx["cycle_id"],
+                    )
+                else:
+                    log(f"⚠️  option {ctx['contract_symbol']} BUY fill confirmed but position was already closed by a concurrent SELL -- skipping stale DB insert")
+                # Emit the fill event (and therefore the one Slack/DB notification) only on the
+                # first fill observed for this order -- otherwise a slowly-filling partial order
+                # would re-notify on every poll tick until it finishes.
+                events.append(fill_event)
+        elif order.status not in _OPTION_NON_TERMINAL:
+            events.append({**ctx, "kind": "terminal", "order_id": order_id, "order_status": order.status.value})
+            _drop_pending_option_fill(order_id)
 
     return events
 
@@ -283,6 +586,51 @@ def check_crypto_stops() -> list[dict]:
     return events
 
 
+def check_option_stops() -> list[dict]:
+    """Runs unconditionally regardless of options_trading.enabled -- that flag only gates opening
+    NEW option positions (see select_option_contract/call_floor_broker_option in dealer/graph.py); a
+    position that's already open must stay protected by its synthetic SL/TP/DTE-force-close even
+    after the flag is flipped off as an emergency rollback. Naturally a no-op whenever
+    _option_positions is empty, matching check_crypto_stops(), which has no enabled-flag gate at
+    all."""
+    cfg = load_config()
+    events = []
+    with _state_lock:
+        tracked = list(_option_positions.items())
+
+    today = datetime.now(pytz.timezone("US/Eastern")).date()
+    for contract_symbol, ctx in tracked:
+        try:
+            mid = get_current_option_mid_price(contract_symbol)
+        except (APIError, KeyError, TypeError) as exc:
+            log(f"💥  failed to fetch quote for tracked option {contract_symbol}: {exc}")
+            continue
+
+        try:
+            expiration = datetime.strptime(ctx["expiration"], "%Y-%m-%d").date()
+        except (ValueError, TypeError) as exc:
+            log(f"💥  malformed expiration {ctx['expiration']!r} for tracked option {contract_symbol}: {exc}")
+            continue
+        dte = (expiration - today).days
+        entry_premium = ctx["entry_premium"]
+        sl_price = entry_premium * cfg.options_trading.options_slP
+        tp_price = entry_premium * cfg.options_trading.options_tpP
+
+        if dte <= cfg.options_trading.dte_force_close:
+            reason = "dte_force_close"
+        elif mid <= sl_price:
+            reason = "stop_loss"
+        elif mid >= tp_price:
+            reason = "take_profit"
+        else:
+            continue
+
+        result = sell_option(contract_symbol, reason=reason)
+        events.append({"symbol": ctx["symbol"], "contract_symbol": contract_symbol, "reason": reason, "premium": mid, "sell_result": result})
+
+    return events
+
+
 def check_eod_flatten() -> list[dict]:
     """Feature-gated (strategy config eod_flatten.enabled, off by default). When enabled and
     Alpaca's live clock reports the market is within eod_flatten.minutes_before_close minutes of
@@ -350,6 +698,28 @@ def flatten_all_crypto(reason: str = "power_down_flatten") -> list[dict]:
     return events
 
 
+def flatten_all_options(reason: str = "power_down_flatten") -> list[dict]:
+    """Force-sells every open LONG option position, no market-clock gating. Used by power_scheduler
+    right before it scales floor-broker to 0 -- check_option_stops()'s SL/TP/DTE-force-close
+    protection is only enforced by this process's own poll loop, so an open option position left
+    behind while the pod is scaled down would be completely unprotected until the next session. This
+    system never itself opens a short option position, so a short reaching this list would only be
+    some other actor's position -- skipped rather than sold, since selling a short would open MORE
+    short instead of closing it (sell_option() itself refuses this too, as defense in depth)."""
+    positions = [
+        p
+        for p in trading_client2.get_all_positions()
+        if p.asset_class == AssetClass.US_OPTION and getattr(p, "side", PositionSide.LONG) == PositionSide.LONG
+    ]
+
+    events = []
+    for position in positions:
+        result = sell_option(position.symbol, reason=reason)
+        if result["status"] != "skipped":
+            events.append({"symbol": position.symbol, "reason": reason, "sell_result": result})
+    return events
+
+
 def is_state_reconciled() -> bool:
     with _state_lock:
         return _state_reconciled
@@ -390,6 +760,109 @@ def _rebuild_crypto_stops_from_positions(positions, cfg) -> int:
             if symbol in _crypto_stops or has_pending_buy:
                 continue
             _crypto_stops[symbol] = (reference_price * cfg.strategy.crypto_slP, reference_price * cfg.strategy.crypto_tpP)
+        restored += 1
+    return restored
+
+
+_OCC_SYMBOL_RE = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
+
+
+def _parse_occ_contract_symbol(contract_symbol: str) -> dict | None:
+    """Parses an OCC-standard option contract symbol (e.g. "AAPL250117C00200000" -> root AAPL,
+    expiration 2025-01-17, call, strike $200.00) with no DB dependency, mirroring
+    _crypto_reference_price's DB-free reconstruction for crypto. Returns None if the symbol doesn't
+    match the OCC format."""
+    m = _OCC_SYMBOL_RE.match(contract_symbol)
+    if m is None:
+        return None
+    root, yymmdd, right_code, strike_digits = m.groups()
+    try:
+        expiration = datetime.strptime(yymmdd, "%y%m%d").date()
+    except ValueError:
+        return None
+    return {
+        "symbol": root,
+        "right": "call" if right_code == "C" else "put",
+        "strike": int(strike_digits) / 1000,
+        "expiration": expiration.isoformat(),
+    }
+
+
+def _rebuild_option_positions_from_positions(positions, open_trades: list[dict]) -> int:
+    """Rebuilds _option_positions from Alpaca's own open-positions state, cross-referenced against
+    options_trades for the fields Alpaca's Position object doesn't carry (right, delta, reasoning
+    isn't needed here). Postgres returns NUMERIC as decimal.Decimal and DATE as datetime.date --
+    both must be explicitly cast, or check_option_stops()'s float/Decimal arithmetic and
+    datetime.strptime() on a date object will raise TypeError the first time this reconstructed
+    entry is polled. When no options_trades row matches (e.g. the row predates this table, or the DB
+    write failed after the Alpaca order filled), falls back to a DB-free reconstruction from the
+    OCC-standard contract symbol plus Alpaca's own avg_entry_price -- mirroring
+    _crypto_reference_price's DB-free pattern for crypto, so a missing DB row never leaves a live
+    position with zero stop-loss/take-profit protection. delta is None in the fallback path;
+    check_option_stops() never reads ctx["delta"], so this is a safe degradation. Only skips entirely
+    when the OCC parse fails or avg_entry_price is missing/<= 0 -- both cases with no reliable way to
+    protect the position at all.
+
+    A short option position (this system never opens one itself, so any short reaching this function
+    is some other actor's position) is skipped entirely, for the same reason flatten_all_options()
+    skips one -- tracking it as if it were long would eventually cause sell_option() to sell it again
+    rather than close it."""
+    trades_by_symbol = {trade["contract_symbol"]: trade for trade in open_trades}
+    restored = 0
+    for position in positions:
+        contract_symbol = position.symbol
+        with _state_lock:
+            already_tracked = contract_symbol in _option_positions
+        if already_tracked:
+            continue
+
+        if getattr(position, "side", PositionSide.LONG) != PositionSide.LONG:
+            log(
+                f"⚠️  skipping option position {contract_symbol}: not a long position -- this system "
+                "only opens long option positions, and reconstructing a short as tracked state would "
+                "cause sell_option() to double it instead of closing it"
+            )
+            continue
+
+        trade = trades_by_symbol.get(contract_symbol)
+        if trade is not None:
+            expiration = trade["expiration"]
+            with _state_lock:
+                _option_positions[contract_symbol] = {
+                    "symbol": trade["symbol"],
+                    "right": trade["right"],
+                    "strike": float(trade["strike"]),
+                    "expiration": expiration.isoformat() if hasattr(expiration, "isoformat") else expiration,
+                    "delta": float(trade["delta"]) if trade["delta"] is not None else None,
+                    "entry_premium": float(trade["entry_premium"]),
+                    "qty": abs(int(float(position.qty))),
+                }
+            restored += 1
+            continue
+
+        parsed = _parse_occ_contract_symbol(contract_symbol)
+        avg_entry_price = getattr(position, "avg_entry_price", None)
+        if parsed is None or avg_entry_price is None or float(avg_entry_price) <= 0:
+            log(
+                f"⚠️  cannot reconstruct option position {contract_symbol}: no matching open row in "
+                "options_trades and no usable OCC-symbol/avg_entry_price fallback"
+            )
+            continue
+
+        log(
+            f"⚠️  reconstructing option position {contract_symbol} from OCC symbol + avg_entry_price "
+            "(degraded: no matching options_trades row, delta unknown)"
+        )
+        with _state_lock:
+            _option_positions[contract_symbol] = {
+                "symbol": parsed["symbol"],
+                "right": parsed["right"],
+                "strike": parsed["strike"],
+                "expiration": parsed["expiration"],
+                "delta": None,
+                "entry_premium": float(avg_entry_price),
+                "qty": abs(int(float(position.qty))),
+            }
         restored += 1
     return restored
 
@@ -458,6 +931,89 @@ def reconcile_tracked_state_once() -> bool:
     except APIError as exc:
         log(f"💥  failed to fetch open positions from Alpaca while backfilling position_opens: {exc}")
 
+    try:
+        option_positions = [p for p in trading_client2.get_all_positions() if p.asset_class == AssetClass.US_OPTION]
+        try:
+            open_trades = db.fetch_open_options_trades()
+            options_restored = _rebuild_option_positions_from_positions(option_positions, open_trades)
+        except Exception as exc:
+            options_restored = 0
+            log(f"💥  failed to reconstruct option positions while reconciling tracked state: {exc}")
+        if options_restored:
+            log(f"🔄  reconstructed {options_restored} option position(s) from Alpaca + options_trades")
+    except APIError as exc:
+        log(f"💥  failed to fetch open option positions from Alpaca while reconciling tracked state: {exc}")
+
+    try:
+        # No side filter here (unlike the pre-fix version, which only fetched BUY) -- a Floor Broker
+        # restart between sell_option() submitting a SELL and that SELL's fill would otherwise leave
+        # the SELL permanently unobserved: nothing else ever re-registers it, so options_trades would
+        # stay open forever even after Alpaca fills or cancels it (external review finding 1,
+        # 2026-08-26).
+        open_option_orders = trading_client2.get_orders(GetOrdersRequest(status="open"))
+
+        # Independent of the option-positions-rebuild block above -- that block's own `open_trades`
+        # is assigned inside a nested try and may be unbound if either its outer or inner try raised
+        # first, so reusing it here risks a NameError or silently-wrong state (fix-loop round 1,
+        # finding 2). This fetch has its own try/except so a DB hiccup during just this step
+        # degrades to the safe default (db_row_opened=False -- worst case one duplicate INSERT on
+        # the rare double-failure case) rather than losing the whole reconciliation step.
+        try:
+            open_contract_symbols = {trade["contract_symbol"] for trade in db.fetch_open_options_trades()}
+        except Exception as exc:
+            open_contract_symbols = set()
+            log(f"💥  failed to fetch open options_trades while reconstructing pending option orders: {exc}")
+
+        restored_pending_options = 0
+        for order in open_option_orders:
+            with _state_lock:
+                already_pending = order.id in _pending_option_fills
+            if already_pending:
+                continue
+            if order.side == OrderSide.SELL:
+                # A pending SELL has no BUY-side fields to reconstruct (right/strike/delta/etc.) and
+                # doesn't need them -- check_pending_option_fills()'s SELL branch only reads
+                # contract_symbol/symbol/reason. _option_positions itself is reconstructed separately
+                # above (_rebuild_option_positions_from_positions), from Alpaca's still-open position,
+                # so it's already tracked here independent of this order.
+                with _state_lock:
+                    underlying_symbol = _option_positions.get(order.symbol, {}).get("symbol")
+                _set_pending_option_fill(order.id, {
+                    "contract_symbol": order.symbol,
+                    "symbol": underlying_symbol,
+                    "action": "SELL",
+                    "reason": "reconstructed_after_restart",
+                })
+                restored_pending_options += 1
+                continue
+            parsed = _parse_occ_contract_symbol(order.symbol)
+            if parsed is None:
+                log(f"⚠️  cannot reconstruct pending option order {order.id} ({order.symbol}): symbol doesn't match OCC format")
+                continue
+            # Seed db_row_opened from whether this contract already has an open options_trades row
+            # (e.g. the order had already partially filled and been DB-recorded before the restart,
+            # or a race with the poll thread) -- otherwise the eventual fill would re-INSERT a
+            # duplicate open row and re-fire the first-fill Slack notification for a contract that's
+            # already tracked (fix-loop round 1, finding 2).
+            _set_pending_option_fill(order.id, {
+                "contract_symbol": order.symbol,
+                "symbol": parsed["symbol"],
+                "action": "BUY",
+                "right": parsed["right"],
+                "strike": parsed["strike"],
+                "expiration": parsed["expiration"],
+                "delta": None,
+                "qty": int(float(order.qty)),
+                "reasoning": "reconstructed_after_restart",
+                "cycle_id": None,
+                "db_row_opened": order.symbol in open_contract_symbols,
+            })
+            restored_pending_options += 1
+        if restored_pending_options:
+            log(f"🔄  reconstructed {restored_pending_options} pending option order(s) from Alpaca")
+    except APIError as exc:
+        log(f"💥  failed to fetch open option orders from Alpaca while reconciling tracked state: {exc}")
+
     _set_state_reconciled(True)
     return True
 
@@ -484,9 +1040,10 @@ def reconstruct_tracked_state(
     )
 
 
-def _fetch_open_position(symbol: str):
+def _fetch_open_position(symbol: str, client=None):
+    client = client or trading_client
     try:
-        return trading_client.get_open_position(alpaca_order_symbol(symbol))
+        return client.get_open_position(alpaca_order_symbol(symbol))
     except APIError:
         return None
 
@@ -585,7 +1142,8 @@ def bracket_buy_with_SLTP(
     )
 
 
-def _buy_preflight_skip(symbol: str, cfg) -> dict | None:
+def _buy_preflight_skip(symbol: str, cfg, client=None) -> dict | None:
+    client = client or trading_client
     if not is_state_reconciled():
         log(f"🛑  BUY {symbol} rejected -- tracked state not yet reconciled with Alpaca")
         return {
@@ -598,7 +1156,7 @@ def _buy_preflight_skip(symbol: str, cfg) -> dict | None:
         log(f"🛑  BUY kill switch active -- skipping BUY {symbol}")
         return {"status": "skipped", "reason": "buy_kill_switch_active", "detail": "BUY kill switch is active"}
 
-    account = trading_client.get_account()
+    account = client.get_account()
     daily_pnl = float(account.equity) - float(account.last_equity)
     if daily_pnl >= cfg.strategy.daily_profit_target_usd:
         log(f"🛑  daily profit target reached (${daily_pnl:.2f}) -- skipping BUY {symbol}")
@@ -660,15 +1218,16 @@ def _risk_based_budget_cap(slP: float, cfg) -> float | None:
     return risk_usd / (1 - slP)
 
 
-def _max_concurrent_positions_skip(symbol: str, cfg) -> dict | None:
+def _max_concurrent_positions_skip(symbol: str, cfg, client=None) -> dict | None:
     """Refuses a new BUY once the number of currently-open positions is at/above
     strategy.max_concurrent_positions -- topping up a symbol that's already open doesn't add a
     new position, so it's exempt (checked via _fetch_open_position, same as
     _remaining_budget_or_skip's own top-up check)."""
-    if _fetch_open_position(symbol) is not None:
+    client = client or trading_client
+    if _fetch_open_position(symbol, client=client) is not None:
         return None
 
-    open_count = len(trading_client.get_all_positions())
+    open_count = len(client.get_all_positions())
     limit = cfg.strategy.max_concurrent_positions
     if open_count >= limit:
         log(f"🛑  max concurrent positions reached ({open_count}/{limit}) -- skipping new BUY {symbol}")
@@ -933,3 +1492,177 @@ def sell(symbol: str, reason: str = "dealer_signal") -> dict:
         except APIError as retry_exc:
             log(f"💥  sell retry failed for {symbol}: {retry_exc}")
             raise
+
+
+def buy_option(
+    contract_symbol: str,
+    qty: int,
+    entry_premium: float,
+    right: str,
+    strike: float,
+    expiration: str,
+    delta: float | None,
+    reasoning: str | None,
+    symbol: str,
+    cycle_id: str | None,
+) -> dict:
+    cfg = load_config()  # fresh (within its own refresh window) so a live strategy change never needs a restart
+
+    skip = _buy_preflight_skip(contract_symbol, cfg, client=trading_client2)
+    if skip is not None:
+        return skip
+
+    skip = _max_concurrent_positions_skip(contract_symbol, cfg, client=trading_client2)
+    if skip is not None:
+        return skip
+
+    try:
+        live_ask = get_current_option_ask_price(contract_symbol)
+    except APIError as exc:
+        log(f"💥  failed to re-quote {contract_symbol} before BUY: {exc}")
+        return {"status": "error", "detail": f"failed to fetch live quote for {contract_symbol}: {exc}"}
+
+    if live_ask <= 0:
+        log(f"⚠️  no executable ask quote for {contract_symbol} -- skipping BUY")
+        return {
+            "status": "skipped",
+            "reason": "no_ask_quote",
+            "detail": f"no executable ask quote for {contract_symbol}: {live_ask}",
+        }
+
+    notional = qty * live_ask * 100
+    if notional > cfg.options_trading.max_notional_usd:
+        log(f"🛑  option BUY notional (${notional:.2f}) exceeds cap (${cfg.options_trading.max_notional_usd}) -- skipping {contract_symbol}")
+        return {
+            "status": "skipped",
+            "reason": "notional_cap_exceeded",
+            "detail": f"live-quoted notional ${notional:.2f} (qty={qty} @ live ask ${live_ask:.2f}) exceeds cap ${cfg.options_trading.max_notional_usd}",
+        }
+
+    req = MarketOrderRequest(symbol=contract_symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
+    try:
+        order = trading_client2.submit_order(req)
+    except APIError as exc:
+        log(f"💥  option buy order failed for {contract_symbol}: {exc}")
+        return {"status": "error", "detail": str(exc)}
+
+    log(f"✅  option buy order submitted: {order.id}")
+    _set_pending_option_fill(order.id, {
+        "contract_symbol": contract_symbol,
+        "symbol": symbol,
+        "action": "BUY",
+        "right": right,
+        "strike": strike,
+        "expiration": expiration,
+        "delta": delta,
+        "qty": qty,
+        "reasoning": reasoning,
+        "cycle_id": cycle_id,
+    })
+
+    return {
+        "status": "submitted",
+        "reason": "opening_position",
+        "detail": f"option buy order submitted: {order.id}",
+        "order_id": str(order.id),
+    }
+
+
+def sell_option(contract_symbol: str, reason: str = "dealer_signal") -> dict:
+    """Submits a market SELL for the full open qty of contract_symbol. Unlike the pre-fix version,
+    this does NOT clear _option_positions or close the DB row synchronously on submit -- a submitted
+    SELL can still be canceled/rejected or simply never fill, and clearing state early would drop
+    synthetic SL/TP/DTE protection and report the trade closed for a position that's still open.
+    Mirrors buy_option()/check_pending_option_fills(): the submit here only registers a pending SELL
+    entry in _pending_option_fills; check_pending_option_fills() is the sole place that pops
+    _option_positions and calls db.record_options_trade_closed, once the SELL's own fill (or
+    terminal no-fill) is confirmed (external review finding 1, 2026-08-26).
+
+    Also cancels (best-effort) any still-open BUY order this process is tracking for contract_symbol
+    BEFORE fetching the position to size this SELL -- e.g. a partially-filled BUY that's still
+    non-terminal when check_option_stops() sells the already-filled portion. Canceling first (rather
+    than after sizing/submitting the SELL) matters: if the cancel loses the race because the BUY's
+    remaining qty fills right before Alpaca can cancel it, that fill has already landed by the time
+    get_open_position() is called below, so this SELL is sized to include it -- no leftover qty is
+    ever left both unsold and untracked (external review finding 2, 2026-08-26; tightened further,
+    external review finding 1, 2026-08-26 round 2, after the first version of this fix cancelled only
+    after sizing/submitting the SELL, which left the exact same gap open).
+
+    Only a BUY order this call actually confirmed canceled has its tracking dropped below. A BUY
+    whose cancel attempt itself failed (e.g. a transient API error, as opposed to the order having
+    already filled) is deliberately left tracked -- it may still be genuinely live at Alpaca, and
+    dropping it here would mean nothing ever watches it again; check_pending_option_fills() resolves
+    it normally on a later poll instead, whichever way it actually goes (external review finding 2,
+    2026-08-26 round 3)."""
+    with _state_lock:
+        if any(ctx.get("action") == "SELL" and ctx.get("contract_symbol") == contract_symbol for ctx in _pending_option_fills.values()):
+            return {"status": "skipped", "detail": "sell already pending"}
+        stale_buy_order_ids = [
+            oid for oid, ctx in _pending_option_fills.items()
+            if ctx.get("contract_symbol") == contract_symbol and ctx.get("action") == "BUY"
+        ]
+
+    canceled_buy_order_ids = []
+    for buy_order_id in stale_buy_order_ids:
+        try:
+            trading_client2.cancel_order_by_id(buy_order_id)
+            log(f"🛑  canceled stale pending option BUY {buy_order_id} for {contract_symbol} ahead of its SELL")
+            canceled_buy_order_ids.append(buy_order_id)
+        except APIError as exc:
+            log(
+                f"💥  failed to cancel stale pending option BUY {buy_order_id} for {contract_symbol}, "
+                f"leaving it tracked: {exc}"
+            )
+
+    try:
+        position = trading_client2.get_open_position(contract_symbol)
+    except APIError as exc:
+        if _is_position_not_found_error(exc):
+            log(f"⚠️  no open option position of {contract_symbol} to sell -- dropping tracking")
+            with _state_lock:
+                _option_positions.pop(contract_symbol, None)
+                _drop_pending_option_fills_for_contract(contract_symbol)
+            return {"status": "skipped", "detail": "no open position"}
+        log(f"💥  failed to fetch option position {contract_symbol}: {exc}")
+        return {"status": "error", "detail": str(exc)}
+
+    qty = int(float(position.qty))
+    if qty <= 0:
+        if qty < 0:
+            log(f"⚠️  {contract_symbol} is a short position (qty={qty}) -- refusing to sell, dropping tracking")
+        with _state_lock:
+            _option_positions.pop(contract_symbol, None)
+            _drop_pending_option_fills_for_contract(contract_symbol)
+        return {"status": "skipped", "detail": "no open position"}
+
+    req = MarketOrderRequest(symbol=contract_symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
+    try:
+        order = trading_client2.submit_order(req)
+    except APIError as exc:
+        log(f"💥  option sell order failed for {contract_symbol}: {exc}")
+        return {"status": "error", "detail": str(exc)}
+
+    log(f"✅  option sell order submitted: {order.id}")
+    with _state_lock:
+        underlying_symbol = _option_positions.get(contract_symbol, {}).get("symbol")
+        # Only drop the pending-fill entries for BUYs actually confirmed canceled above -- a BUY
+        # whose cancel attempt failed stays tracked (see docstring) rather than being blanket-dropped
+        # via _drop_pending_option_fills_for_contract() (external review finding 2, 2026-08-26 round
+        # 3). _option_positions itself is deliberately left tracked here too: check_pending_option_
+        # fills() clears it once this SELL's fill (or terminal no-fill) is confirmed (fix-loop round
+        # 1, finding 3; external review finding 1, 2026-08-26).
+        for buy_order_id in canceled_buy_order_ids:
+            _pending_option_fills.pop(buy_order_id, None)
+        _pending_option_fills[order.id] = {
+            "contract_symbol": contract_symbol,
+            "symbol": underlying_symbol,
+            "action": "SELL",
+            "reason": reason,
+        }
+
+    return {
+        "status": "submitted",
+        "reason": reason,
+        "detail": f"option sell order submitted: {order.id}",
+        "order_id": str(order.id),
+    }

@@ -20,3 +20,5 @@ langchain
 langchain-openai
 langgraph
 langsmith
+alpaca-mcp-server
+langchain-mcp-adapters

@@ -22,8 +22,10 @@ trading:
   pollsecs: 600
   buffer: 15
   market_override: false
-  enable_stocks: true         # set false to pause Analyst/Dealer handling of equities entirely
-  enable_crypto: true         # crypto merge/trading verified live (BTC/USD test buy + Analyst crypto picks)
+  stocks:
+    enabled: true         # set false to pause Analyst/Dealer handling of equities entirely
+  crypto:
+    enabled: true         # crypto merge/trading verified live (BTC/USD test buy + Analyst crypto picks)
   crypto_taapi_exchange: "binance"   # TAAPI venue used for indicator requests on crypto symbols
 
 ohlcv_enrichment:
@@ -47,13 +49,28 @@ strategy:
   risk_per_trade_usd: null        # recorded intent only -- see position_sizing note above
   max_concurrent_positions: 10    # recorded intent only -- analyst.max_universe_size already caps concurrent picks
   win_rate_throttle_scope: symbol
-  enable_symbol_stop_cooldown: true
+  symbol_stop_cooldown:
+    enabled: true
   symbol_stop_cooldown_days: 1
   max_symbol_stop_losses: 1
-  enable_dealer_memory: true
+  dealer_memory:
+    enabled: true
   symbol_memory_days: 2
   symbol_memory_limit: 8
   max_bid_ask_spread_pct: 0.03
+
+options_trading:
+  enabled: false            # top-level feature gate
+  dte_min: 14
+  dte_max: 45
+  dte_force_close: 3        # force-close regardless of P&L once DTE drops to/below this
+  target_delta_min: 0.30
+  target_delta_max: 0.60
+  min_open_interest: 100
+  min_volume: 10
+  options_slP: 0.50         # synthetic stop-loss, fraction of entry premium
+  options_tpP: 1.75         # synthetic take-profit, fraction of entry premium
+  max_notional_usd: 2000    # hard cap on a single option order's live-quoted notional (qty * mid-price * 100); re-quoted against the market at BUY time, not the LLM-claimed premium (20x strategy.risk_per_trade_usd's default of 100)
 
 eod_report:
   schedule: "30 21 * * *"   # informational copy of the CronJob's own spec.schedule — 21:30 UTC daily, after
@@ -92,7 +109,7 @@ analyst:
     large_cap_pct: 0.40         # fraction of pool_size drawn from large_cap_symbols
     crypto_pct: 0.30            # fraction of pool_size drawn from crypto (screener movers + the
                                  # fixed CRYPTO_WATCHLIST); silently redistributed to the other
-                                 # buckets when trading.enable_crypto is false
+                                 # buckets when trading.crypto.enabled is false
     screener_pct: 0.30          # fraction of pool_size drawn from today's screener movers/most-
                                  # actives ("weird stocks"), excluding any symbol already in
                                  # large_cap_symbols

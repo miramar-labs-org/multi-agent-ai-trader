@@ -23,8 +23,8 @@ def _cfg(enable_stocks: bool, enable_crypto: bool):
     return OmegaConf.create(
         {
             "trading": {
-                "enable_stocks": enable_stocks,
-                "enable_crypto": enable_crypto,
+                "stocks": {"enabled": enable_stocks},
+                "crypto": {"enabled": enable_crypto},
                 "crypto_taapi_exchange": "binance",
             }
         }

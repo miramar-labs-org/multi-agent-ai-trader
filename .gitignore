@@ -9,3 +9,5 @@ notebook.ipynb
 .ipynb_checkpoints/
 
 backtests/
+
+.worktrees/

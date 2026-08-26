@@ -1,4 +1,5 @@
 import re
+from datetime import datetime
 from typing import Literal
 
 from alpaca.common.exceptions import APIError
@@ -16,6 +17,14 @@ log = get_logger("FLOOR")
 # (analyst/schema.py's `budget` field has no upper bound of its own) reaching Alpaca as a live
 # order. 20x config.yaml's analyst.default_budget (5000).
 MAX_BUDGET = 100_000.0
+
+# Same category of guard as MAX_BUDGET above, for the options path -- a hard, non-configurable
+# ceiling on a single option order's notional (qty * premium * 100) as a last-line-of-defense
+# against a units bug or a wildly hallucinated premium/qty reaching Alpaca. Distinct from
+# config.yaml's options_trading.max_notional_usd, which is the real, configurable, re-quoted-
+# against-the-market business-rule cap enforced inside buy_option() itself (Step 3 below) --
+# this pydantic ceiling is only the outer sanity bound on the raw request.
+MAX_OPTION_NOTIONAL = 100_000.0
 
 # Alpaca tickers: letters/digits, with an optional single "/" for crypto pairs (e.g. "BTC/USD")
 # or "." for dual-class shares and warrants/units (e.g. "BRK.B", "DSX.WS") -- both come straight
@@ -75,7 +84,53 @@ class ExecuteResponse(BaseModel):
     tp_price: float | None = None
 
 
+class ExecuteOptionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    contract_symbol: str
+    side: Literal["BUY"]
+    qty: int = Field(gt=0)
+    symbol: str
+    right: Literal["call", "put"]
+    strike: float = Field(gt=0)
+    expiration: str
+    delta: float | None = None
+    premium: float = Field(gt=0)
+    reasoning: str | None = None
+    cycle_id: str | None = None
+
+    @field_validator("premium")
+    @classmethod
+    def _notional_within_ceiling(cls, v: float, info) -> float:
+        qty = info.data.get("qty")
+        if qty is not None and qty * v * 100 > MAX_OPTION_NOTIONAL:
+            raise ValueError(f"notional (qty * premium * 100) exceeds ceiling of {MAX_OPTION_NOTIONAL}")
+        return v
+
+    @field_validator("expiration")
+    @classmethod
+    def _expiration_is_valid_iso_date(cls, v: str) -> str:
+        try:
+            datetime.strptime(v, "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError(f"expiration must be an ISO date (YYYY-MM-DD), got {v!r}") from exc
+        return v
+
+
+class ExecuteOptionResponse(BaseModel):
+    status: Literal["executed", "submitted", "skipped", "error"]
+    detail: str
+    reason: str | None = None
+    order_id: str | None = None
+
+
 class FlattenCryptoResponse(BaseModel):
+    status: Literal["ok", "error"]
+    events: list[dict] = Field(default_factory=list)
+    detail: str | None = None
+
+
+class FlattenOptionsResponse(BaseModel):
     status: Literal["ok", "error"]
     events: list[dict] = Field(default_factory=list)
     detail: str | None = None
@@ -106,6 +161,31 @@ def execute(req: ExecuteRequest):
         raise
 
 
+@app.post("/execute-option", response_model=ExecuteOptionResponse)
+def execute_option(req: ExecuteOptionRequest):
+    try:
+        result = execution.buy_option(
+            req.contract_symbol,
+            req.qty,
+            req.premium,
+            req.right,
+            req.strike,
+            req.expiration,
+            req.delta,
+            req.reasoning,
+            req.symbol,
+            req.cycle_id,
+        )
+        return ExecuteOptionResponse(**result)
+    except APIError as exc:
+        log(f"💥  option BUY {req.contract_symbol} failed: {exc}")
+        return ExecuteOptionResponse(status="error", detail=str(exc))
+    except Exception as exc:
+        log(f"💥  unexpected error on option BUY {req.contract_symbol}: {exc}")
+        slack.notify_error("FLOOR", f"unexpected error on option BUY {req.contract_symbol}: {exc}")
+        raise
+
+
 @app.post("/flatten-crypto", response_model=FlattenCryptoResponse)
 def flatten_crypto():
     """Called by power_scheduler right before it scales this pod to 0 -- force-sells every open
@@ -120,4 +200,21 @@ def flatten_crypto():
     except Exception as exc:
         log(f"💥  unexpected error on flatten-crypto: {exc}")
         slack.notify_error("FLOOR", f"unexpected error on flatten-crypto: {exc}")
+        raise
+
+
+@app.post("/flatten-options", response_model=FlattenOptionsResponse)
+def flatten_options():
+    """Called by power_scheduler right before it scales this pod to 0 -- force-sells every open
+    option position since check_option_stops()'s SL/TP/DTE-force-close is only enforced by this
+    process's own poll loop (no Alpaca server-side bracket support for options either)."""
+    try:
+        events = execution.flatten_all_options()
+        return FlattenOptionsResponse(status="ok", events=events)
+    except APIError as exc:
+        log(f"💥  flatten-options failed: {exc}")
+        return FlattenOptionsResponse(status="error", detail=str(exc))
+    except Exception as exc:
+        log(f"💥  unexpected error on flatten-options: {exc}")
+        slack.notify_error("FLOOR", f"unexpected error on flatten-options: {exc}")
         raise

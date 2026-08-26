@@ -1,9 +1,10 @@
+import asyncio
 from datetime import datetime, timedelta
 from typing import TypedDict
 
 import pytz
 import requests
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 
@@ -13,9 +14,12 @@ from src.common.config import load_config
 from src.common.logging import get_logger
 from src.common.indicators import fetch_indicators_bulk
 from src.dealer.features import compute_derived_features, format_features_text
-from src.dealer.schema import Signal
+from src.dealer.mcp_options import get_options_tools
+from src.dealer.schema import OptionContractPick, Signal
 
 log = get_logger("DEALER")
+
+_MAX_TOOL_CALL_ROUNDS = 6
 
 
 class DealerState(TypedDict):
@@ -28,6 +32,7 @@ class DealerState(TypedDict):
     raw_bars: dict
     ohlcv_features_text: str
     signal: dict | None
+    option_pick: dict | None
     execution_result: dict | None
 
 
@@ -175,7 +180,7 @@ def _classify_exit_event(event: dict) -> str | None:
 def _symbol_memory_text(symbol: str, cfg) -> str:
     """Returns compact recent same-symbol context for the Dealer prompt. This is advisory context
     only: DB failures fail open so a transient logging-store outage does not block decisions."""
-    if not cfg.strategy.get("enable_dealer_memory", True):
+    if not cfg.strategy.get("dealer_memory", {}).get("enabled", True):
         return ""
     days = cfg.strategy.get("symbol_memory_days", 2)
     limit = cfg.strategy.get("symbol_memory_limit", 8)
@@ -202,7 +207,7 @@ def _symbol_memory_text(symbol: str, cfg) -> str:
 def _symbol_stop_cooldown_active(symbol: str, cfg) -> str | None:
     """Blocks repeated same-symbol BUYs after recent stop-outs. This is deterministic risk
     control, separate from the LLM's interpretation of recent history."""
-    if not cfg.strategy.get("enable_symbol_stop_cooldown", True):
+    if not cfg.strategy.get("symbol_stop_cooldown", {}).get("enabled", True):
         return None
     days = cfg.strategy.get("symbol_stop_cooldown_days", 1)
     max_stops = cfg.strategy.get("max_symbol_stop_losses", 1)
@@ -228,7 +233,7 @@ def _win_rate_throttle_active(cfg, symbol: str | None = None) -> str | None:
     evaluating at all, so a handful of early trades can't trip the throttle on noise. Discretionary
     dealer-triggered SELLs, eod_flatten, and BUY opens are excluded from the count -- see
     _classify_exit_event."""
-    if not cfg.strategy.get("enable_win_rate_throttle", True):
+    if not cfg.strategy.get("win_rate_throttle", {}).get("enabled", True):
         return None
 
     since_date = (datetime.now(pytz.timezone("US/Eastern")) - timedelta(days=cfg.analyst.track_record_days)).date()
@@ -393,6 +398,226 @@ def call_floor_broker(state: DealerState, cfg) -> DealerState:
         return {**state, "execution_result": {"status": "error", "detail": str(exc)}}
 
 
+def select_option_contract(state: DealerState, cfg) -> DealerState:
+    if not cfg.get("options_trading", {}).get("enabled", False):
+        return {**state, "option_pick": None}
+
+    signal = state["signal"]
+    if signal["action"] == "HOLD" or signal.get("confidence", 1.0) < cfg.strategy.min_confidence:
+        return {**state, "option_pick": None}
+
+    try:
+        pick = asyncio.run(_select_option_contract_async(state, cfg, signal))
+    except Exception as exc:
+        log(f"💥 option contract selection failed for {state['symbol']}: {exc}")
+        return {**state, "option_pick": None}
+
+    return {**state, "option_pick": pick.model_dump() if pick else None}
+
+
+async def _select_option_contract_async(state: DealerState, cfg, signal: dict) -> OptionContractPick | None:
+    tools = await get_options_tools()
+    tools_by_name = {t.name: t for t in tools}
+
+    llm = ChatOpenAI(base_url=cfg.llm.base_url, model=cfg.llm.model, temperature=cfg.llm.temperature)
+    agent_llm = llm.bind_tools(tools)
+    right = "call" if signal["action"] == "BUY" else "put"
+
+    messages = [
+        SystemMessage(
+            content=(
+                "You are an options contract selector for a paper-trading account. Use the "
+                "provided Alpaca tools to look up the option chain, quotes, and Greeks for the "
+                "given underlying symbol, then pick exactly one contract that fits the stated "
+                "constraints."
+            )
+        ),
+        HumanMessage(
+            content=(
+                f"Underlying: {state['symbol']}\n"
+                f"Desired right: {right}\n"
+                f"Days-to-expiration window: {cfg.options_trading.dte_min}-{cfg.options_trading.dte_max}\n"
+                f"Target delta window: {cfg.options_trading.target_delta_min}-{cfg.options_trading.target_delta_max}\n"
+                f"Minimum open interest: {cfg.options_trading.min_open_interest}\n"
+                f"Minimum volume: {cfg.options_trading.min_volume}\n"
+                f"Dealer reasoning for the underlying signal: {signal['reasoning']}\n\n"
+                "Call tools as needed to find chain/quote/Greeks data, then respond with your "
+                "final pick."
+            )
+        ),
+    ]
+
+    for _ in range(_MAX_TOOL_CALL_ROUNDS):
+        response = agent_llm.invoke(messages)
+        messages.append(response)
+        if not response.tool_calls:
+            break
+        for call in response.tool_calls:
+            tool = tools_by_name[call["name"]]
+            result = await tool.ainvoke(call["args"])
+            messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
+
+    structured_llm = llm.with_structured_output(OptionContractPick)
+    return structured_llm.invoke(messages)
+
+
+def _route_after_llm_call(state: DealerState, cfg) -> str:
+    if state["exchange"] == "stocks" and cfg.get("options_trading", {}).get("enabled", False):
+        return "select_option_contract"
+    return "call_floor_broker"
+
+
+def call_floor_broker_option(state: DealerState, cfg) -> DealerState:
+    """Every option_pick here represents a brand-new position -- there is no "SELL means close"
+    case for options via this graph node (the only exit path is check_option_stops()'s synthetic
+    SL/TP/DTE-force-close, which calls sell_option() directly, outside this function). So unlike
+    call_floor_broker()'s stock path, these risk gates are NOT limited to action == "BUY":
+    select_option_contract() maps a bearish SELL signal to buying a put (right = "call" if
+    action == "BUY" else "put"), and that put purchase is exactly as much a new entry as a call
+    purchase is -- it must not bypass macro blackout / symbol-stop cooldown / win-rate throttle."""
+    slack.notify_dealer_signal(state["symbol"], state["signal"]["action"], state["signal"]["reasoning"])
+    db.record_dealer_decision(
+        state["symbol"],
+        state["signal"]["action"],
+        state["signal"]["reasoning"],
+        state["signal"].get("size_hint"),
+        ohlcv_enrichment_active=bool(state.get("ohlcv_features_text")),
+        cycle_id=state.get("cycle_id"),
+    )
+
+    option_pick = state.get("option_pick")
+    if not option_pick:
+        return {**state, "execution_result": {"status": "skipped", "reason": "no_option_pick", "detail": "no option contract was selected"}}
+
+    action = state["signal"]["action"]
+
+    blackout_label = _macro_blackout_active(cfg)
+    if blackout_label:
+        log(f"⏭️  option entry for {state['symbol']} skipped -- macro blackout ({blackout_label})")
+        result = {
+            "status": "skipped",
+            "reason": "macro_blackout",
+            "detail": f"new option entries paused for macro blackout: {blackout_label}",
+        }
+        graph_slack_and_record(state, action, result)
+        return {**state, "execution_result": result}
+
+    cooldown_reason = _symbol_stop_cooldown_active(state["symbol"], cfg)
+    if cooldown_reason:
+        log(f"⏭️  option entry for {state['symbol']} skipped -- {cooldown_reason}")
+        result = {
+            "status": "skipped",
+            "reason": "symbol_stop_cooldown",
+            "detail": f"new option entry paused: {cooldown_reason}",
+        }
+        graph_slack_and_record(state, action, result)
+        return {**state, "execution_result": result}
+
+    throttle_reason = _win_rate_throttle_active(cfg, state["symbol"])
+    if throttle_reason:
+        log(f"⏭️  option entry for {state['symbol']} skipped -- {throttle_reason}")
+        result = {
+            "status": "skipped",
+            "reason": "win_rate_throttle",
+            "detail": f"new option entries paused: {throttle_reason}",
+        }
+        graph_slack_and_record(state, action, result)
+        return {**state, "execution_result": result}
+
+    if state["budget"] <= 0:
+        # A held-only position (merge_held_positions()) carries budget=0 -- see call_floor_broker's
+        # identical guard. Options never merge held-only positions today (merge_held_positions only
+        # reads account 1's stock/crypto positions), but every option_pick is a brand-new entry
+        # regardless of BUY/SELL (unlike stocks, where SELL means close) -- so this guard applies
+        # unconditionally, without the action == "BUY" restriction call_floor_broker uses.
+        log(f"⚠️  no authorized budget for {state['symbol']} option entry -- skipping")
+        result = {
+            "status": "skipped",
+            "reason": "no_authorized_budget",
+            "detail": "no authorized budget for new option entry",
+        }
+        graph_slack_and_record(state, action, result)
+        return {**state, "execution_result": result}
+
+    expiration = datetime.strptime(option_pick["expiration"], "%Y-%m-%d").date()
+    today = datetime.now(pytz.timezone("US/Eastern")).date()
+    dte = (expiration - today).days
+    if not (cfg.options_trading.dte_min <= dte <= cfg.options_trading.dte_max):
+        result = {
+            "status": "skipped",
+            "reason": "dte_out_of_range",
+            "detail": f"DTE {dte} outside [{cfg.options_trading.dte_min}, {cfg.options_trading.dte_max}]",
+        }
+        graph_slack_and_record(state, action, result)
+        return {**state, "execution_result": result}
+
+    delta = abs(option_pick["delta"])
+    if not (cfg.options_trading.target_delta_min <= delta <= cfg.options_trading.target_delta_max):
+        result = {
+            "status": "skipped",
+            "reason": "delta_out_of_range",
+            "detail": f"delta {delta} outside [{cfg.options_trading.target_delta_min}, {cfg.options_trading.target_delta_max}]",
+        }
+        graph_slack_and_record(state, action, result)
+        return {**state, "execution_result": result}
+
+    if not cfg.strategy.risk_per_trade_usd:
+        result = {
+            "status": "skipped",
+            "reason": "risk_per_trade_usd_not_configured",
+            "detail": "strategy.risk_per_trade_usd is not configured",
+        }
+        graph_slack_and_record(state, action, result)
+        return {**state, "execution_result": result}
+
+    premium = option_pick["premium"]
+    qty = int(cfg.strategy.risk_per_trade_usd // (premium * 100)) if premium > 0 else 0
+    if qty < 1:
+        result = {
+            "status": "skipped",
+            "reason": "qty_zero",
+            "detail": f"risk_per_trade_usd={cfg.strategy.risk_per_trade_usd} affords 0 contracts at premium ${premium}",
+        }
+        graph_slack_and_record(state, action, result)
+        return {**state, "execution_result": result}
+
+    payload = {
+        "contract_symbol": option_pick["contract_symbol"],
+        "side": "BUY",
+        "qty": qty,
+        "symbol": state["symbol"],
+        "right": option_pick["right"],
+        "strike": option_pick["strike"],
+        "expiration": option_pick["expiration"],
+        "delta": option_pick["delta"],
+        "premium": premium,
+        "reasoning": option_pick["reasoning"],
+        "cycle_id": state.get("cycle_id"),
+    }
+
+    try:
+        response = requests.post(f"{cfg.floor_broker.base_url}/execute-option", json=payload, timeout=30)
+        if response.status_code != 200:
+            log(f"💥 floor broker option error: {response.status_code} {response.text}")
+            result = {"status": "error", "detail": response.text}
+            graph_slack_and_record(state, action, result)
+            return {**state, "execution_result": result}
+        result = response.json()
+        slack.notify_floor_broker_result(state["symbol"], action, result["status"], result["detail"], reason=result.get("reason"))
+        db.record_floor_broker_event(state["symbol"], f"option_{result['status']}", result["detail"])
+        return {**state, "execution_result": result}
+    except requests.RequestException as exc:
+        log(f"💥 floor broker option request failed: {exc}")
+        result = {"status": "error", "detail": str(exc)}
+        graph_slack_and_record(state, action, result)
+        return {**state, "execution_result": result}
+
+
+def graph_slack_and_record(state: DealerState, action: str, result: dict) -> None:
+    slack.notify_floor_broker_result(state["symbol"], action, result["status"], result["detail"], reason=result.get("reason"))
+    db.record_floor_broker_event(state["symbol"], "skip" if result["status"] == "skipped" else result["status"], result["detail"])
+
+
 def build_graph():
     # Each lambda calls load_config() fresh at invocation time (once per node per graph run,
     # i.e. once per Dealer poll cycle per symbol) rather than baking one cfg into the closure at
@@ -403,7 +628,9 @@ def build_graph():
     graph.add_node("fetch_market_data", lambda state: fetch_market_data(state, load_config()))
     graph.add_node("llm_call", lambda state: llm_call(state, load_config()))
     graph.add_node("skip_missing_indicators", lambda state: skip_missing_indicators(state, load_config()))
+    graph.add_node("select_option_contract", lambda state: select_option_contract(state, load_config()))
     graph.add_node("call_floor_broker", lambda state: call_floor_broker(state, load_config()))
+    graph.add_node("call_floor_broker_option", lambda state: call_floor_broker_option(state, load_config()))
 
     graph.set_entry_point("fetch_indicators")
     graph.add_conditional_edges(
@@ -412,8 +639,14 @@ def build_graph():
         {"llm_call": "fetch_market_data", "skip_missing_indicators": "skip_missing_indicators"},
     )
     graph.add_edge("fetch_market_data", "llm_call")
-    graph.add_edge("llm_call", "call_floor_broker")
+    graph.add_conditional_edges(
+        "llm_call",
+        lambda state: _route_after_llm_call(state, load_config()),
+        {"call_floor_broker": "call_floor_broker", "select_option_contract": "select_option_contract"},
+    )
+    graph.add_edge("select_option_contract", "call_floor_broker_option")
     graph.add_edge("skip_missing_indicators", END)
     graph.add_edge("call_floor_broker", END)
+    graph.add_edge("call_floor_broker_option", END)
 
     return graph.compile()

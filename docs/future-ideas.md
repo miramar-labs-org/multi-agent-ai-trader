@@ -94,7 +94,7 @@ unrealized P&L and the original Analyst rationale into the Dealer prompt would l
 
 ### ~~Dealer has no memory across polls~~ — Partly addressed (2026-08-11)
 
-Implemented: `strategy.enable_dealer_memory` now adds recent same-symbol Dealer decisions and
+Implemented: `strategy.dealer_memory.enabled` now adds recent same-symbol Dealer decisions and
 Floor Broker outcomes to the Dealer LLM prompt. This gives each poll context about recent BUY
 skips, fills, stop-outs, and prior reasoning for the same symbol. It is intentionally
 same-symbol memory only; broader account state, current unrealized P&L, and the original Analyst
@@ -116,7 +116,7 @@ built, per `docs/strategy.md`).
 `strategy.daily_loss_limit_usd` blocks new BUYs once `equity - last_equity` crosses the bound —
 but doesn't distinguish realized vs. unrealized loss, has no trade-count limit, and has no
 per-asset-class exposure cap. As of 2026-08-11, there is a same-symbol stop-loss cooldown
-(`strategy.enable_symbol_stop_cooldown`) that prevents immediate re-entry after recent stop-outs,
+(`strategy.symbol_stop_cooldown.enabled`) that prevents immediate re-entry after recent stop-outs,
 but there is still no generalized rejection-streak cooldown or portfolio-level loss-streak
 controller. This is `docs/ROADMAP.md` P1.8, already tracked as Partial — flagging here because
 it's directly upstream of any algorithmic sizing change: a smarter sizing model is only as safe

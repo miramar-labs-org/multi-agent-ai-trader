@@ -8,7 +8,9 @@ from src.dealer.main import market_is_open, should_process_entry
 
 
 def _cfg(enable_stocks: bool, enable_crypto: bool):
-    return OmegaConf.create({"trading": {"enable_stocks": enable_stocks, "enable_crypto": enable_crypto}})
+    return OmegaConf.create(
+        {"trading": {"stocks": {"enabled": enable_stocks}, "crypto": {"enabled": enable_crypto}}}
+    )
 
 
 def _trading_cfg(market_override=False, buffer=0):

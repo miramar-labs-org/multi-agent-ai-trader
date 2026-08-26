@@ -115,6 +115,63 @@ def test_record_floor_broker_event_inserts_expected_row(monkeypatch):
     assert params == ("MGN", "buy_submitted", "order abc123", 10, 5.5)
 
 
+def test_record_options_trade_opened_inserts_expected_row(monkeypatch):
+    conn = FakeConnection()
+    _patch_pool(monkeypatch, conn)
+
+    db.record_options_trade_opened(
+        symbol="MGN",
+        contract_symbol="MGN260116C00100000",
+        right="call",
+        strike=100.0,
+        expiration="2026-01-16",
+        delta=0.45,
+        entry_premium=2.50,
+        qty=1,
+        reasoning="momentum breakout",
+        cycle_id="cycle-1",
+    )
+
+    sql, params = conn.executed[0]
+    assert "INSERT INTO options_trades" in sql
+    assert params == (
+        "MGN",
+        "MGN260116C00100000",
+        "call",
+        100.0,
+        "2026-01-16",
+        0.45,
+        2.50,
+        1,
+        "momentum breakout",
+        "cycle-1",
+    )
+
+
+def test_record_options_trade_closed_updates_expected_row(monkeypatch):
+    conn = FakeConnection()
+    _patch_pool(monkeypatch, conn)
+
+    db.record_options_trade_closed("MGN260116C00100000", "take_profit", 4.00)
+
+    sql, params = conn.executed[0]
+    assert "UPDATE options_trades" in sql
+    assert "WHERE contract_symbol = %s AND closed_at IS NULL" in sql
+    assert params == ("take_profit", 4.00, "MGN260116C00100000")
+
+
+def test_record_options_trade_updated_updates_expected_row(monkeypatch):
+    conn = FakeConnection()
+    _patch_pool(monkeypatch, conn)
+
+    db.record_options_trade_updated("MGN260116C00100000", 3.25, 2)
+
+    sql, params = conn.executed[0]
+    assert "UPDATE options_trades" in sql
+    assert "WHERE contract_symbol = %s AND closed_at IS NULL" in sql
+    assert params == (3.25, 2, "MGN260116C00100000")
+
+
 def test_record_position_opened_inserts_expected_row(monkeypatch):
     conn = FakeConnection()
     _patch_pool(monkeypatch, conn)
@@ -202,6 +259,12 @@ def test_fetch_position_opened_at_returns_none_when_untracked(monkeypatch):
         (db.record_analyst_pick, ("MGN", "NASDAQ", 100.0, "rationale", datetime(2026, 8, 4))),
         (db.record_dealer_decision, ("MGN", "BUY", "reasoning", 5.0)),
         (db.record_floor_broker_event, ("MGN", "error", "boom")),
+        (
+            db.record_options_trade_opened,
+            ("MGN", "MGN260116C00100000", "call", 100.0, "2026-01-16", 0.45, 2.50, 1, "reasoning", "cycle-1"),
+        ),
+        (db.record_options_trade_closed, ("MGN260116C00100000", "take_profit", 4.00)),
+        (db.record_options_trade_updated, ("MGN260116C00100000", 3.25, 2)),
         (db.record_position_opened, ("MGN",)),
         (db.record_position_closed, ("MGN",)),
         (db.record_eod_report_sent, (date(2026, 8, 6),)),
@@ -298,3 +361,15 @@ def test_fetch_symbol_floor_broker_events_since_returns_list_of_dicts(monkeypatc
     sql, params = conn.last_cursor.queries[-1]
     assert "WHERE symbol = %s" in sql
     assert params == ("MGN", date(2026, 8, 1), 5)
+
+
+def test_fetch_open_options_trades_returns_list_of_dicts(monkeypatch):
+    rows = [{"id": 1, "symbol": "MGN", "contract_symbol": "MGN260116C00100000", "closed_at": None}]
+    conn = FakeConnection(rows=rows)
+    _patch_pool(monkeypatch, conn)
+
+    result = db.fetch_open_options_trades()
+
+    assert result == rows
+    sql, params = conn.last_cursor.queries[-1]
+    assert "SELECT * FROM options_trades WHERE closed_at IS NULL" in sql

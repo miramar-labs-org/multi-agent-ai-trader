@@ -1,7 +1,7 @@
 from datetime import datetime
 
 import pytz
-from alpaca.trading.enums import AssetClass
+from alpaca.trading.enums import AssetClass, PositionSide
 from omegaconf import OmegaConf
 
 from src.power_scheduler import main
@@ -9,7 +9,8 @@ from src.power_scheduler import main
 EASTERN = pytz.timezone("US/Eastern")
 
 
-def _cfg(minutes_before_open=60, minutes_after_close=60, flatten_crypto=True, enabled=True, manage_ollama=True):
+def _cfg(minutes_before_open=60, minutes_after_close=60, flatten_crypto=True, enabled=True, manage_ollama=True,
+         options_enabled=False, flatten_options=True):
     return OmegaConf.create(
         {
             "power_schedule": {
@@ -17,8 +18,10 @@ def _cfg(minutes_before_open=60, minutes_after_close=60, flatten_crypto=True, en
                 "minutes_before_open": minutes_before_open,
                 "minutes_after_close": minutes_after_close,
                 "flatten_crypto_before_powerdown": flatten_crypto,
+                "flatten_options_before_powerdown": flatten_options,
                 "manage_ollama_model": manage_ollama,
             },
+            "options_trading": {"enabled": options_enabled},
             "floor_broker": {"base_url": "http://floor-broker.test:8000"},
             "llm": {"base_url": "http://ollama.test:11434/v1", "model": "qwen3.6:35b-a3b"},
         }
@@ -43,8 +46,9 @@ class FakeResponse:
 
 
 class FakePosition:
-    def __init__(self, asset_class):
+    def __init__(self, asset_class, side=PositionSide.LONG):
         self.asset_class = asset_class
+        self.side = side
 
 
 # --- _target_replica_count -------------------------------------------------
@@ -90,6 +94,26 @@ def test_wait_until_crypto_flat_returns_true_immediately_when_no_crypto_position
 def test_wait_until_crypto_flat_returns_false_after_timeout_when_still_open(monkeypatch):
     monkeypatch.setattr(main.trading_client, "get_all_positions", lambda: [FakePosition(AssetClass.CRYPTO)])
     assert main._wait_until_crypto_flat(timeout_s=0) is False
+
+
+def test_wait_until_options_flat_returns_true_immediately_when_no_option_positions(monkeypatch):
+    monkeypatch.setattr(main.trading_client2, "get_all_positions", lambda: [])
+    assert main._wait_until_options_flat(timeout_s=5) is True
+
+
+def test_wait_until_options_flat_returns_false_after_timeout_when_still_open(monkeypatch):
+    monkeypatch.setattr(main.trading_client2, "get_all_positions", lambda: [FakePosition(AssetClass.US_OPTION)])
+    assert main._wait_until_options_flat(timeout_s=0) is False
+
+
+def test_wait_until_options_flat_returns_true_when_only_short_position_open(monkeypatch):
+    """An externally-created short option must not be waited on -- flatten_all_options() (called
+    before this) deliberately leaves shorts alone, since selling one would open MORE short rather
+    than closing it. Mirrors the LONG-only filter in execution.py's flatten_all_options()."""
+    monkeypatch.setattr(
+        main.trading_client2, "get_all_positions", lambda: [FakePosition(AssetClass.US_OPTION, side=PositionSide.SHORT)]
+    )
+    assert main._wait_until_options_flat(timeout_s=5) is True
 
 
 def test_wait_until_floor_broker_ready_returns_true_on_200(monkeypatch):
@@ -174,6 +198,7 @@ def test_power_down_scales_dealer_first_then_flattens_and_scales_floor_broker(mo
     monkeypatch.setattr(main, "_stop_ollama_model", lambda cfg: None)
     monkeypatch.setattr(main.requests, "post", lambda url, timeout: FakeResponse(json_data={"events": [{"symbol": "BTC/USD"}]}))
     monkeypatch.setattr(main, "_wait_until_crypto_flat", lambda: True)
+    monkeypatch.setattr(main, "_wait_until_options_flat", lambda: True)
     notified = {}
     monkeypatch.setattr(main.slack, "notify_power_state", lambda action, detail: notified.update(action=action, detail=detail))
 
@@ -213,7 +238,7 @@ def test_power_down_skips_flatten_request_when_disabled_by_config(monkeypatch):
     monkeypatch.setattr(main, "_wait_until_crypto_flat", lambda: True)
     monkeypatch.setattr(main.slack, "notify_power_state", lambda *a, **k: None)
 
-    main._power_down(None, _cfg(flatten_crypto=False))
+    main._power_down(None, _cfg(flatten_crypto=False, flatten_options=False))
 
     assert posted["called"] is False
     assert calls[-1] == ("floor-broker", 0)
@@ -243,6 +268,7 @@ def test_power_down_stops_ollama_model_after_scaling_dealer_to_zero(monkeypatch)
     monkeypatch.setattr(main, "_stop_ollama_model", lambda cfg: order.append(("stop_ollama",)))
     monkeypatch.setattr(main.requests, "post", lambda url, timeout: FakeResponse(json_data={"events": []}))
     monkeypatch.setattr(main, "_wait_until_crypto_flat", lambda: True)
+    monkeypatch.setattr(main, "_wait_until_options_flat", lambda: True)
     monkeypatch.setattr(main.slack, "notify_power_state", lambda *a, **k: None)
 
     main._power_down(None, _cfg())
@@ -257,11 +283,149 @@ def test_power_down_skips_ollama_stop_when_disabled_by_config(monkeypatch):
     monkeypatch.setattr(main, "_stop_ollama_model", lambda cfg: called.__setitem__("stop", True))
     monkeypatch.setattr(main.requests, "post", lambda url, timeout: FakeResponse(json_data={"events": []}))
     monkeypatch.setattr(main, "_wait_until_crypto_flat", lambda: True)
+    monkeypatch.setattr(main, "_wait_until_options_flat", lambda: True)
     monkeypatch.setattr(main.slack, "notify_power_state", lambda *a, **k: None)
 
     main._power_down(None, _cfg(manage_ollama=False))
 
     assert called["stop"] is False
+
+
+def test_power_down_flattens_options_when_enabled(monkeypatch):
+    calls = []
+    monkeypatch.setattr(main, "_scale", lambda apps_v1, name, replicas: calls.append((name, replicas)))
+    monkeypatch.setattr(main, "_stop_ollama_model", lambda cfg: None)
+    posted_urls = []
+
+    def _fake_post(url, timeout):
+        posted_urls.append(url)
+        events = [{"symbol": "AAPL250117C00200000"}] if url.endswith("/flatten-options") else []
+        return FakeResponse(json_data={"events": events})
+
+    monkeypatch.setattr(main.requests, "post", _fake_post)
+    monkeypatch.setattr(main, "_wait_until_crypto_flat", lambda: True)
+    monkeypatch.setattr(main, "_wait_until_options_flat", lambda: True)
+    notified = {}
+    monkeypatch.setattr(main.slack, "notify_power_state", lambda action, detail: notified.update(action=action, detail=detail))
+
+    main._power_down(None, _cfg(options_enabled=True))
+
+    assert any(u.endswith("/flatten-options") for u in posted_urls)
+    assert calls[-1] == ("floor-broker", 0)
+    assert "1 option position" in notified["detail"]
+
+
+def test_power_down_flattens_options_even_when_options_trading_disabled(monkeypatch):
+    """Regression: options_trading.enabled is a new-entry gate, not a protection gate -- flipping it
+    off as an emergency rollback must not skip flattening any option position still open."""
+    calls = []
+    monkeypatch.setattr(main, "_scale", lambda apps_v1, name, replicas: calls.append((name, replicas)))
+    monkeypatch.setattr(main, "_stop_ollama_model", lambda cfg: None)
+    posted_urls = []
+
+    def _fake_post(url, timeout):
+        posted_urls.append(url)
+        events = [{"symbol": "AAPL250117C00200000"}] if url.endswith("/flatten-options") else []
+        return FakeResponse(json_data={"events": events})
+
+    monkeypatch.setattr(main.requests, "post", _fake_post)
+    monkeypatch.setattr(main, "_wait_until_crypto_flat", lambda: True)
+    monkeypatch.setattr(main, "_wait_until_options_flat", lambda: True)
+    monkeypatch.setattr(main.slack, "notify_power_state", lambda *a, **k: None)
+
+    main._power_down(None, _cfg(options_enabled=False))
+
+    assert any(u.endswith("/flatten-options") for u in posted_urls)
+    assert calls[-1] == ("floor-broker", 0)
+
+
+def test_power_down_skips_options_flatten_when_disabled_by_config_flag(monkeypatch):
+    monkeypatch.setattr(main, "_scale", lambda apps_v1, name, replicas: None)
+    monkeypatch.setattr(main, "_stop_ollama_model", lambda cfg: None)
+    posted_urls = []
+    monkeypatch.setattr(main.requests, "post", lambda url, timeout: posted_urls.append(url) or FakeResponse(json_data={"events": []}))
+    monkeypatch.setattr(main, "_wait_until_crypto_flat", lambda: True)
+    monkeypatch.setattr(main.slack, "notify_power_state", lambda *a, **k: None)
+
+    main._power_down(None, _cfg(options_enabled=True, flatten_options=False))
+
+    assert not any(u.endswith("/flatten-options") for u in posted_urls)
+
+
+def test_power_down_continues_when_options_never_flatten(monkeypatch):
+    """Regression: unlike crypto, a failed/incomplete options flatten must never block power-down --
+    options stay protected by dte_force_close/synthetic SL-TP once Floor Broker restarts, and
+    retrying the flatten after the options market has closed for the day cannot succeed anyway."""
+    calls = []
+    monkeypatch.setattr(main, "_scale", lambda apps_v1, name, replicas: calls.append((name, replicas)))
+    monkeypatch.setattr(main, "_stop_ollama_model", lambda cfg: None)
+    monkeypatch.setattr(main.requests, "post", lambda url, timeout: FakeResponse(json_data={"events": []}))
+    monkeypatch.setattr(main, "_wait_until_crypto_flat", lambda: True)
+    monkeypatch.setattr(main, "_wait_until_options_flat", lambda: False)
+    errors = {}
+    monkeypatch.setattr(main.slack, "notify_error", lambda component, text: errors.setdefault("text", text))
+    notified = {}
+    monkeypatch.setattr(main.slack, "notify_power_state", lambda action, detail: notified.update(action=action, detail=detail))
+
+    main._power_down(None, _cfg(options_enabled=True))
+
+    assert calls[0] == ("dealer", 0)
+    assert calls[-1] == ("floor-broker", 0)
+    assert "text" in errors  # still notified, just doesn't block
+    assert notified["action"] == "powered_down"
+
+
+def test_power_down_continues_when_flatten_options_request_fails(monkeypatch):
+    calls = []
+    monkeypatch.setattr(main, "_scale", lambda apps_v1, name, replicas: calls.append((name, replicas)))
+    monkeypatch.setattr(main, "_stop_ollama_model", lambda cfg: None)
+
+    def _fake_post(url, timeout):
+        if url.endswith("/flatten-options"):
+            raise main.requests.RequestException("connection refused")
+        return FakeResponse(json_data={"events": []})
+
+    monkeypatch.setattr(main.requests, "post", _fake_post)
+    monkeypatch.setattr(main, "_wait_until_crypto_flat", lambda: True)
+    errors = {}
+    monkeypatch.setattr(main.slack, "notify_error", lambda component, text: errors.setdefault("text", text))
+    notified = {}
+    monkeypatch.setattr(main.slack, "notify_power_state", lambda action, detail: notified.update(action=action, detail=detail))
+
+    main._power_down(None, _cfg(options_enabled=True))
+
+    assert calls[0] == ("dealer", 0)
+    assert calls[-1] == ("floor-broker", 0)
+    assert "text" in errors
+    assert notified["action"] == "powered_down"
+
+
+def test_power_down_continues_when_wait_until_options_flat_raises(monkeypatch):
+    """Regression: an uncaught exception from _wait_until_options_flat() (e.g. Alpaca's APIError on
+    an outage, rate limit, or a bad account-2 credential) must not crash power-down and leave
+    floor-broker stuck up with no notification -- this is the same failure mode the request-failure/
+    timeout branches already guard against, just reached via an exception instead of a return."""
+    calls = []
+    monkeypatch.setattr(main, "_scale", lambda apps_v1, name, replicas: calls.append((name, replicas)))
+    monkeypatch.setattr(main, "_stop_ollama_model", lambda cfg: None)
+    monkeypatch.setattr(main.requests, "post", lambda url, timeout: FakeResponse(json_data={"events": []}))
+    monkeypatch.setattr(main, "_wait_until_crypto_flat", lambda: True)
+
+    def _raise():
+        raise RuntimeError("simulated outage")
+
+    monkeypatch.setattr(main, "_wait_until_options_flat", _raise)
+    errors = {}
+    monkeypatch.setattr(main.slack, "notify_error", lambda component, text: errors.setdefault("text", text))
+    notified = {}
+    monkeypatch.setattr(main.slack, "notify_power_state", lambda action, detail: notified.update(action=action, detail=detail))
+
+    main._power_down(None, _cfg(options_enabled=True))
+
+    assert calls[0] == ("dealer", 0)
+    assert calls[-1] == ("floor-broker", 0)
+    assert "text" in errors
+    assert notified["action"] == "powered_down"
 
 
 def test_power_up_scales_floor_broker_first_then_dealer(monkeypatch):

@@ -37,9 +37,9 @@ def is_after_open_buffer(buffer_minutes: int) -> bool:
 
 def should_process_entry(entry: dict, cfg) -> bool:
     is_crypto = entry["exchange"] != "stocks"
-    if is_crypto and not cfg.trading.enable_crypto:
+    if is_crypto and not cfg.trading.crypto.enabled:
         return False
-    if not is_crypto and not cfg.trading.enable_stocks:
+    if not is_crypto and not cfg.trading.stocks.enabled:
         return False
     return True
 
@@ -128,6 +128,7 @@ def main():
                         "raw_bars": {},
                         "ohlcv_features_text": "",
                         "signal": None,
+                        "option_pick": None,
                         "execution_result": None,
                     }
                     graph.invoke(state, config={"tags": ["dealer"]})

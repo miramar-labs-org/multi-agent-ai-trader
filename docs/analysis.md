@@ -157,7 +157,7 @@ lower-band proximity strongly supports a short-term bounce trade"* (13:52 ET), a
 holding above the VWAP and BB upper band with RSI at 62.96 confirms strong intraday buying
 pressure"* (19:14 ET). Every one of these was vetoed at Floor Broker with the same message:
 `"new BUY entries paused: trailing win rate 16% (4W/21L over 25 exits) below minimum 30%"` — 38
-such skips today. This is the `enable_win_rate_throttle` risk control working as designed, not a
+such skips today. This is the `win_rate_throttle.enabled` risk control working as designed, not a
 bug.
 
 ### Every SELL found nothing to sell
@@ -194,9 +194,9 @@ Implemented mitigations:
 
 - `strategy.win_rate_throttle_scope: symbol` makes the TP/SL win-rate throttle default to
   same-symbol history instead of all recent exits.
-- `strategy.enable_symbol_stop_cooldown` blocks new BUYs for a symbol after recent stop-loss
+- `strategy.symbol_stop_cooldown.enabled` blocks new BUYs for a symbol after recent stop-loss
   exits, before the Floor Broker HTTP call.
-- `strategy.enable_dealer_memory` adds recent same-symbol Dealer decisions and Floor Broker
+- `strategy.dealer_memory.enabled` adds recent same-symbol Dealer decisions and Floor Broker
   events to the Dealer prompt.
 - Analyst screener filters now drop extreme movers, low-notional candidates when dollar volume
   is computable, and likely warrant/unit symbols before LLM selection.

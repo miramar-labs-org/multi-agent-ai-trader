@@ -44,6 +44,26 @@ CREATE TABLE IF NOT EXISTS floor_broker_events (
     occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS options_trades (
+    id SERIAL PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    contract_symbol TEXT NOT NULL,
+    "right" TEXT NOT NULL,
+    strike NUMERIC NOT NULL,
+    expiration DATE NOT NULL,
+    delta NUMERIC,
+    entry_premium NUMERIC NOT NULL,
+    qty INTEGER NOT NULL,
+    reasoning TEXT,
+    cycle_id TEXT,
+    opened_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    closed_at TIMESTAMPTZ,
+    exit_reason TEXT,
+    exit_premium NUMERIC
+);
+
+CREATE INDEX IF NOT EXISTS idx_options_trades_contract_symbol ON options_trades (contract_symbol);
+
 -- Tracks the timestamp a currently-open stock/crypto position was (re)opened, keyed by symbol.
 -- Populated from poll_pending_fills() (src/floor_broker/main.py) on a BUY fill, and cleared on a
 -- SELL fill -- sell() always closes the entire current position, so there is no partial-lot case
@@ -153,6 +173,82 @@ def record_floor_broker_event(
             )
     except Exception as exc:
         log(f"⚠️ record_floor_broker_event failed: {exc}")
+
+
+def record_options_trade_opened(
+    symbol: str,
+    contract_symbol: str,
+    right: str,
+    strike: float,
+    expiration: str,
+    delta: float | None,
+    entry_premium: float,
+    qty: int,
+    reasoning: str | None,
+    cycle_id: str | None,
+) -> None:
+    """Fire-and-forget insert -- never raises, so a DB outage can't block option order submission."""
+    try:
+        _ensure_schema()
+        with _get_pool().connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO options_trades (
+                    symbol, contract_symbol, "right", strike, expiration, delta, entry_premium, qty, reasoning, cycle_id
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (symbol, contract_symbol, right, strike, expiration, delta, entry_premium, qty, reasoning, cycle_id),
+            )
+    except Exception as exc:
+        log(f"⚠️ record_options_trade_opened failed: {exc}")
+
+
+def record_options_trade_closed(contract_symbol: str, exit_reason: str, exit_premium: float | None) -> None:
+    """Fire-and-forget update -- never raises. Closes the most recent still-open row for this
+    contract_symbol; a contract symbol is unique to one strike/expiration/right, so at most one
+    open row can exist for it at a time."""
+    try:
+        _ensure_schema()
+        with _get_pool().connection() as conn:
+            conn.execute(
+                """
+                UPDATE options_trades
+                SET closed_at = now(), exit_reason = %s, exit_premium = %s
+                WHERE contract_symbol = %s AND closed_at IS NULL
+                """,
+                (exit_reason, exit_premium, contract_symbol),
+            )
+    except Exception as exc:
+        log(f"⚠️ record_options_trade_closed failed: {exc}")
+
+
+def record_options_trade_updated(contract_symbol: str, entry_premium: float, qty: int) -> None:
+    """Fire-and-forget update -- never raises. Updates the still-open row for this contract_symbol
+    with the latest cumulative fill price/qty as a partially-filled option BUY order continues to
+    fill; a contract symbol is unique to one strike/expiration/right, so at most one open row can
+    exist for it at a time (same uniqueness assumption record_options_trade_closed relies on)."""
+    try:
+        _ensure_schema()
+        with _get_pool().connection() as conn:
+            conn.execute(
+                """
+                UPDATE options_trades
+                SET entry_premium = %s, qty = %s
+                WHERE contract_symbol = %s AND closed_at IS NULL
+                """,
+                (entry_premium, qty, contract_symbol),
+            )
+    except Exception as exc:
+        log(f"⚠️ record_options_trade_updated failed: {exc}")
+
+
+def fetch_open_options_trades() -> list[dict]:
+    _ensure_schema()
+    with _get_pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM options_trades WHERE closed_at IS NULL ORDER BY opened_at")
+            return cur.fetchall()
 
 
 def record_position_opened(symbol: str) -> None:

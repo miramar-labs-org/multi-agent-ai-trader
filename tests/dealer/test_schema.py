@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from src.dealer.schema import Signal
+from src.dealer.schema import OptionContractPick, Signal
 
 
 def test_size_hint_rejects_out_of_range_values():
@@ -31,3 +31,27 @@ def test_confidence_rejects_out_of_range_values():
 def test_confidence_accepts_valid_fraction():
     signal = Signal(symbol="DFNS", action="BUY", reasoning="test", confidence=0.4)
     assert signal.confidence == 0.4
+
+
+def _option_pick(**overrides):
+    fields = {
+        "contract_symbol": "AAPL250117C00200000",
+        "strike": 200.0,
+        "expiration": "2025-01-17",
+        "right": "call",
+        "delta": 0.45,
+        "premium": 3.20,
+        "reasoning": "test reasoning",
+    }
+    fields.update(overrides)
+    return OptionContractPick(**fields)
+
+
+def test_option_contract_pick_accepts_valid_iso_expiration():
+    pick = _option_pick(expiration="2025-01-17")
+    assert pick.expiration == "2025-01-17"
+
+
+def test_option_contract_pick_rejects_malformed_expiration():
+    with pytest.raises(ValidationError):
+        _option_pick(expiration="not-a-date")

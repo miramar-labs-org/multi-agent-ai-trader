@@ -5,7 +5,7 @@ metadata:
   namespace: multi-agent-ai-trader
 spec:
   # 12:30pm America/New_York -- an optional second Analyst run to catch intraday movers/news the
-  # 08:55 run missed, gated on analyst.enable_midday_run in config.yaml (off by default). The
+  # 08:55 run missed, gated on analyst.midday_run.enabled in config.yaml (off by default). The
   # CronJob always fires; ANALYST_RUN_LABEL=midday tells src/analyst/main.py to check the flag
   # and exit immediately if it's disabled, so toggling this feature is a config-only change, no
   # redeploy needed. timeZone (not a fixed UTC offset) keeps this correct across DST.
