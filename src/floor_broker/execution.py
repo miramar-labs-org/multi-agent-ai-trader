@@ -224,6 +224,27 @@ def _set_pending_option_fill(order_id: str, ctx: dict) -> None:
         _pending_option_fills[order_id] = ctx
 
 
+def _drop_pending_option_fills_for_contract(contract_symbol: str) -> None:
+    """Drops every _pending_option_fills entry tracking contract_symbol -- called everywhere
+    sell_option() drops _option_positions tracking for a contract (fix-loop round 1, finding 3).
+    Now that a partially-filled BUY order stays in _pending_option_fills until fully terminal
+    (finding 1), there's a window where check_option_stops() can sell the already-filled portion of
+    a position via sell_option() while an outstanding partial-fill BUY for that same contract is
+    still tracked here. Left alone, the next check_pending_option_fills() poll would resurrect
+    _option_positions for a contract that was just sold and whose DB row is now closed (silently
+    no-oping the UPDATE, since it's keyed on closed_at IS NULL), leaving a phantom in-memory-only
+    position with no DB backing. Deliberately does not touch the underlying Alpaca order -- no
+    cancel_related_orders() call -- this is in-memory tracking cleanup only; the order itself is
+    left to resolve on its own (self-limiting: the next poll or sell_option() call finds no position
+    and pops).
+
+    Must be called while _state_lock is already held (all three call sites in sell_option() already
+    hold it around the matching _option_positions.pop())."""
+    stale_order_ids = [order_id for order_id, ctx in _pending_option_fills.items() if ctx.get("contract_symbol") == contract_symbol]
+    for order_id in stale_order_ids:
+        _pending_option_fills.pop(order_id, None)
+
+
 def _stop_tracking_symbol(symbol: str) -> None:
     with _state_lock:
         _tracked_brackets.pop(symbol, None)
@@ -284,7 +305,19 @@ def check_pending_option_fills() -> list[dict]:
     rather than a stale pre-trade quote.
 
     Same transient-vs-terminal distinction as check_pending_fills: a non-404 APIError keeps the order
-    tracked and just records the failure; only a confirmed 404 drops it without a fill ever observed."""
+    tracked and just records the failure; only a confirmed 404 drops it without a fill ever observed.
+
+    A PARTIALLY_FILLED order updates _option_positions and the DB row on every poll but stays in
+    _pending_option_fills -- the first observation of any fill (partial or full) does the initial
+    DB INSERT (db.record_options_trade_opened) and emits the one "fill" event/Slack notification for
+    this order id; every later observation of the same still-open order instead does a DB UPDATE
+    (db.record_options_trade_updated) and emits no new event, keyed off ctx["db_row_opened"] (which
+    may already be seeded True by reconcile_tracked_state_once() if this order was reconstructed for
+    a contract that already had an open DB row -- see finding 2, fix-loop round 1). The entry is only
+    dropped from _pending_option_fills once the order leaves the partially-filled state entirely
+    (order.status != PARTIALLY_FILLED) -- see finding 1, fix-loop round 1: this covers not just
+    FILLED/CANCELED/EXPIRED/REJECTED but any other real terminal-with-a-fill Alpaca status (e.g.
+    done_for_day, replaced, stopped), so an unusual status never leaks this entry forever."""
     events = []
     for order_id, ctx in _pending_option_fills_snapshot():
         try:
@@ -322,10 +355,16 @@ def check_pending_option_fills() -> list[dict]:
                     ctx["delta"], fill_price, filled_qty, ctx["reasoning"], ctx["cycle_id"],
                 )
 
-            # Terminal here means either a full fill, or a partial fill that will never grow further
-            # (the order itself went canceled/expired/rejected after partially filling) -- either way
-            # nothing more will ever be observed for this order id, so it's safe to stop polling it.
-            is_terminal = order.status == OrderStatus.FILLED or order.status in _TERMINAL_NO_FILL
+            # Terminal here means anything other than still-partially-filled: a full fill, or a
+            # partial fill that will never grow further because the order itself left the
+            # partially-filled state (canceled/expired/rejected after partially filling, or any
+            # other real Alpaca terminal-with-a-fill status -- e.g. done_for_day, replaced,
+            # stopped -- that isn't FILLED and isn't in _TERMINAL_NO_FILL either). Checking
+            # `!= PARTIALLY_FILLED` rather than enumerating every such status by name is what
+            # stops an unusual-but-real status from leaking this entry forever (fix-loop round 1,
+            # finding 1) -- either way, once the order leaves partially-filled, nothing more will
+            # ever be observed for this order id, so it's safe to stop polling it.
+            is_terminal = order.status != OrderStatus.PARTIALLY_FILLED
             if not ctx.get("db_row_opened"):
                 # Emit the fill event (and therefore the one Slack/DB notification) only on the
                 # first fill observed for this order -- otherwise a slowly-filling partial order
@@ -777,6 +816,19 @@ def reconcile_tracked_state_once() -> bool:
 
     try:
         open_option_orders = trading_client2.get_orders(GetOrdersRequest(status="open", side=OrderSide.BUY))
+
+        # Independent of the option-positions-rebuild block above -- that block's own `open_trades`
+        # is assigned inside a nested try and may be unbound if either its outer or inner try raised
+        # first, so reusing it here risks a NameError or silently-wrong state (fix-loop round 1,
+        # finding 2). This fetch has its own try/except so a DB hiccup during just this step
+        # degrades to the safe default (db_row_opened=False -- worst case one duplicate INSERT on
+        # the rare double-failure case) rather than losing the whole reconciliation step.
+        try:
+            open_contract_symbols = {trade["contract_symbol"] for trade in db.fetch_open_options_trades()}
+        except Exception as exc:
+            open_contract_symbols = set()
+            log(f"💥  failed to fetch open options_trades while reconstructing pending option orders: {exc}")
+
         restored_pending_options = 0
         for order in open_option_orders:
             with _state_lock:
@@ -787,6 +839,11 @@ def reconcile_tracked_state_once() -> bool:
             if parsed is None:
                 log(f"⚠️  cannot reconstruct pending option order {order.id} ({order.symbol}): symbol doesn't match OCC format")
                 continue
+            # Seed db_row_opened from whether this contract already has an open options_trades row
+            # (e.g. the order had already partially filled and been DB-recorded before the restart,
+            # or a race with the poll thread) -- otherwise the eventual fill would re-INSERT a
+            # duplicate open row and re-fire the first-fill Slack notification for a contract that's
+            # already tracked (fix-loop round 1, finding 2).
             _set_pending_option_fill(order.id, {
                 "contract_symbol": order.symbol,
                 "symbol": parsed["symbol"],
@@ -797,6 +854,7 @@ def reconcile_tracked_state_once() -> bool:
                 "qty": int(float(order.qty)),
                 "reasoning": "reconstructed_after_restart",
                 "cycle_id": None,
+                "db_row_opened": order.symbol in open_contract_symbols,
             })
             restored_pending_options += 1
         if restored_pending_options:
@@ -1365,6 +1423,7 @@ def sell_option(contract_symbol: str, reason: str = "dealer_signal") -> dict:
             log(f"⚠️  no open option position of {contract_symbol} to sell -- dropping tracking")
             with _state_lock:
                 _option_positions.pop(contract_symbol, None)
+                _drop_pending_option_fills_for_contract(contract_symbol)
             return {"status": "skipped", "detail": "no open position"}
         log(f"💥  failed to fetch option position {contract_symbol}: {exc}")
         return {"status": "error", "detail": str(exc)}
@@ -1375,6 +1434,7 @@ def sell_option(contract_symbol: str, reason: str = "dealer_signal") -> dict:
             log(f"⚠️  {contract_symbol} is a short position (qty={qty}) -- refusing to sell, dropping tracking")
         with _state_lock:
             _option_positions.pop(contract_symbol, None)
+            _drop_pending_option_fills_for_contract(contract_symbol)
         return {"status": "skipped", "detail": "no open position"}
 
     req = MarketOrderRequest(symbol=contract_symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
@@ -1387,6 +1447,7 @@ def sell_option(contract_symbol: str, reason: str = "dealer_signal") -> dict:
     log(f"✅  option sell order submitted: {order.id}")
     with _state_lock:
         _option_positions.pop(contract_symbol, None)
+        _drop_pending_option_fills_for_contract(contract_symbol)
 
     exit_premium = float(position.current_price) if position.current_price is not None else None
     db.record_options_trade_closed(contract_symbol, reason, exit_premium)
