@@ -13,7 +13,7 @@ async def get_options_tools():
     src.common.alpaca_client's trading_client2/option_data_client2 -- so switching the "account2"
     paper account in config.yaml also repoints which credentials this MCP subprocess is launched
     with, not just the direct alpaca-py clients."""
-    key_env, secret_env = account_env_names("account2", "ALPACA_PAPER_API_KEY2", "ALPACA_PAPER_API_SECRET2")
+    key_env, secret_env = account_env_names("account2", "ALPACA_PAPER_API_KEY", "ALPACA_PAPER_API_SECRET")
     client = MultiServerMCPClient(
         {
             "alpaca": {

@@ -25,13 +25,17 @@ floor_broker:
 # exist under those env var names in the mlabs-api-keys k8s Secret (a pod restart is still needed
 # the first time a new named pair is added to the Secret, since env var values are fixed at pod
 # start; only which pair is *active* is live-switchable).
+# account2 defaults to the same credentials as account1 (there's only one funded paper account
+# today). ALPACA_PAPER_API_KEY2/ALPACA_PAPER_API_SECRET2 are pre-wired as the switch target: once
+# a real second paper account's credentials are added to the mlabs-api-keys k8s Secret under those
+# names (+ one pod restart), flip account2.key_env/secret_env below to them to split it out live.
 alpaca:
   account1:
     key_env: "ALPACA_PAPER_API_KEY"
     secret_env: "ALPACA_PAPER_API_SECRET"
   account2:
-    key_env: "ALPACA_PAPER_API_KEY2"
-    secret_env: "ALPACA_PAPER_API_SECRET2"
+    key_env: "ALPACA_PAPER_API_KEY"
+    secret_env: "ALPACA_PAPER_API_SECRET"
 
 trading:
   slP: 0.98

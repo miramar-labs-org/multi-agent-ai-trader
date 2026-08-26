@@ -71,11 +71,11 @@ crypto_data_client = _LazyAlpacaClient(
 )
 
 trading_client2 = _LazyAlpacaClient(
-    "account2", "ALPACA_PAPER_API_KEY2", "ALPACA_PAPER_API_SECRET2",
+    "account2", "ALPACA_PAPER_API_KEY", "ALPACA_PAPER_API_SECRET",
     lambda key, secret: TradingClient(key, secret, paper=True),
 )
 option_data_client2 = _LazyAlpacaClient(
-    "account2", "ALPACA_PAPER_API_KEY2", "ALPACA_PAPER_API_SECRET2", OptionHistoricalDataClient
+    "account2", "ALPACA_PAPER_API_KEY", "ALPACA_PAPER_API_SECRET", OptionHistoricalDataClient
 )
 
 
