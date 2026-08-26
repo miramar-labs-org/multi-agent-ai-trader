@@ -13,6 +13,7 @@ def test_get_options_tools_config_uses_read_only_toolsets(monkeypatch):
 
     monkeypatch.setenv("ALPACA_PAPER_API_KEY2", "test-key")
     monkeypatch.setenv("ALPACA_PAPER_API_SECRET2", "test-secret")
+    monkeypatch.setattr(mcp_options, "account_env_names", lambda *a: ("ALPACA_PAPER_API_KEY2", "ALPACA_PAPER_API_SECRET2"))
     monkeypatch.setattr(mcp_options, "MultiServerMCPClient", FakeClient)
 
     import asyncio
