@@ -51,18 +51,20 @@ def _api_error(payload: dict) -> APIError:
 
 @pytest.fixture(autouse=True)
 def _clear_tracked_brackets():
-    """_tracked_brackets, _pending_fills, _crypto_stops, and _option_positions are module-level
-    state shared across every test in this file -- clear them before and after each test so tests
-    can't leak tracking into one another."""
+    """_tracked_brackets, _pending_fills, _crypto_stops, _option_positions, and
+    _pending_option_fills are module-level state shared across every test in this file -- clear
+    them before and after each test so tests can't leak tracking into one another."""
     execution._tracked_brackets.clear()
     execution._pending_fills.clear()
     execution._crypto_stops.clear()
     execution._option_positions.clear()
+    execution._pending_option_fills.clear()
     yield
     execution._tracked_brackets.clear()
     execution._pending_fills.clear()
     execution._crypto_stops.clear()
     execution._option_positions.clear()
+    execution._pending_option_fills.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -1504,6 +1506,156 @@ def test_check_pending_fills_clears_poll_failures_once_order_is_reachable_again(
     assert "poll_failures" not in execution._pending_fills["order-1"]
 
 
+def test_check_pending_option_fills_reports_a_filled_order_and_commits_tracked_state(monkeypatch):
+    execution._pending_option_fills["order-opt-1"] = {
+        "contract_symbol": "AAPL250117C00200000",
+        "symbol": "AAPL",
+        "right": "call",
+        "strike": 200.0,
+        "expiration": "2025-01-17",
+        "delta": 0.45,
+        "qty": 2,
+        "reasoning": "test reasoning",
+        "cycle_id": "cycle-1",
+    }
+    fake_client = FakePendingFillTradingClient({"order-opt-1": FakePendingOrder(filled_avg_price="3.35")})
+    monkeypatch.setattr(execution, "trading_client2", fake_client)
+    recorded_db = {}
+    monkeypatch.setattr(execution.db, "record_options_trade_opened", lambda *a, **k: recorded_db.setdefault("opened", (a, k)))
+
+    events = execution.check_pending_option_fills()
+
+    assert events == [
+        {
+            "contract_symbol": "AAPL250117C00200000",
+            "symbol": "AAPL",
+            "right": "call",
+            "strike": 200.0,
+            "expiration": "2025-01-17",
+            "delta": 0.45,
+            "qty": 2,
+            "reasoning": "test reasoning",
+            "cycle_id": "cycle-1",
+            "kind": "fill",
+            "order_id": "order-opt-1",
+            "fill_price": 3.35,
+        }
+    ]
+    assert "order-opt-1" not in execution._pending_option_fills
+    with execution._state_lock:
+        assert execution._option_positions["AAPL250117C00200000"] == {
+            "symbol": "AAPL",
+            "right": "call",
+            "strike": 200.0,
+            "expiration": "2025-01-17",
+            "delta": 0.45,
+            "entry_premium": 3.35,
+            "qty": 2,
+        }
+    assert recorded_db["opened"] == (
+        ("AAPL", "AAPL250117C00200000", "call", 200.0, "2025-01-17", 0.45, 3.35, 2, "test reasoning", "cycle-1"),
+        {},
+    )
+
+
+def test_check_pending_option_fills_uses_actual_filled_qty_when_available(monkeypatch):
+    execution._pending_option_fills["order-opt-1"] = {
+        "contract_symbol": "AAPL250117C00200000",
+        "symbol": "AAPL",
+        "right": "call",
+        "strike": 200.0,
+        "expiration": "2025-01-17",
+        "delta": 0.45,
+        "qty": 2,
+        "reasoning": "test reasoning",
+        "cycle_id": "cycle-1",
+    }
+    order = FakePendingOrder(filled_avg_price="3.35")
+    order.filled_qty = "1"  # partial fill
+    fake_client = FakePendingFillTradingClient({"order-opt-1": order})
+    monkeypatch.setattr(execution, "trading_client2", fake_client)
+    monkeypatch.setattr(execution.db, "record_options_trade_opened", lambda *a, **k: None)
+
+    events = execution.check_pending_option_fills()
+
+    assert events[0]["qty"] == 1
+    with execution._state_lock:
+        assert execution._option_positions["AAPL250117C00200000"]["qty"] == 1
+
+
+def test_check_pending_option_fills_keeps_tracking_an_unfilled_order(monkeypatch):
+    execution._pending_option_fills["order-opt-1"] = {
+        "contract_symbol": "AAPL250117C00200000", "symbol": "AAPL", "right": "call", "strike": 200.0,
+        "expiration": "2025-01-17", "delta": 0.45, "qty": 2, "reasoning": "r", "cycle_id": "cycle-1",
+    }
+    fake_client = FakePendingFillTradingClient({"order-opt-1": FakePendingOrder(filled_avg_price=None, status=OrderStatus.NEW)})
+    monkeypatch.setattr(execution, "trading_client2", fake_client)
+
+    events = execution.check_pending_option_fills()
+
+    assert events == []
+    assert "order-opt-1" in execution._pending_option_fills
+    with execution._state_lock:
+        assert execution._option_positions == {}
+
+
+def test_check_pending_option_fills_untracks_order_on_terminal_no_fill_status(monkeypatch):
+    execution._pending_option_fills["order-opt-1"] = {
+        "contract_symbol": "AAPL250117C00200000", "symbol": "AAPL", "right": "call", "strike": 200.0,
+        "expiration": "2025-01-17", "delta": 0.45, "qty": 2, "reasoning": "r", "cycle_id": "cycle-1",
+    }
+    fake_client = FakePendingFillTradingClient({"order-opt-1": FakePendingOrder(filled_avg_price=None, status=OrderStatus.CANCELED)})
+    monkeypatch.setattr(execution, "trading_client2", fake_client)
+
+    events = execution.check_pending_option_fills()
+
+    assert events == [
+        {
+            "contract_symbol": "AAPL250117C00200000", "symbol": "AAPL", "right": "call", "strike": 200.0,
+            "expiration": "2025-01-17", "delta": 0.45, "qty": 2, "reasoning": "r", "cycle_id": "cycle-1",
+            "kind": "terminal", "order_id": "order-opt-1", "order_status": "canceled",
+        }
+    ]
+    assert "order-opt-1" not in execution._pending_option_fills
+    with execution._state_lock:
+        assert execution._option_positions == {}
+
+
+def test_check_pending_option_fills_untracks_order_on_confirmed_not_found(monkeypatch):
+    execution._pending_option_fills["order-opt-1"] = {
+        "contract_symbol": "AAPL250117C00200000", "symbol": "AAPL", "right": "call", "strike": 200.0,
+        "expiration": "2025-01-17", "delta": 0.45, "qty": 2, "reasoning": "r", "cycle_id": "cycle-1",
+    }
+    fake_client = FakePendingFillTradingClient(
+        {"order-opt-1": _api_error({"code": execution.ORDER_NOT_FOUND_CODE, "message": "order not found"})}
+    )
+    monkeypatch.setattr(execution, "trading_client2", fake_client)
+
+    events = execution.check_pending_option_fills()
+
+    assert events == []
+    assert "order-opt-1" not in execution._pending_option_fills
+
+
+def test_check_pending_option_fills_keeps_tracking_order_on_transient_api_error(monkeypatch):
+    execution._pending_option_fills["order-opt-1"] = {
+        "contract_symbol": "AAPL250117C00200000", "symbol": "AAPL", "right": "call", "strike": 200.0,
+        "expiration": "2025-01-17", "delta": 0.45, "qty": 2, "reasoning": "r", "cycle_id": "cycle-1",
+    }
+    fake_client = FakePendingFillTradingClient({"order-opt-1": _api_error({"code": 50000000, "message": "internal server error"})})
+    monkeypatch.setattr(execution, "trading_client2", fake_client)
+
+    events = execution.check_pending_option_fills()
+
+    assert events == []
+    assert execution._pending_option_fills["order-opt-1"]["poll_failures"] == 1
+
+    events = execution.check_pending_option_fills()
+
+    assert events == []
+    assert execution._pending_option_fills["order-opt-1"]["poll_failures"] == 2
+
+
 class FakeOrder:
     def __init__(self, id, symbol, side, status, filled_avg_price=None, legs=None):
         self.id = id
@@ -1878,7 +2030,9 @@ def test_buy_skips_when_state_not_reconciled(monkeypatch):
     assert client.submitted == []
 
 
-def test_buy_option_submits_order_and_tracks_position(monkeypatch):
+def test_buy_option_submits_order_and_defers_tracking_until_fill(monkeypatch):
+    """buy_option() must not write _option_positions or call record_options_trade_opened itself --
+    that's deferred to check_pending_option_fills() until a real fill is observed (Task 27)."""
     monkeypatch.setattr(execution, "is_state_reconciled", lambda: True)
     monkeypatch.setattr(execution, "get_current_option_ask_price", lambda contract_symbol: 3.20)
     recorded_db = {}
@@ -1909,10 +2063,20 @@ def test_buy_option_submits_order_and_tracks_position(monkeypatch):
 
     assert result["status"] == "submitted"
     assert result["order_id"] == "order-opt-1"
-    assert "opened" in recorded_db
+    assert "opened" not in recorded_db
     with execution._state_lock:
-        assert execution._option_positions["AAPL250117C00200000"]["entry_premium"] == 3.20
-        assert execution._option_positions["AAPL250117C00200000"]["qty"] == 2
+        assert "AAPL250117C00200000" not in execution._option_positions
+        assert execution._pending_option_fills["order-opt-1"] == {
+            "contract_symbol": "AAPL250117C00200000",
+            "symbol": "AAPL",
+            "right": "call",
+            "strike": 200.0,
+            "expiration": "2025-01-17",
+            "delta": 0.45,
+            "qty": 2,
+            "reasoning": "test reasoning",
+            "cycle_id": "cycle-1",
+        }
 
 
 def test_buy_option_refuses_when_state_not_reconciled(monkeypatch):
@@ -2015,8 +2179,6 @@ def test_buy_option_proceeds_when_contract_already_open_regardless_of_max_concur
     )
 
     assert result["status"] == "submitted"
-    with execution._state_lock:
-        del execution._option_positions["AAPL250117C00200000"]
 
 
 def test_buy_option_refuses_when_live_notional_exceeds_cap(monkeypatch):

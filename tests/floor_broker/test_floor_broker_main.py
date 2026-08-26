@@ -274,6 +274,88 @@ def test_poll_pending_fills_survives_an_exception_and_reaches_the_next_sleep(mon
         fb_main.poll_pending_fills()
 
 
+def test_poll_pending_option_fills_posts_slack_notification_for_a_fill(monkeypatch):
+    monkeypatch.setattr(
+        fb_main.execution,
+        "check_pending_option_fills",
+        lambda: [
+            {
+                "contract_symbol": "AAPL250117C00200000",
+                "symbol": "AAPL",
+                "kind": "fill",
+                "order_id": "order-opt-1",
+                "fill_price": 3.35,
+                "qty": 2,
+            }
+        ],
+    )
+    posted = []
+    monkeypatch.setattr(fb_main.slack, "notify_floor_broker_result", lambda *a, **k: posted.append((a, k)))
+    monkeypatch.setattr(fb_main.time, "sleep", lambda s: (_ for _ in ()).throw(_StopLoop))
+
+    with pytest.raises(_StopLoop):
+        fb_main.poll_pending_option_fills()
+
+    assert len(posted) == 1
+    args, kwargs = posted[0]
+    assert args[0] == "AAPL"
+    assert args[1] == "BUY"
+    assert args[2] == "executed"
+    assert kwargs["reason"] == "opening_position"
+    assert kwargs["fill_price"] == 3.35
+
+
+def test_poll_pending_option_fills_posts_no_fill_notice_for_a_terminal_event(monkeypatch):
+    monkeypatch.setattr(
+        fb_main.execution,
+        "check_pending_option_fills",
+        lambda: [
+            {
+                "contract_symbol": "AAPL250117C00200000",
+                "symbol": "AAPL",
+                "kind": "terminal",
+                "order_id": "order-opt-1",
+                "order_status": "rejected",
+            }
+        ],
+    )
+    posted = []
+    monkeypatch.setattr(fb_main.slack, "notify_floor_broker_result", lambda *a, **k: posted.append((a, k)))
+    monkeypatch.setattr(fb_main.time, "sleep", lambda s: (_ for _ in ()).throw(_StopLoop))
+
+    with pytest.raises(_StopLoop):
+        fb_main.poll_pending_option_fills()
+
+    assert len(posted) == 1
+    args, kwargs = posted[0]
+    assert args[0] == "AAPL"
+    assert args[1] == "BUY"
+    assert args[2] == "no_fill"
+
+
+def test_poll_pending_option_fills_posts_nothing_when_no_events(monkeypatch):
+    monkeypatch.setattr(fb_main.execution, "check_pending_option_fills", lambda: [])
+    posted = []
+    monkeypatch.setattr(fb_main.slack, "notify_floor_broker_result", lambda *a, **k: posted.append((a, k)))
+    monkeypatch.setattr(fb_main.time, "sleep", lambda s: (_ for _ in ()).throw(_StopLoop))
+
+    with pytest.raises(_StopLoop):
+        fb_main.poll_pending_option_fills()
+
+    assert posted == []
+
+
+def test_poll_pending_option_fills_survives_an_exception_and_reaches_the_next_sleep(monkeypatch):
+    def _raise():
+        raise RuntimeError("alpaca unavailable")
+
+    monkeypatch.setattr(fb_main.execution, "check_pending_option_fills", _raise)
+    monkeypatch.setattr(fb_main.time, "sleep", lambda s: (_ for _ in ()).throw(_StopLoop))
+
+    with pytest.raises(_StopLoop):
+        fb_main.poll_pending_option_fills()
+
+
 def test_poll_eod_flatten_posts_slack_notification_for_each_event(monkeypatch):
     monkeypatch.setattr(
         fb_main.execution,

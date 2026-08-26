@@ -141,6 +141,49 @@ def poll_pending_fills():
         time.sleep(PENDING_FILL_POLL_INTERVAL_S)
 
 
+def poll_pending_option_fills():
+    """Runs for the lifetime of the process, watching for the fill of option BUY orders
+    buy_option() itself submitted -- mirrors poll_pending_fills() but against account 2
+    (trading_client2), via execution.check_pending_option_fills(). _option_positions and the
+    options_trades DB row are only written on a confirmed fill (see check_pending_option_fills()'s
+    docstring); an order that never fills produces no phantom tracked state or DB row."""
+    while True:
+        try:
+            for event in execution.check_pending_option_fills():
+                if event["kind"] == "fill":
+                    log(f"💰 option BUY filled for {event['contract_symbol']} @ {event['fill_price']}")
+                    slack.notify_floor_broker_result(
+                        event["symbol"],
+                        "BUY",
+                        "executed",
+                        f"option buy order filled: {event['order_id']}",
+                        reason="opening_position",
+                        fill_price=event["fill_price"],
+                    )
+                    db.record_floor_broker_event(
+                        event["symbol"],
+                        "fill",
+                        f"option buy order filled: {event['order_id']}",
+                        qty=event.get("qty"),
+                        price=event["fill_price"],
+                    )
+                else:
+                    log(f"⚠️ option BUY {event['contract_symbol']} closed with no fill: {event['order_status']}")
+                    slack.notify_floor_broker_result(
+                        event["symbol"],
+                        "BUY",
+                        "no_fill",
+                        f"option order {event['order_status']}, never filled: {event['order_id']}",
+                        reason="opening_position",
+                    )
+                    db.record_floor_broker_event(
+                        event["symbol"], "no_fill", f"option order {event['order_status']}, never filled: {event['order_id']}"
+                    )
+        except Exception as exc:
+            log(f"💥 pending-option-fill poll failed: {exc}")
+        time.sleep(PENDING_FILL_POLL_INTERVAL_S)
+
+
 def poll_eod_flatten():
     """Runs for the lifetime of the process. When strategy config enables eod_flatten and Alpaca's
     live clock reports the market is close to closing, sells every open stock position (crypto is
@@ -217,6 +260,7 @@ def main():
     threading.Thread(target=poll_reconciliation, daemon=True).start()
     threading.Thread(target=poll_bracket_fills, daemon=True).start()
     threading.Thread(target=poll_pending_fills, daemon=True).start()
+    threading.Thread(target=poll_pending_option_fills, daemon=True).start()
     threading.Thread(target=poll_kill_switch, daemon=True).start()
     threading.Thread(target=poll_eod_flatten, daemon=True).start()
     threading.Thread(target=poll_symbol_bases, daemon=True).start()

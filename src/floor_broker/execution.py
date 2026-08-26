@@ -87,6 +87,15 @@ _crypto_stops: dict[str, tuple[float, float]] = {}
 # exit mechanism for options -- same in-memory-only, no-restart-recovery caveat as _crypto_stops.
 _option_positions: dict[str, dict] = {}
 
+# Tracks every option BUY order buy_option() itself submitted, keyed by order id, so
+# check_pending_option_fills() can later confirm the fill and only then commit the position into
+# _option_positions and record it to the DB -- mirrors _pending_fills/check_pending_fills() for the
+# stock/crypto path, except this one polls trading_client2 (account 2, options-only) since option
+# orders never touch trading_client (account 1) and so cannot share that dict or poller. In-memory
+# only, same restart caveat as _pending_fills: an option BUY that fills in the gap between the pod
+# dying and reconstruct_tracked_state() running still produces no Slack notice for that fill.
+_pending_option_fills: dict[str, dict] = {}
+
 # False from process start until reconcile_tracked_state_once() has succeeded at least once.
 # buy() refuses new BUYs while this is False (see below) -- submitting a fresh order before
 # Alpaca's live open-order state has been reconciled into _pending_fills/_tracked_brackets risks
@@ -184,6 +193,37 @@ def _set_pending_fill(order_id: str, ctx: dict) -> None:
         _pending_fills[order_id] = ctx
 
 
+def _pending_option_fills_snapshot() -> list[tuple[str, dict]]:
+    with _state_lock:
+        return [(order_id, ctx.copy()) for order_id, ctx in _pending_option_fills.items()]
+
+
+def _drop_pending_option_fill(order_id: str) -> None:
+    with _state_lock:
+        _pending_option_fills.pop(order_id, None)
+
+
+def _increment_pending_option_poll_failures(order_id: str) -> int:
+    with _state_lock:
+        ctx = _pending_option_fills.get(order_id)
+        if ctx is None:
+            return 0
+        ctx["poll_failures"] = ctx.get("poll_failures", 0) + 1
+        return ctx["poll_failures"]
+
+
+def _clear_pending_option_poll_failures(order_id: str) -> None:
+    with _state_lock:
+        ctx = _pending_option_fills.get(order_id)
+        if ctx is not None:
+            ctx.pop("poll_failures", None)
+
+
+def _set_pending_option_fill(order_id: str, ctx: dict) -> None:
+    with _state_lock:
+        _pending_option_fills[order_id] = ctx
+
+
 def _stop_tracking_symbol(symbol: str) -> None:
     with _state_lock:
         _tracked_brackets.pop(symbol, None)
@@ -229,6 +269,61 @@ def check_pending_fills() -> list[dict]:
         elif order.status in _TERMINAL_NO_FILL:
             events.append({**ctx, "kind": "terminal", "order_id": order_id, "order_status": order.status.value})
             _drop_pending_fill(order_id)
+
+    return events
+
+
+def check_pending_option_fills() -> list[dict]:
+    """Polls every option BUY order buy_option() itself submitted for its own fill, mirroring
+    check_pending_fills() but against trading_client2 (account 2, options-only) -- option orders never
+    touch trading_client (account 1), so the two mechanisms cannot share one dict or one poller.
+    _option_positions and the options_trades DB row are only written here, on a confirmed fill, using
+    the real fill_price -- never in buy_option() itself, which only knows the pre-trade quoted ask.
+    This is what stops a rejected/canceled/unfilled option BUY from leaving behind phantom tracked
+    state, and what keeps check_option_stops()'s synthetic SL/TP math anchored to the real entry price
+    rather than a stale pre-trade quote.
+
+    Same transient-vs-terminal distinction as check_pending_fills: a non-404 APIError keeps the order
+    tracked and just records the failure; only a confirmed 404 drops it without a fill ever observed."""
+    events = []
+    for order_id, ctx in _pending_option_fills_snapshot():
+        try:
+            order = trading_client2.get_order_by_id(order_id)
+        except APIError as exc:
+            if _is_order_not_found(exc):
+                log(f"⚠️  pending option order {order_id} ({ctx['contract_symbol']}) no longer exists on Alpaca -- dropping")
+                _drop_pending_option_fill(order_id)
+            else:
+                failures = _increment_pending_option_poll_failures(order_id)
+                log(f"💥  poll failure #{failures} for pending option order {order_id} ({ctx['contract_symbol']}): {exc}")
+            continue
+
+        _clear_pending_option_poll_failures(order_id)
+        ctx.pop("poll_failures", None)
+
+        if order.filled_avg_price is not None:
+            fill_price = float(order.filled_avg_price)
+            filled_qty = int(float(order.filled_qty)) if getattr(order, "filled_qty", None) else ctx["qty"]
+            with _state_lock:
+                _option_positions[ctx["contract_symbol"]] = {
+                    "symbol": ctx["symbol"],
+                    "right": ctx["right"],
+                    "strike": ctx["strike"],
+                    "expiration": ctx["expiration"],
+                    "delta": ctx["delta"],
+                    "entry_premium": fill_price,
+                    "qty": filled_qty,
+                }
+            db.record_options_trade_opened(
+                ctx["symbol"], ctx["contract_symbol"], ctx["right"], ctx["strike"], ctx["expiration"],
+                ctx["delta"], fill_price, filled_qty, ctx["reasoning"], ctx["cycle_id"],
+            )
+            event = {**ctx, "kind": "fill", "order_id": order_id, "fill_price": fill_price, "qty": filled_qty}
+            events.append(event)
+            _drop_pending_option_fill(order_id)
+        elif order.status in _TERMINAL_NO_FILL:
+            events.append({**ctx, "kind": "terminal", "order_id": order_id, "order_status": order.status.value})
+            _drop_pending_option_fill(order_id)
 
     return events
 
@@ -1198,17 +1293,17 @@ def buy_option(
         return {"status": "error", "detail": str(exc)}
 
     log(f"✅  option buy order submitted: {order.id}")
-    with _state_lock:
-        _option_positions[contract_symbol] = {
-            "symbol": symbol,
-            "right": right,
-            "strike": strike,
-            "expiration": expiration,
-            "delta": delta,
-            "entry_premium": entry_premium,
-            "qty": qty,
-        }
-    db.record_options_trade_opened(symbol, contract_symbol, right, strike, expiration, delta, entry_premium, qty, reasoning, cycle_id)
+    _set_pending_option_fill(order.id, {
+        "contract_symbol": contract_symbol,
+        "symbol": symbol,
+        "right": right,
+        "strike": strike,
+        "expiration": expiration,
+        "delta": delta,
+        "qty": qty,
+        "reasoning": reasoning,
+        "cycle_id": cycle_id,
+    })
 
     return {
         "status": "submitted",
