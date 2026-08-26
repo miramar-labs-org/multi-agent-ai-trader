@@ -160,6 +160,18 @@ def test_record_options_trade_closed_updates_expected_row(monkeypatch):
     assert params == ("take_profit", 4.00, "MGN260116C00100000")
 
 
+def test_record_options_trade_updated_updates_expected_row(monkeypatch):
+    conn = FakeConnection()
+    _patch_pool(monkeypatch, conn)
+
+    db.record_options_trade_updated("MGN260116C00100000", 3.25, 2)
+
+    sql, params = conn.executed[0]
+    assert "UPDATE options_trades" in sql
+    assert "WHERE contract_symbol = %s AND closed_at IS NULL" in sql
+    assert params == (3.25, 2, "MGN260116C00100000")
+
+
 def test_record_position_opened_inserts_expected_row(monkeypatch):
     conn = FakeConnection()
     _patch_pool(monkeypatch, conn)
@@ -252,6 +264,7 @@ def test_fetch_position_opened_at_returns_none_when_untracked(monkeypatch):
             ("MGN", "MGN260116C00100000", "call", 100.0, "2026-01-16", 0.45, 2.50, 1, "reasoning", "cycle-1"),
         ),
         (db.record_options_trade_closed, ("MGN260116C00100000", "take_profit", 4.00)),
+        (db.record_options_trade_updated, ("MGN260116C00100000", 3.25, 2)),
         (db.record_position_opened, ("MGN",)),
         (db.record_position_closed, ("MGN",)),
         (db.record_eod_report_sent, (date(2026, 8, 6),)),

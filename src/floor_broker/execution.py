@@ -314,13 +314,28 @@ def check_pending_option_fills() -> list[dict]:
                     "entry_premium": fill_price,
                     "qty": filled_qty,
                 }
-            db.record_options_trade_opened(
-                ctx["symbol"], ctx["contract_symbol"], ctx["right"], ctx["strike"], ctx["expiration"],
-                ctx["delta"], fill_price, filled_qty, ctx["reasoning"], ctx["cycle_id"],
-            )
-            event = {**ctx, "kind": "fill", "order_id": order_id, "fill_price": fill_price, "qty": filled_qty}
-            events.append(event)
-            _drop_pending_option_fill(order_id)
+            if ctx.get("db_row_opened"):
+                db.record_options_trade_updated(ctx["contract_symbol"], fill_price, filled_qty)
+            else:
+                db.record_options_trade_opened(
+                    ctx["symbol"], ctx["contract_symbol"], ctx["right"], ctx["strike"], ctx["expiration"],
+                    ctx["delta"], fill_price, filled_qty, ctx["reasoning"], ctx["cycle_id"],
+                )
+
+            # Terminal here means either a full fill, or a partial fill that will never grow further
+            # (the order itself went canceled/expired/rejected after partially filling) -- either way
+            # nothing more will ever be observed for this order id, so it's safe to stop polling it.
+            is_terminal = order.status == OrderStatus.FILLED or order.status in _TERMINAL_NO_FILL
+            if not ctx.get("db_row_opened"):
+                # Emit the fill event (and therefore the one Slack/DB notification) only on the
+                # first fill observed for this order -- otherwise a slowly-filling partial order
+                # would re-notify on every poll tick until it finishes.
+                events.append({**ctx, "kind": "fill", "order_id": order_id, "fill_price": fill_price, "qty": filled_qty})
+            if is_terminal:
+                _drop_pending_option_fill(order_id)
+            else:
+                ctx["db_row_opened"] = True
+                _set_pending_option_fill(order_id, ctx)
         elif order.status in _TERMINAL_NO_FILL:
             events.append({**ctx, "kind": "terminal", "order_id": order_id, "order_status": order.status.value})
             _drop_pending_option_fill(order_id)
@@ -759,6 +774,35 @@ def reconcile_tracked_state_once() -> bool:
             log(f"🔄  reconstructed {options_restored} option position(s) from Alpaca + options_trades")
     except APIError as exc:
         log(f"💥  failed to fetch open option positions from Alpaca while reconciling tracked state: {exc}")
+
+    try:
+        open_option_orders = trading_client2.get_orders(GetOrdersRequest(status="open", side=OrderSide.BUY))
+        restored_pending_options = 0
+        for order in open_option_orders:
+            with _state_lock:
+                already_pending = order.id in _pending_option_fills
+            if already_pending:
+                continue
+            parsed = _parse_occ_contract_symbol(order.symbol)
+            if parsed is None:
+                log(f"⚠️  cannot reconstruct pending option order {order.id} ({order.symbol}): symbol doesn't match OCC format")
+                continue
+            _set_pending_option_fill(order.id, {
+                "contract_symbol": order.symbol,
+                "symbol": parsed["symbol"],
+                "right": parsed["right"],
+                "strike": parsed["strike"],
+                "expiration": parsed["expiration"],
+                "delta": None,
+                "qty": int(float(order.qty)),
+                "reasoning": "reconstructed_after_restart",
+                "cycle_id": None,
+            })
+            restored_pending_options += 1
+        if restored_pending_options:
+            log(f"🔄  reconstructed {restored_pending_options} pending option order(s) from Alpaca")
+    except APIError as exc:
+        log(f"💥  failed to fetch open option orders from Alpaca while reconciling tracked state: {exc}")
 
     _set_state_reconciled(True)
     return True

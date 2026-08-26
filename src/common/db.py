@@ -223,6 +223,26 @@ def record_options_trade_closed(contract_symbol: str, exit_reason: str, exit_pre
         log(f"⚠️ record_options_trade_closed failed: {exc}")
 
 
+def record_options_trade_updated(contract_symbol: str, entry_premium: float, qty: int) -> None:
+    """Fire-and-forget update -- never raises. Updates the still-open row for this contract_symbol
+    with the latest cumulative fill price/qty as a partially-filled option BUY order continues to
+    fill; a contract symbol is unique to one strike/expiration/right, so at most one open row can
+    exist for it at a time (same uniqueness assumption record_options_trade_closed relies on)."""
+    try:
+        _ensure_schema()
+        with _get_pool().connection() as conn:
+            conn.execute(
+                """
+                UPDATE options_trades
+                SET entry_premium = %s, qty = %s
+                WHERE contract_symbol = %s AND closed_at IS NULL
+                """,
+                (entry_premium, qty, contract_symbol),
+            )
+    except Exception as exc:
+        log(f"⚠️ record_options_trade_updated failed: {exc}")
+
+
 def fetch_open_options_trades() -> list[dict]:
     _ensure_schema()
     with _get_pool().connection() as conn:
