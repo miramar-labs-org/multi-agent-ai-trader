@@ -36,6 +36,26 @@ ORDER_NOT_FOUND_CODE = 40410000  # Alpaca's code for "no order exists with that 
 
 _TERMINAL_NO_FILL = {OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED}
 
+# Options-only (account 2) terminal/non-terminal classification for check_pending_option_fills().
+# Deliberately NOT shared with _TERMINAL_NO_FILL (account 1's check_pending_fills() uses that one
+# and is out of scope for the options mechanism). Everything NOT in this set is terminal for
+# options pending-fill purposes -- fix-loop round 2, finding 1 (remaining half): the prior
+# `!= PARTIALLY_FILLED` check correctly handled the with-fill branch but the no-fill branch's
+# `in _TERMINAL_NO_FILL` only caught CANCELED/EXPIRED/REJECTED, leaking any other zero-fill
+# terminal status (DONE_FOR_DAY, REPLACED, STOPPED, SUSPENDED) forever. Verified against every
+# member of alpaca.trading.enums.OrderStatus (17 total).
+_OPTION_NON_TERMINAL = {
+    OrderStatus.NEW,
+    OrderStatus.PARTIALLY_FILLED,
+    OrderStatus.ACCEPTED,
+    OrderStatus.PENDING_NEW,
+    OrderStatus.ACCEPTED_FOR_BIDDING,
+    OrderStatus.HELD,
+    OrderStatus.PENDING_CANCEL,
+    OrderStatus.PENDING_REPLACE,
+    OrderStatus.PENDING_REVIEW,
+}
+
 _RECONCILE_MAX_STARTUP_ATTEMPTS = 5
 _RECONCILE_BACKOFF_BASE_S = 5.0
 
@@ -314,10 +334,19 @@ def check_pending_option_fills() -> list[dict]:
     (db.record_options_trade_updated) and emits no new event, keyed off ctx["db_row_opened"] (which
     may already be seeded True by reconcile_tracked_state_once() if this order was reconstructed for
     a contract that already had an open DB row -- see finding 2, fix-loop round 1). The entry is only
-    dropped from _pending_option_fills once the order leaves the partially-filled state entirely
-    (order.status != PARTIALLY_FILLED) -- see finding 1, fix-loop round 1: this covers not just
-    FILLED/CANCELED/EXPIRED/REJECTED but any other real terminal-with-a-fill Alpaca status (e.g.
-    done_for_day, replaced, stopped), so an unusual status never leaks this entry forever."""
+    dropped from _pending_option_fills once order.status leaves _OPTION_NON_TERMINAL (fix-loop round
+    2, finding 1's remaining half) -- this now covers every real Alpaca terminal status, with or
+    without a fill (e.g. done_for_day, replaced, stopped, suspended), not just
+    FILLED/CANCELED/EXPIRED/REJECTED, so an unusual status never leaks this entry forever. The same
+    set is used for the zero-fill branch below, so PENDING_CANCEL/PENDING_REPLACE/PENDING_REVIEW are
+    correctly kept non-terminal in both branches.
+
+    check_pending_option_fills() re-checks _pending_option_fills membership under _state_lock
+    immediately before writing _option_positions or making the terminal-drop/reseed decision
+    (fix-loop round 2, new issue A) -- get_order_by_id() above is a network call made outside any
+    lock, so a concurrent sell_option() can drop this order's tracking in that window; if it did,
+    this poll skips the order entirely rather than resurrecting a phantom position or orphaning a
+    DB row."""
     events = []
     for order_id, ctx in _pending_option_fills_snapshot():
         try:
@@ -337,7 +366,24 @@ def check_pending_option_fills() -> list[dict]:
         if order.filled_avg_price is not None:
             fill_price = float(order.filled_avg_price)
             filled_qty = int(float(order.filled_qty)) if getattr(order, "filled_qty", None) else ctx["qty"]
+            db_row_was_open = ctx.get("db_row_opened", False)
+            # Snapshot the fill event now, before ctx is possibly mutated below (db_row_opened is
+            # set True inside the lock for a still-open partial fill) -- this preserves the
+            # pre-round-2 event shape (no db_row_opened key ever leaking into the emitted event).
+            fill_event = None if db_row_was_open else {**ctx, "kind": "fill", "order_id": order_id, "fill_price": fill_price, "qty": filled_qty}
+            # Terminal here means order.status has left _OPTION_NON_TERMINAL: a full fill, or a
+            # partial fill that will never grow further because the order itself resolved
+            # (canceled/expired/rejected/done_for_day/replaced/stopped/suspended after partially
+            # filling). Fix-loop round 2, finding 1's remaining half.
+            is_terminal = order.status not in _OPTION_NON_TERMINAL
             with _state_lock:
+                if order_id not in _pending_option_fills:
+                    # A concurrent sell_option() (or another poll) already dropped this contract's
+                    # tracking between the get_order_by_id() call above and this lock -- the
+                    # position was sold out from under this poll. Do not resurrect
+                    # _option_positions/_pending_option_fills, and do not write a DB row for it
+                    # (fix-loop round 2, new issue A).
+                    continue
                 _option_positions[ctx["contract_symbol"]] = {
                     "symbol": ctx["symbol"],
                     "right": ctx["right"],
@@ -347,35 +393,24 @@ def check_pending_option_fills() -> list[dict]:
                     "entry_premium": fill_price,
                     "qty": filled_qty,
                 }
-            if ctx.get("db_row_opened"):
+                if is_terminal:
+                    _pending_option_fills.pop(order_id, None)
+                else:
+                    ctx["db_row_opened"] = True
+                    _pending_option_fills[order_id] = ctx
+
+            if db_row_was_open:
                 db.record_options_trade_updated(ctx["contract_symbol"], fill_price, filled_qty)
             else:
                 db.record_options_trade_opened(
                     ctx["symbol"], ctx["contract_symbol"], ctx["right"], ctx["strike"], ctx["expiration"],
                     ctx["delta"], fill_price, filled_qty, ctx["reasoning"], ctx["cycle_id"],
                 )
-
-            # Terminal here means anything other than still-partially-filled: a full fill, or a
-            # partial fill that will never grow further because the order itself left the
-            # partially-filled state (canceled/expired/rejected after partially filling, or any
-            # other real Alpaca terminal-with-a-fill status -- e.g. done_for_day, replaced,
-            # stopped -- that isn't FILLED and isn't in _TERMINAL_NO_FILL either). Checking
-            # `!= PARTIALLY_FILLED` rather than enumerating every such status by name is what
-            # stops an unusual-but-real status from leaking this entry forever (fix-loop round 1,
-            # finding 1) -- either way, once the order leaves partially-filled, nothing more will
-            # ever be observed for this order id, so it's safe to stop polling it.
-            is_terminal = order.status != OrderStatus.PARTIALLY_FILLED
-            if not ctx.get("db_row_opened"):
                 # Emit the fill event (and therefore the one Slack/DB notification) only on the
                 # first fill observed for this order -- otherwise a slowly-filling partial order
                 # would re-notify on every poll tick until it finishes.
-                events.append({**ctx, "kind": "fill", "order_id": order_id, "fill_price": fill_price, "qty": filled_qty})
-            if is_terminal:
-                _drop_pending_option_fill(order_id)
-            else:
-                ctx["db_row_opened"] = True
-                _set_pending_option_fill(order_id, ctx)
-        elif order.status in _TERMINAL_NO_FILL:
+                events.append(fill_event)
+        elif order.status not in _OPTION_NON_TERMINAL:
             events.append({**ctx, "kind": "terminal", "order_id": order_id, "order_status": order.status.value})
             _drop_pending_option_fill(order_id)
 

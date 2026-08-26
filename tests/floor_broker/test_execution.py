@@ -1723,6 +1723,139 @@ def test_check_pending_option_fills_treats_unusual_fill_carrying_status_as_termi
         assert execution._option_positions["AAPL250117C00200000"]["entry_premium"] == 3.50
 
 
+def test_check_pending_option_fills_untracks_zero_fill_order_on_unusual_terminal_status(monkeypatch):
+    """Regression (fix-loop round 2, finding 1's remaining half): a zero-fill order can land on a
+    terminal status that is neither FILLED nor in the small _TERMINAL_NO_FILL set (CANCELED/
+    EXPIRED/REJECTED) -- e.g. DONE_FOR_DAY, a real Alpaca status, plausible for options since they
+    are DAY-only. Before the fix, `elif order.status in _TERMINAL_NO_FILL:` would never be true
+    here, so the entry would poll forever and never emit the "terminal" event. The new
+    `elif order.status not in _OPTION_NON_TERMINAL:` must treat this as terminal and drop it."""
+    execution._pending_option_fills["order-opt-1"] = {
+        "contract_symbol": "AAPL250117C00200000", "symbol": "AAPL", "right": "call", "strike": 200.0,
+        "expiration": "2025-01-17", "delta": 0.45, "qty": 2, "reasoning": "r", "cycle_id": "cycle-1",
+    }
+    fake_client = FakePendingFillTradingClient({"order-opt-1": FakePendingOrder(filled_avg_price=None, status=OrderStatus.DONE_FOR_DAY)})
+    monkeypatch.setattr(execution, "trading_client2", fake_client)
+
+    events = execution.check_pending_option_fills()
+
+    assert events == [
+        {
+            "contract_symbol": "AAPL250117C00200000", "symbol": "AAPL", "right": "call", "strike": 200.0,
+            "expiration": "2025-01-17", "delta": 0.45, "qty": 2, "reasoning": "r", "cycle_id": "cycle-1",
+            "kind": "terminal", "order_id": "order-opt-1", "order_status": "done_for_day",
+        }
+    ]
+    assert "order-opt-1" not in execution._pending_option_fills
+
+
+def test_check_pending_option_fills_untracks_zero_fill_order_on_suspended_status(monkeypatch):
+    """Same regression as above, second status (SUSPENDED) to cover more than one unusual
+    zero-fill terminal case per the fix-loop round 2 brief."""
+    execution._pending_option_fills["order-opt-1"] = {
+        "contract_symbol": "AAPL250117C00200000", "symbol": "AAPL", "right": "call", "strike": 200.0,
+        "expiration": "2025-01-17", "delta": 0.45, "qty": 2, "reasoning": "r", "cycle_id": "cycle-1",
+    }
+    fake_client = FakePendingFillTradingClient({"order-opt-1": FakePendingOrder(filled_avg_price=None, status=OrderStatus.SUSPENDED)})
+    monkeypatch.setattr(execution, "trading_client2", fake_client)
+
+    events = execution.check_pending_option_fills()
+
+    assert events == [
+        {
+            "contract_symbol": "AAPL250117C00200000", "symbol": "AAPL", "right": "call", "strike": 200.0,
+            "expiration": "2025-01-17", "delta": 0.45, "qty": 2, "reasoning": "r", "cycle_id": "cycle-1",
+            "kind": "terminal", "order_id": "order-opt-1", "order_status": "suspended",
+        }
+    ]
+    assert "order-opt-1" not in execution._pending_option_fills
+
+
+def test_check_pending_option_fills_keeps_tracking_pending_cancel_with_partial_fill(monkeypatch):
+    """Free side-effect fix confirmed (fix-loop round 1's new issue B): PENDING_CANCEL with a
+    partial fill must NOT be treated as terminal -- a further fill could still be observed before
+    the cancel actually resolves. _OPTION_NON_TERMINAL includes PENDING_CANCEL, so
+    `is_terminal = order.status not in _OPTION_NON_TERMINAL` stays False here."""
+    execution._pending_option_fills["order-opt-1"] = {
+        "contract_symbol": "AAPL250117C00200000",
+        "symbol": "AAPL",
+        "right": "call",
+        "strike": 200.0,
+        "expiration": "2025-01-17",
+        "delta": 0.45,
+        "qty": 2,
+        "reasoning": "test reasoning",
+        "cycle_id": "cycle-1",
+        "db_row_opened": True,
+    }
+    order = FakePendingOrder(filled_avg_price="3.50", status=OrderStatus.PENDING_CANCEL)
+    order.filled_qty = "1"
+    fake_client = FakePendingFillTradingClient({"order-opt-1": order})
+    monkeypatch.setattr(execution, "trading_client2", fake_client)
+    monkeypatch.setattr(execution.db, "record_options_trade_updated", lambda *a, **k: None)
+
+    events = execution.check_pending_option_fills()
+
+    assert events == []
+    assert "order-opt-1" in execution._pending_option_fills
+    with execution._state_lock:
+        assert execution._option_positions["AAPL250117C00200000"]["qty"] == 1
+        assert execution._option_positions["AAPL250117C00200000"]["entry_premium"] == 3.50
+
+
+class RacyGetOrderTradingClient:
+    """Stands in for trading_client2 to simulate the fix-loop round 2 (new issue A) race: a
+    concurrent sell_option() drops _pending_option_fills/_option_positions tracking for the
+    contract in the window between get_order_by_id() returning and check_pending_option_fills()
+    acquiring _state_lock. The drop happens as a side effect of get_order_by_id() itself, which is
+    the cleanest way to make the interleaving deterministic in a single-threaded test."""
+
+    def __init__(self, order_id, order, contract_symbol):
+        self._order_id = order_id
+        self._order = order
+        self._contract_symbol = contract_symbol
+
+    def get_order_by_id(self, order_id, filter=None):
+        execution._pending_option_fills.pop(order_id, None)
+        execution._option_positions.pop(self._contract_symbol, None)
+        return self._order
+
+
+def test_check_pending_option_fills_does_not_resurrect_state_dropped_by_concurrent_sell(monkeypatch):
+    """Regression (fix-loop round 2, new issue A): if sell_option() drops both
+    _pending_option_fills and _option_positions for a contract in the window between the
+    get_order_by_id() network call and check_pending_option_fills() acquiring _state_lock, this
+    poll must skip the order entirely -- no _option_positions resurrection, no DB write, no
+    event."""
+    execution._pending_option_fills["order-opt-1"] = {
+        "contract_symbol": "AAPL250117C00200000",
+        "symbol": "AAPL",
+        "right": "call",
+        "strike": 200.0,
+        "expiration": "2025-01-17",
+        "delta": 0.45,
+        "qty": 2,
+        "reasoning": "test reasoning",
+        "cycle_id": "cycle-1",
+    }
+    order = FakePendingOrder(filled_avg_price="3.35", status=OrderStatus.FILLED)
+    fake_client = RacyGetOrderTradingClient("order-opt-1", order, "AAPL250117C00200000")
+    monkeypatch.setattr(execution, "trading_client2", fake_client)
+
+    def _fail_if_called(*a, **k):
+        raise AssertionError("db.record_options_trade_opened must not be called when the entry was concurrently dropped")
+
+    monkeypatch.setattr(execution.db, "record_options_trade_opened", _fail_if_called)
+    monkeypatch.setattr(execution.db, "record_options_trade_updated", _fail_if_called)
+
+    events = execution.check_pending_option_fills()
+
+    assert events == []
+    assert "order-opt-1" not in execution._pending_option_fills
+    with execution._state_lock:
+        assert "AAPL250117C00200000" not in execution._option_positions
+
+
 def test_check_pending_option_fills_keeps_tracking_an_unfilled_order(monkeypatch):
     execution._pending_option_fills["order-opt-1"] = {
         "contract_symbol": "AAPL250117C00200000", "symbol": "AAPL", "right": "call", "strike": 200.0,
