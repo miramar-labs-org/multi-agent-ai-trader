@@ -272,6 +272,7 @@ def test_power_down_skips_ollama_stop_when_disabled_by_config(monkeypatch):
     monkeypatch.setattr(main, "_stop_ollama_model", lambda cfg: called.__setitem__("stop", True))
     monkeypatch.setattr(main.requests, "post", lambda url, timeout: FakeResponse(json_data={"events": []}))
     monkeypatch.setattr(main, "_wait_until_crypto_flat", lambda: True)
+    monkeypatch.setattr(main, "_wait_until_options_flat", lambda: True)
     monkeypatch.setattr(main.slack, "notify_power_state", lambda *a, **k: None)
 
     main._power_down(None, _cfg(manage_ollama=False))
