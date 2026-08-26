@@ -462,7 +462,7 @@ async def _select_option_contract_async(state: DealerState, cfg, signal: dict) -
 
 
 def _route_after_llm_call(state: DealerState, cfg) -> str:
-    if cfg.get("options_trading", {}).get("enabled", False):
+    if state["exchange"] == "stocks" and cfg.get("options_trading", {}).get("enabled", False):
         return "select_option_contract"
     return "call_floor_broker"
 
@@ -475,6 +475,15 @@ def call_floor_broker_option(state: DealerState, cfg) -> DealerState:
     select_option_contract() maps a bearish SELL signal to buying a put (right = "call" if
     action == "BUY" else "put"), and that put purchase is exactly as much a new entry as a call
     purchase is -- it must not bypass macro blackout / symbol-stop cooldown / win-rate throttle."""
+    db.record_dealer_decision(
+        state["symbol"],
+        state["signal"]["action"],
+        state["signal"]["reasoning"],
+        state["signal"].get("size_hint"),
+        ohlcv_enrichment_active=bool(state.get("ohlcv_features_text")),
+        cycle_id=state.get("cycle_id"),
+    )
+
     option_pick = state.get("option_pick")
     if not option_pick:
         return {**state, "execution_result": {"status": "skipped", "reason": "no_option_pick", "detail": "no option contract was selected"}}

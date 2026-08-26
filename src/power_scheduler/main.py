@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 
 import pytz
 import requests
-from alpaca.trading.enums import AssetClass
+from alpaca.trading.enums import AssetClass, PositionSide
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 
@@ -68,7 +68,11 @@ def _wait_until_crypto_flat(timeout_s: int = CRYPTO_FLAT_TIMEOUT_S) -> bool:
 def _wait_until_options_flat(timeout_s: int = OPTIONS_FLAT_TIMEOUT_S) -> bool:
     deadline = time.monotonic() + timeout_s
     while True:
-        positions = [p for p in trading_client2.get_all_positions() if p.asset_class == AssetClass.US_OPTION]
+        positions = [
+            p
+            for p in trading_client2.get_all_positions()
+            if p.asset_class == AssetClass.US_OPTION and getattr(p, "side", PositionSide.LONG) == PositionSide.LONG
+        ]
         if not positions:
             return True
         if time.monotonic() >= deadline:
