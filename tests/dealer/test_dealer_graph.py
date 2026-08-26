@@ -466,25 +466,17 @@ def test_call_floor_broker_option_skips_buy_when_win_rate_below_minimum(monkeypa
     assert result["execution_result"]["reason"] == "win_rate_throttle"
 
 
-def test_call_floor_broker_option_sell_bypasses_buy_only_gates(monkeypatch):
-    """A SELL (closing an existing option position) must never be blocked by the BUY-only gates --
-    same parity as call_floor_broker's own stock-path gates, which are also `if action == "BUY":`
-    guarded."""
+def test_call_floor_broker_option_skips_sell_during_macro_blackout(monkeypatch):
+    """Regression: a SELL signal maps to buying a put (a new bearish entry, right = "put" in
+    select_option_contract), never to closing an existing position -- it must be blocked by the same
+    entry gates as a BUY/call pick."""
     monkeypatch.setattr(graph.slack, "notify_floor_broker_result", lambda *a, **k: None)
     monkeypatch.setattr(graph.db, "record_floor_broker_event", lambda *a, **k: None)
-    captured = {}
 
-    class FakeResponse:
-        status_code = 200
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("Floor Broker must not be called during a macro blackout")
 
-        def json(self):
-            return {"status": "submitted", "detail": "option sell order submitted: order-1"}
-
-    def _fake_post(url, json, timeout):
-        captured["json"] = json
-        return FakeResponse()
-
-    monkeypatch.setattr(graph.requests, "post", _fake_post)
+    monkeypatch.setattr(graph.requests, "post", _fail_if_called)
 
     cfg = _base_option_gate_cfg()
     today = datetime.now(pytz.timezone("US/Eastern")).date().isoformat()
@@ -493,8 +485,8 @@ def test_call_floor_broker_option_sell_bypasses_buy_only_gates(monkeypatch):
 
     result = graph.call_floor_broker_option(_option_pick_state(action="SELL"), cfg)
 
-    assert result["execution_result"]["status"] == "submitted"
-    assert captured["json"]["side"] == "BUY"  # payload's `side` is hardcoded BUY-only today (unrelated, pre-existing)
+    assert result["execution_result"]["status"] == "skipped"
+    assert result["execution_result"]["reason"] == "macro_blackout"
 
 
 def test_call_floor_broker_option_skips_when_risk_per_trade_usd_not_configured(monkeypatch):

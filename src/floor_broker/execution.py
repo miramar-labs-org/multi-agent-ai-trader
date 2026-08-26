@@ -306,10 +306,13 @@ def check_crypto_stops() -> list[dict]:
 
 
 def check_option_stops() -> list[dict]:
+    """Runs unconditionally regardless of options_trading.enabled -- that flag only gates opening
+    NEW option positions (see select_option_contract/call_floor_broker_option in dealer/graph.py); a
+    position that's already open must stay protected by its synthetic SL/TP/DTE-force-close even
+    after the flag is flipped off as an emergency rollback. Naturally a no-op whenever
+    _option_positions is empty, matching check_crypto_stops(), which has no enabled-flag gate at
+    all."""
     cfg = load_config()
-    if not cfg.get("options_trading", {}).get("enabled", False):
-        return []
-
     events = []
     with _state_lock:
         tracked = list(_option_positions.items())

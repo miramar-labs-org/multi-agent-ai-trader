@@ -151,8 +151,7 @@ def _power_down(apps_v1, cfg) -> None:
         return
 
     option_events = []
-    options_enabled = cfg.get("options_trading", {}).get("enabled", False)
-    if options_enabled and cfg.power_schedule.get("flatten_options_before_powerdown", True):
+    if cfg.power_schedule.get("flatten_options_before_powerdown", True):
         try:
             resp = requests.post(f"{cfg.floor_broker.base_url}/flatten-options", timeout=30)
             resp.raise_for_status()

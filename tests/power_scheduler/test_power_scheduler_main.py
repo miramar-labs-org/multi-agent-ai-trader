@@ -226,7 +226,7 @@ def test_power_down_skips_flatten_request_when_disabled_by_config(monkeypatch):
     monkeypatch.setattr(main, "_wait_until_crypto_flat", lambda: True)
     monkeypatch.setattr(main.slack, "notify_power_state", lambda *a, **k: None)
 
-    main._power_down(None, _cfg(flatten_crypto=False))
+    main._power_down(None, _cfg(flatten_crypto=False, flatten_options=False))
 
     assert posted["called"] is False
     assert calls[-1] == ("floor-broker", 0)
@@ -301,17 +301,28 @@ def test_power_down_flattens_options_when_enabled(monkeypatch):
     assert "1 option position" in notified["detail"]
 
 
-def test_power_down_skips_options_flatten_when_options_trading_disabled(monkeypatch):
-    monkeypatch.setattr(main, "_scale", lambda apps_v1, name, replicas: None)
+def test_power_down_flattens_options_even_when_options_trading_disabled(monkeypatch):
+    """Regression: options_trading.enabled is a new-entry gate, not a protection gate -- flipping it
+    off as an emergency rollback must not skip flattening any option position still open."""
+    calls = []
+    monkeypatch.setattr(main, "_scale", lambda apps_v1, name, replicas: calls.append((name, replicas)))
     monkeypatch.setattr(main, "_stop_ollama_model", lambda cfg: None)
     posted_urls = []
-    monkeypatch.setattr(main.requests, "post", lambda url, timeout: posted_urls.append(url) or FakeResponse(json_data={"events": []}))
+
+    def _fake_post(url, timeout):
+        posted_urls.append(url)
+        events = [{"symbol": "AAPL250117C00200000"}] if url.endswith("/flatten-options") else []
+        return FakeResponse(json_data={"events": events})
+
+    monkeypatch.setattr(main.requests, "post", _fake_post)
     monkeypatch.setattr(main, "_wait_until_crypto_flat", lambda: True)
+    monkeypatch.setattr(main, "_wait_until_options_flat", lambda: True)
     monkeypatch.setattr(main.slack, "notify_power_state", lambda *a, **k: None)
 
     main._power_down(None, _cfg(options_enabled=False))
 
-    assert not any(u.endswith("/flatten-options") for u in posted_urls)
+    assert any(u.endswith("/flatten-options") for u in posted_urls)
+    assert calls[-1] == ("floor-broker", 0)
 
 
 def test_power_down_skips_options_flatten_when_disabled_by_config_flag(monkeypatch):

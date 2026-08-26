@@ -2089,19 +2089,28 @@ def test_sell_option_preserves_tracking_when_submit_order_fails(monkeypatch):
         assert "AAPL250117C00200000" in execution._option_positions
 
 
-def test_check_option_stops_is_noop_when_disabled(monkeypatch):
-    monkeypatch.setattr(execution, "load_config", lambda: OmegaConf.create({"options_trading": {"enabled": False}}))
+def test_check_option_stops_still_protects_tracked_positions_when_options_trading_disabled(monkeypatch):
+    """Regression: options_trading.enabled=False must only block NEW entries, not strip protection
+    from a position that's already open -- flipping the flag off as an emergency rollback must not
+    leave an existing option position with zero stop-loss/take-profit coverage."""
+    cfg = OmegaConf.create({"options_trading": {"enabled": False, "options_slP": 0.50, "options_tpP": 1.75, "dte_force_close": 3}})
+    monkeypatch.setattr(execution, "load_config", lambda: cfg)
+    monkeypatch.setattr(execution, "get_current_option_mid_price", lambda contract_symbol: 1.50)  # entry 3.20 * 0.50 = 1.60 -> 1.50 <= 1.60 triggers SL
+    sell_calls = []
+    monkeypatch.setattr(execution, "sell_option", lambda contract_symbol, reason: sell_calls.append((contract_symbol, reason)) or {"status": "submitted", "detail": "x", "order_id": "o1"})
+
+    far_expiration = "2099-01-17"
     with execution._state_lock:
         execution._option_positions["AAPL250117C00200000"] = {
-            "symbol": "AAPL", "right": "call", "strike": 200.0, "expiration": "2099-01-17",
+            "symbol": "AAPL", "right": "call", "strike": 200.0, "expiration": far_expiration,
             "delta": 0.45, "entry_premium": 3.20, "qty": 2,
         }
 
     events = execution.check_option_stops()
 
-    assert events == []
-    with execution._state_lock:
-        del execution._option_positions["AAPL250117C00200000"]
+    assert len(events) == 1
+    assert events[0]["reason"] == "stop_loss"
+    assert sell_calls == [("AAPL250117C00200000", "stop_loss")]
 
 
 def test_check_option_stops_triggers_stop_loss(monkeypatch):

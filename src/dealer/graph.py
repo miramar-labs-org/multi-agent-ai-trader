@@ -468,45 +468,51 @@ def _route_after_llm_call(state: DealerState, cfg) -> str:
 
 
 def call_floor_broker_option(state: DealerState, cfg) -> DealerState:
+    """Every option_pick here represents a brand-new position -- there is no "SELL means close"
+    case for options via this graph node (the only exit path is check_option_stops()'s synthetic
+    SL/TP/DTE-force-close, which calls sell_option() directly, outside this function). So unlike
+    call_floor_broker()'s stock path, these risk gates are NOT limited to action == "BUY":
+    select_option_contract() maps a bearish SELL signal to buying a put (right = "call" if
+    action == "BUY" else "put"), and that put purchase is exactly as much a new entry as a call
+    purchase is -- it must not bypass macro blackout / symbol-stop cooldown / win-rate throttle."""
     option_pick = state.get("option_pick")
     if not option_pick:
         return {**state, "execution_result": {"status": "skipped", "reason": "no_option_pick", "detail": "no option contract was selected"}}
 
     action = state["signal"]["action"]
 
-    if action == "BUY":
-        blackout_label = _macro_blackout_active(cfg)
-        if blackout_label:
-            log(f"⏭️  option BUY for {state['symbol']} skipped -- macro blackout ({blackout_label})")
-            result = {
-                "status": "skipped",
-                "reason": "macro_blackout",
-                "detail": f"new BUY entries paused for macro blackout: {blackout_label}",
-            }
-            graph_slack_and_record(state, action, result)
-            return {**state, "execution_result": result}
+    blackout_label = _macro_blackout_active(cfg)
+    if blackout_label:
+        log(f"⏭️  option entry for {state['symbol']} skipped -- macro blackout ({blackout_label})")
+        result = {
+            "status": "skipped",
+            "reason": "macro_blackout",
+            "detail": f"new option entries paused for macro blackout: {blackout_label}",
+        }
+        graph_slack_and_record(state, action, result)
+        return {**state, "execution_result": result}
 
-        cooldown_reason = _symbol_stop_cooldown_active(state["symbol"], cfg)
-        if cooldown_reason:
-            log(f"⏭️  option BUY for {state['symbol']} skipped -- {cooldown_reason}")
-            result = {
-                "status": "skipped",
-                "reason": "symbol_stop_cooldown",
-                "detail": f"new BUY entry paused: {cooldown_reason}",
-            }
-            graph_slack_and_record(state, action, result)
-            return {**state, "execution_result": result}
+    cooldown_reason = _symbol_stop_cooldown_active(state["symbol"], cfg)
+    if cooldown_reason:
+        log(f"⏭️  option entry for {state['symbol']} skipped -- {cooldown_reason}")
+        result = {
+            "status": "skipped",
+            "reason": "symbol_stop_cooldown",
+            "detail": f"new option entry paused: {cooldown_reason}",
+        }
+        graph_slack_and_record(state, action, result)
+        return {**state, "execution_result": result}
 
-        throttle_reason = _win_rate_throttle_active(cfg, state["symbol"])
-        if throttle_reason:
-            log(f"⏭️  option BUY for {state['symbol']} skipped -- {throttle_reason}")
-            result = {
-                "status": "skipped",
-                "reason": "win_rate_throttle",
-                "detail": f"new BUY entries paused: {throttle_reason}",
-            }
-            graph_slack_and_record(state, action, result)
-            return {**state, "execution_result": result}
+    throttle_reason = _win_rate_throttle_active(cfg, state["symbol"])
+    if throttle_reason:
+        log(f"⏭️  option entry for {state['symbol']} skipped -- {throttle_reason}")
+        result = {
+            "status": "skipped",
+            "reason": "win_rate_throttle",
+            "detail": f"new option entries paused: {throttle_reason}",
+        }
+        graph_slack_and_record(state, action, result)
+        return {**state, "execution_result": result}
 
     expiration = datetime.strptime(option_pick["expiration"], "%Y-%m-%d").date()
     today = datetime.now(pytz.timezone("US/Eastern")).date()
