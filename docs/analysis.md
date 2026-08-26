@@ -343,3 +343,79 @@ further Dealer decisions for ETH/USD appear after 14:26 in today's data.
 control (macro blackout during the CPI release, or the bid/ask spread guard). The one pattern
 worth flagging: TISI generated 6 consecutive BUY signals and never executed once, split between
 blackout timing and spread width.
+
+---
+
+## 2026-08-14 12:16 ET
+
+**P&L: -\$14.68 on \$998,780.63 last equity (-0.001%)** — essentially flat, down fractionally.
+Equity closed the observed window at \$998,765.95.
+
+### META — -\$14.68 (only position with \$ impact)
+
+Analyst flagged META (pick #143) pre-market: *"Strong bullish MACD (1.955 > 1.062), price 622.49
+above VWAP 592.99 and SMA/EMA, RSI 63.99 leaves room for upside."* Dealer acted on that early,
+BUYing 4 times through the morning. First BUY (14:00:07 UTC, size\_hint 0.4) reasoned: *"Short‑term
+momentum is bullish: price above VWAP, SMA, EMA, MACD line > signal with positive histogram, and
+RSI is rising but still below overbought (66.98)... Volume on the 1‑hour bar is above average
+(relative\_volume 1.34), supporting the move. The daily chart shows a slight pullback (price below
+VWAP and EMA50, negative EMA20 slope), which tempers aggressiveness. Hence a moderate long
+position is warranted."* Floor Broker submitted and filled 3 shares at 14:00:37 UTC, avg \$598.35.
+The next two BUY decisions (14:21, 14:42) were both blocked — `buy_skipped: "open orders exist for
+symbol"` — and the fourth (15:05, size\_hint 0.35) was blocked by the confidence guard (`"BUY
+confidence 0.55 below minimum 0.6"`). So only the first BUY ever executed. By midday the
+Dealer flipped to HOLD three cycles running (15:26, 15:47, 16:07 UTC / 11:26, 11:47, 12:07 ET) as the picture turned mixed —
+intraday still bullish but the daily-chart pullback weighing more. Current position: 3 shares, avg
+entry \$598.35, current price \$593.46, unrealized -\$14.68 (-0.82%) — this is the entire day's
+P&L.
+
+### JPM — 5 BUY signals, zero fills (spread guard)
+
+Dealer was consistently bullish on JPM all day — 5 BUY decisions (14:00–15:27, size\_hint
+0.55–0.6) before flipping to HOLD twice late. Representative reasoning (15:27:48): *"Price is
+above VWAP, SMA, EMA, and the middle Bollinger Band; RSI is mildly bullish (~54). The only
+bearish cue is a slightly negative MACD histogram, indicating weakening short‑term momentum, but
+the MACD line remains near the signal line and most trend‑following indicators point upward."*
+Every single BUY was blocked by Floor Broker's spread guard: `"bid/ask spread 9.78% exceeds max
+3.00%"` (×3), `4.42%` (×1), `5.72%` (×1) — the spread never once tightened enough to clear the 3%
+ceiling. Zero shares ever traded.
+
+### OBX — 7 SELL signals, no position to sell
+
+Dealer called SELL on OBX every single cycle (7/7, 13:52–16:02) on consistently bearish grounds:
+price below VWAP/SMA/EMA and the middle Bollinger Band, negative MACD histogram, low relative
+volume. Floor Broker skipped all 7 with `"no open position"` — there was never a long position in
+OBX to close, so these were no-ops by design.
+
+### SECZ — 6 SELL signals + 1 skipped cycle, no position to sell
+
+Same bearish story as OBX (price 5.70 well below VWAP 6.58, below SMA/EMA) drove 6 SELL calls, all
+skipped by Floor Broker with `"no open position"`. One cycle (15:40:42 UTC) had no OHLCV data at
+all for SECZ and was skipped without invoking the LLM — logged reasoning: *"no indicator data
+available for SECZ this cycle (exchange=stocks) — skipped without invoking the LLM."*
+
+### GOOGL — HOLD, then flipped to SELL late, no position to sell
+
+Held for the first 4 cycles on mixed signals, then flipped to SELL for the last 3 cycles
+(15:05–16:02) as longer-term bearish structure won out. All 3 SELLs were skipped by Floor Broker —
+`"no open position"` — same as OBX/SECZ.
+
+### SNDQ, AAPL, AMZN — HOLD all day, no Floor Broker activity
+
+All three stayed HOLD every single cycle with no BUY/SELL ever issued, so Floor Broker never
+touched them:
+
+- **SNDQ**: torn all day between deeply-oversold RSI (19.19 at pick time) and positive MACD
+  histogram (bullish) versus price well below VWAP/SMA/EMA (bearish) — never resolved either way.
+- **AAPL**: consistently mixed short-term-bullish signals against longer-term bearish structure
+  and low volume.
+- **AMZN**: torn between oversold-RSI/bullish-MACD-crossover and negative short-term momentum with
+  price below the SMA.
+
+**Open positions carried from before today:** none — the account was fully flat entering today;
+the META position was built entirely from today's own fills.
+
+**Errors/no-fills needing a look:** nothing broken — no `error` or `no_fill` events occurred today.
+Every Floor Broker skip traces to an intentional guard rail: no open position to sell
+(OBX/SECZ/GOOGL), bid/ask spread too wide (JPM), open orders already pending or confidence below
+threshold (META's later BUYs).
