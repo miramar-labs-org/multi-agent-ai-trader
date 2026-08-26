@@ -266,6 +266,61 @@ def test_flatten_crypto_notifies_slack_and_reraises_on_unexpected_error(monkeypa
     assert "error" in calls
 
 
+def test_flatten_options_returns_ok_with_events(monkeypatch):
+    monkeypatch.setattr(
+        app_module.execution,
+        "flatten_all_options",
+        lambda: [{"symbol": "AAPL250117C00200000", "reason": "power_down_flatten", "sell_result": {"status": "submitted"}}],
+    )
+
+    response = _client().post("/flatten-options")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["events"] == [{"symbol": "AAPL250117C00200000", "reason": "power_down_flatten", "sell_result": {"status": "submitted"}}]
+
+
+def test_flatten_options_returns_ok_with_no_events_when_nothing_open(monkeypatch):
+    monkeypatch.setattr(app_module.execution, "flatten_all_options", lambda: [])
+
+    response = _client().post("/flatten-options")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["events"] == []
+
+
+def test_flatten_options_returns_error_status_on_api_error(monkeypatch):
+    def _raise():
+        raise APIError("broker rejected")
+
+    monkeypatch.setattr(app_module.execution, "flatten_all_options", _raise)
+
+    response = _client().post("/flatten-options")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "error"
+    assert body["events"] == []
+
+
+def test_flatten_options_notifies_slack_and_reraises_on_unexpected_error(monkeypatch):
+    def _raise():
+        raise ValueError("boom")
+
+    monkeypatch.setattr(app_module.execution, "flatten_all_options", _raise)
+    calls = {}
+    monkeypatch.setattr(app_module.slack, "notify_error", lambda *a, **k: calls.setdefault("error", (a, k)))
+
+    client = TestClient(app_module.app, raise_server_exceptions=False)
+    response = client.post("/flatten-options")
+
+    assert response.status_code == 500
+    assert "error" in calls
+
+
 def test_execute_option_returns_result_from_buy_option(monkeypatch):
     captured = {}
 
@@ -363,3 +418,24 @@ def test_execute_option_accepts_notional_at_ceiling(monkeypatch):
     )
 
     assert response.status_code == 200
+
+
+def test_execute_option_rejects_malformed_expiration():
+    response = _client().post(
+        "/execute-option",
+        json={
+            "contract_symbol": "AAPL250117C00200000",
+            "side": "BUY",
+            "qty": 2,
+            "symbol": "AAPL",
+            "right": "call",
+            "strike": 200.0,
+            "expiration": "13/45/2025",
+            "delta": 0.45,
+            "premium": 3.20,
+            "reasoning": "test",
+            "cycle_id": "cycle-1",
+        },
+    )
+
+    assert response.status_code == 422

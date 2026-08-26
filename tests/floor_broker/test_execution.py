@@ -1,6 +1,7 @@
 import json
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 
 import pytest
 import pytz
@@ -50,16 +51,18 @@ def _api_error(payload: dict) -> APIError:
 
 @pytest.fixture(autouse=True)
 def _clear_tracked_brackets():
-    """_tracked_brackets, _pending_fills, and _crypto_stops are module-level state shared across
-    every test in this file -- clear them before and after each test so tests can't leak tracking
-    into one another."""
+    """_tracked_brackets, _pending_fills, _crypto_stops, and _option_positions are module-level
+    state shared across every test in this file -- clear them before and after each test so tests
+    can't leak tracking into one another."""
     execution._tracked_brackets.clear()
     execution._pending_fills.clear()
     execution._crypto_stops.clear()
+    execution._option_positions.clear()
     yield
     execution._tracked_brackets.clear()
     execution._pending_fills.clear()
     execution._crypto_stops.clear()
+    execution._option_positions.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -1495,10 +1498,17 @@ class FakeReconstructTradingClient:
         return self._positions
 
 
+class FakeEmptyOptionsTradingClient2:
+    def get_all_positions(self):
+        return []
+
+
 def test_reconcile_tracked_state_once_restores_a_still_open_pending_order(monkeypatch):
     order = FakeOrder("order-1", "BTC/USD", OrderSide.BUY, OrderStatus.NEW, filled_avg_price=None, legs=None)
     monkeypatch.setattr(execution, "trading_client", FakeReconstructTradingClient([order]))
     monkeypatch.setattr(execution, "_state_reconciled", False)
+    monkeypatch.setattr(execution, "trading_client2", FakeEmptyOptionsTradingClient2())
+    monkeypatch.setattr(db, "fetch_open_options_trades", lambda: [])
 
     assert execution.reconcile_tracked_state_once() is True
 
@@ -1516,6 +1526,8 @@ def test_reconcile_tracked_state_once_restores_a_bracket_with_a_still_open_leg(m
     legs = [FakeLeg("tp-leg-1", OrderStatus.NEW, OrderType.LIMIT), FakeLeg("sl-leg-1", OrderStatus.NEW, OrderType.STOP)]
     order = FakeOrder("parent-1", "MGN", OrderSide.BUY, OrderStatus.FILLED, filled_avg_price="10.05", legs=legs)
     monkeypatch.setattr(execution, "trading_client", FakeReconstructTradingClient([order]))
+    monkeypatch.setattr(execution, "trading_client2", FakeEmptyOptionsTradingClient2())
+    monkeypatch.setattr(db, "fetch_open_options_trades", lambda: [])
 
     assert execution.reconcile_tracked_state_once() is True
 
@@ -1529,6 +1541,8 @@ def test_reconcile_tracked_state_once_skips_a_bracket_whose_legs_are_all_termina
     legs = [FakeLeg("tp-leg-1", OrderStatus.CANCELED, OrderType.LIMIT), FakeLeg("sl-leg-1", OrderStatus.CANCELED, OrderType.STOP)]
     order = FakeOrder("parent-1", "MGN", OrderSide.BUY, OrderStatus.FILLED, filled_avg_price="10.05", legs=legs)
     monkeypatch.setattr(execution, "trading_client", FakeReconstructTradingClient([order]))
+    monkeypatch.setattr(execution, "trading_client2", FakeEmptyOptionsTradingClient2())
+    monkeypatch.setattr(db, "fetch_open_options_trades", lambda: [])
 
     assert execution.reconcile_tracked_state_once() is True
 
@@ -1538,6 +1552,8 @@ def test_reconcile_tracked_state_once_skips_a_bracket_whose_legs_are_all_termina
 def test_reconcile_tracked_state_once_backfills_position_opens_for_open_positions(monkeypatch):
     positions = [FakeEodPosition("MGN", AssetClass.US_EQUITY), FakeEodPosition("BTC/USD", AssetClass.CRYPTO)]
     monkeypatch.setattr(execution, "trading_client", FakeReconstructTradingClient([], positions=positions))
+    monkeypatch.setattr(execution, "trading_client2", FakeEmptyOptionsTradingClient2())
+    monkeypatch.setattr(db, "fetch_open_options_trades", lambda: [])
     recorded = []
     monkeypatch.setattr(db, "record_position_opened", lambda symbol: recorded.append(symbol))
 
@@ -1549,6 +1565,8 @@ def test_reconcile_tracked_state_once_backfills_position_opens_for_open_position
 def test_reconcile_tracked_state_once_rebuilds_crypto_stop_from_live_alpaca_position_symbol(monkeypatch):
     positions = [FakeEodPosition("BTCUSD", AssetClass.CRYPTO, avg_entry_price="100.0")]
     monkeypatch.setattr(execution, "trading_client", FakeReconstructTradingClient([], positions=positions))
+    monkeypatch.setattr(execution, "trading_client2", FakeEmptyOptionsTradingClient2())
+    monkeypatch.setattr(db, "fetch_open_options_trades", lambda: [])
     monkeypatch.setattr(db, "record_position_opened", lambda symbol: None)
 
     assert execution.reconcile_tracked_state_once() is True
@@ -1560,6 +1578,8 @@ def test_reconcile_tracked_state_once_does_not_rebuild_crypto_stop_for_pending_b
     execution._pending_fills["order-1"] = {"symbol": "BTC/USD", "action": "BUY"}
     positions = [FakeEodPosition("BTCUSD", AssetClass.CRYPTO, avg_entry_price="100.0")]
     monkeypatch.setattr(execution, "trading_client", FakeReconstructTradingClient([], positions=positions))
+    monkeypatch.setattr(execution, "trading_client2", FakeEmptyOptionsTradingClient2())
+    monkeypatch.setattr(db, "fetch_open_options_trades", lambda: [])
     monkeypatch.setattr(db, "record_position_opened", lambda symbol: None)
 
     assert execution.reconcile_tracked_state_once() is True
@@ -1577,6 +1597,110 @@ def test_reconcile_tracked_state_once_backfill_failure_does_not_block_reconcilia
 
     monkeypatch.setattr(execution, "trading_client", FailingPositionsClient([]))
     monkeypatch.setattr(execution, "_state_reconciled", False)
+    monkeypatch.setattr(execution, "trading_client2", FakeEmptyOptionsTradingClient2())
+    monkeypatch.setattr(db, "fetch_open_options_trades", lambda: [])
+
+    assert execution.reconcile_tracked_state_once() is True
+    assert execution.is_state_reconciled() is True
+
+
+def test_reconcile_tracked_state_once_rebuilds_option_position_from_matching_options_trades_row(monkeypatch):
+    monkeypatch.setattr(execution, "trading_client", FakeReconstructTradingClient([]))
+
+    class FakeOptionPosition:
+        symbol = "AAPL250117C00200000"
+        qty = "2"
+        asset_class = AssetClass.US_OPTION
+
+    class FakeTradingClient2:
+        def get_all_positions(self):
+            return [FakeOptionPosition()]
+
+    monkeypatch.setattr(execution, "trading_client2", FakeTradingClient2())
+    monkeypatch.setattr(db, "record_position_opened", lambda symbol: None)
+    open_trades = [{
+        "symbol": "AAPL", "contract_symbol": "AAPL250117C00200000", "right": "call",
+        "strike": Decimal("200.0"), "expiration": date(2025, 1, 17), "delta": Decimal("0.45"),
+        "entry_premium": Decimal("3.20"), "qty": 2,
+    }]
+    monkeypatch.setattr(db, "fetch_open_options_trades", lambda: open_trades)
+
+    assert execution.reconcile_tracked_state_once() is True
+
+    with execution._state_lock:
+        restored = execution._option_positions["AAPL250117C00200000"]
+    assert restored == {
+        "symbol": "AAPL", "right": "call", "strike": 200.0, "expiration": "2025-01-17",
+        "delta": 0.45, "entry_premium": 3.20, "qty": 2,
+    }
+    assert isinstance(restored["strike"], float)
+    assert isinstance(restored["entry_premium"], float)
+
+
+def test_reconcile_tracked_state_once_skips_option_position_with_no_matching_trades_row(monkeypatch):
+    monkeypatch.setattr(execution, "trading_client", FakeReconstructTradingClient([]))
+
+    class FakeOptionPosition:
+        symbol = "AAPL250117C00200000"
+        qty = "2"
+        asset_class = AssetClass.US_OPTION
+
+    class FakeTradingClient2:
+        def get_all_positions(self):
+            return [FakeOptionPosition()]
+
+    monkeypatch.setattr(execution, "trading_client2", FakeTradingClient2())
+    monkeypatch.setattr(db, "record_position_opened", lambda symbol: None)
+    monkeypatch.setattr(db, "fetch_open_options_trades", lambda: [])
+
+    assert execution.reconcile_tracked_state_once() is True
+
+    with execution._state_lock:
+        assert "AAPL250117C00200000" not in execution._option_positions
+
+
+def test_reconcile_tracked_state_once_does_not_reconstruct_option_position_already_tracked(monkeypatch):
+    monkeypatch.setattr(execution, "trading_client", FakeReconstructTradingClient([]))
+    with execution._state_lock:
+        execution._option_positions["AAPL250117C00200000"] = {
+            "symbol": "AAPL", "right": "call", "strike": 999.0, "expiration": "2025-01-17",
+            "delta": 0.1, "entry_premium": 1.0, "qty": 1,
+        }
+
+    class FakeOptionPosition:
+        symbol = "AAPL250117C00200000"
+        qty = "2"
+        asset_class = AssetClass.US_OPTION
+
+    class FakeTradingClient2:
+        def get_all_positions(self):
+            return [FakeOptionPosition()]
+
+    monkeypatch.setattr(execution, "trading_client2", FakeTradingClient2())
+    monkeypatch.setattr(db, "record_position_opened", lambda symbol: None)
+    open_trades = [{
+        "symbol": "AAPL", "contract_symbol": "AAPL250117C00200000", "right": "call",
+        "strike": Decimal("200.0"), "expiration": date(2025, 1, 17), "delta": Decimal("0.45"),
+        "entry_premium": Decimal("3.20"), "qty": 2,
+    }]
+    monkeypatch.setattr(db, "fetch_open_options_trades", lambda: open_trades)
+
+    assert execution.reconcile_tracked_state_once() is True
+
+    with execution._state_lock:
+        # untouched -- the already-tracked entry must not be clobbered by a stale/duplicate row
+        assert execution._option_positions["AAPL250117C00200000"]["strike"] == 999.0
+
+
+def test_reconcile_tracked_state_once_options_failure_does_not_block_account1_reconciliation(monkeypatch):
+    monkeypatch.setattr(execution, "trading_client", FakeReconstructTradingClient([]))
+
+    class FailingTradingClient2:
+        def get_all_positions(self):
+            raise APIError("unreachable")
+
+    monkeypatch.setattr(execution, "trading_client2", FailingTradingClient2())
+    monkeypatch.setattr(db, "record_position_opened", lambda symbol: None)
 
     assert execution.reconcile_tracked_state_once() is True
     assert execution.is_state_reconciled() is True
@@ -1621,6 +1745,8 @@ def test_reconstruct_tracked_state_retries_with_backoff_until_success(monkeypatc
     client = FakeFlakyReconstructTradingClient(open_orders=[], fail_times=2)
     monkeypatch.setattr(execution, "trading_client", client)
     monkeypatch.setattr(execution, "_state_reconciled", False)
+    monkeypatch.setattr(execution, "trading_client2", FakeEmptyOptionsTradingClient2())
+    monkeypatch.setattr(db, "fetch_open_options_trades", lambda: [])
     sleeps = []
     monkeypatch.setattr(execution.time, "sleep", lambda s: sleeps.append(s))
 
@@ -1892,6 +2018,77 @@ def test_sell_option_submits_order_and_drops_tracking(monkeypatch):
         assert "AAPL250117C00200000" not in execution._option_positions
 
 
+def test_sell_option_drops_tracking_on_confirmed_position_not_found(monkeypatch):
+    with execution._state_lock:
+        execution._option_positions["AAPL250117C00200000"] = {
+            "symbol": "AAPL", "right": "call", "strike": 200.0, "expiration": "2025-01-17",
+            "delta": 0.45, "entry_premium": 3.20, "qty": 2,
+        }
+
+    class FakeHttpError:
+        class response:
+            status_code = 404
+
+    class FakeTradingClient2:
+        def get_open_position(self, contract_symbol):
+            raise APIError('{"code": 40410000, "message": "position does not exist"}', http_error=FakeHttpError())
+
+    monkeypatch.setattr(execution, "trading_client2", FakeTradingClient2())
+
+    result = execution.sell_option("AAPL250117C00200000")
+
+    assert result["status"] == "skipped"
+    with execution._state_lock:
+        assert "AAPL250117C00200000" not in execution._option_positions
+
+
+def test_sell_option_preserves_tracking_on_transient_error_fetching_position(monkeypatch):
+    with execution._state_lock:
+        execution._option_positions["AAPL250117C00200000"] = {
+            "symbol": "AAPL", "right": "call", "strike": 200.0, "expiration": "2025-01-17",
+            "delta": 0.45, "entry_premium": 3.20, "qty": 2,
+        }
+
+    class FakeTradingClient2:
+        def get_open_position(self, contract_symbol):
+            raise APIError('{"code": 50000000, "message": "internal server error"}')
+
+    monkeypatch.setattr(execution, "trading_client2", FakeTradingClient2())
+
+    result = execution.sell_option("AAPL250117C00200000")
+
+    assert result["status"] == "error"
+    with execution._state_lock:
+        assert "AAPL250117C00200000" in execution._option_positions
+
+
+def test_sell_option_preserves_tracking_when_submit_order_fails(monkeypatch):
+    with execution._state_lock:
+        execution._option_positions["AAPL250117C00200000"] = {
+            "symbol": "AAPL", "right": "call", "strike": 200.0, "expiration": "2025-01-17",
+            "delta": 0.45, "entry_premium": 3.20, "qty": 2,
+        }
+
+    class FakePosition:
+        qty = "2"
+        current_price = "4.50"
+
+    class FakeTradingClient2:
+        def get_open_position(self, contract_symbol):
+            return FakePosition()
+
+        def submit_order(self, req):
+            raise APIError('{"code": 40310000, "message": "insufficient buying power"}')
+
+    monkeypatch.setattr(execution, "trading_client2", FakeTradingClient2())
+
+    result = execution.sell_option("AAPL250117C00200000")
+
+    assert result["status"] == "error"
+    with execution._state_lock:
+        assert "AAPL250117C00200000" in execution._option_positions
+
+
 def test_check_option_stops_is_noop_when_disabled(monkeypatch):
     monkeypatch.setattr(execution, "load_config", lambda: OmegaConf.create({"options_trading": {"enabled": False}}))
     with execution._state_lock:
@@ -1926,6 +2123,29 @@ def test_check_option_stops_triggers_stop_loss(monkeypatch):
     assert len(events) == 1
     assert events[0]["reason"] == "stop_loss"
     assert sell_calls == [("AAPL250117C00200000", "stop_loss")]
+
+
+def test_check_option_stops_skips_contract_with_malformed_expiration_without_poisoning_others(monkeypatch):
+    cfg = OmegaConf.create({"options_trading": {"enabled": True, "options_slP": 0.50, "options_tpP": 1.75, "dte_force_close": 3}})
+    monkeypatch.setattr(execution, "load_config", lambda: cfg)
+    monkeypatch.setattr(execution, "get_current_option_mid_price", lambda contract_symbol: 1.50)
+    sell_calls = []
+    monkeypatch.setattr(execution, "sell_option", lambda contract_symbol, reason: sell_calls.append((contract_symbol, reason)) or {"status": "submitted", "detail": "x", "order_id": "o1"})
+
+    with execution._state_lock:
+        execution._option_positions["BAD250117C00200000"] = {
+            "symbol": "BAD", "right": "call", "strike": 200.0, "expiration": "not-a-date",
+            "delta": 0.45, "entry_premium": 3.20, "qty": 1,
+        }
+        execution._option_positions["AAPL250117C00200000"] = {
+            "symbol": "AAPL", "right": "call", "strike": 200.0, "expiration": "2099-01-17",
+            "delta": 0.45, "entry_premium": 3.20, "qty": 2,
+        }
+
+    events = execution.check_option_stops()
+
+    assert sell_calls == [("AAPL250117C00200000", "stop_loss")]
+    assert len(events) == 1
 
 
 def test_check_option_stops_force_closes_near_expiration(monkeypatch):

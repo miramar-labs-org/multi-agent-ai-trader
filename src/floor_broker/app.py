@@ -1,4 +1,5 @@
 import re
+from datetime import datetime
 from typing import Literal
 
 from alpaca.common.exceptions import APIError
@@ -106,6 +107,15 @@ class ExecuteOptionRequest(BaseModel):
             raise ValueError(f"notional (qty * premium * 100) exceeds ceiling of {MAX_OPTION_NOTIONAL}")
         return v
 
+    @field_validator("expiration")
+    @classmethod
+    def _expiration_is_valid_iso_date(cls, v: str) -> str:
+        try:
+            datetime.strptime(v, "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError(f"expiration must be an ISO date (YYYY-MM-DD), got {v!r}") from exc
+        return v
+
 
 class ExecuteOptionResponse(BaseModel):
     status: Literal["executed", "submitted", "skipped", "error"]
@@ -115,6 +125,12 @@ class ExecuteOptionResponse(BaseModel):
 
 
 class FlattenCryptoResponse(BaseModel):
+    status: Literal["ok", "error"]
+    events: list[dict] = Field(default_factory=list)
+    detail: str | None = None
+
+
+class FlattenOptionsResponse(BaseModel):
     status: Literal["ok", "error"]
     events: list[dict] = Field(default_factory=list)
     detail: str | None = None
@@ -184,4 +200,21 @@ def flatten_crypto():
     except Exception as exc:
         log(f"💥  unexpected error on flatten-crypto: {exc}")
         slack.notify_error("FLOOR", f"unexpected error on flatten-crypto: {exc}")
+        raise
+
+
+@app.post("/flatten-options", response_model=FlattenOptionsResponse)
+def flatten_options():
+    """Called by power_scheduler right before it scales this pod to 0 -- force-sells every open
+    option position since check_option_stops()'s SL/TP/DTE-force-close is only enforced by this
+    process's own poll loop (no Alpaca server-side bracket support for options either)."""
+    try:
+        events = execution.flatten_all_options()
+        return FlattenOptionsResponse(status="ok", events=events)
+    except APIError as exc:
+        log(f"💥  flatten-options failed: {exc}")
+        return FlattenOptionsResponse(status="error", detail=str(exc))
+    except Exception as exc:
+        log(f"💥  unexpected error on flatten-options: {exc}")
+        slack.notify_error("FLOOR", f"unexpected error on flatten-options: {exc}")
         raise

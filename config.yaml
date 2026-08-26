@@ -140,6 +140,12 @@ power_schedule:
                                # power-up -- it's an optimization, not a safety control.
                                            # Stocks need no equivalent flag: eod_flatten already
                                            # unconditionally flattens them near close.
+  flatten_options_before_powerdown: true   # unlike crypto, options don't trade 24/7 and are already
+                                            # force-closed by dte_force_close well before expiration --
+                                            # this exists purely as an operator escape hatch, mirroring
+                                            # flatten_crypto_before_powerdown's role, not because an
+                                            # open option position left overnight is otherwise as
+                                            # exposed as crypto is.
 
 earnings_blackout:
   enabled: true    # feature gate: when false, discover_candidates() never calls Finnhub and the

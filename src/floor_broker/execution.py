@@ -104,6 +104,14 @@ def _is_order_not_found(exc: APIError) -> bool:
         return False
 
 
+def _is_position_not_found_error(exc: APIError) -> bool:
+    """True only for a confirmed HTTP 404 (no such position). Any other status -- or an error shape
+    with no discoverable HTTP status -- must be treated as transient rather than assumed to mean
+    not-found, since dropping tracked state should require positive confirmation, not just an
+    unparseable or non-404 error."""
+    return exc.status_code == 404
+
+
 def _pending_fills_snapshot() -> list[tuple[str, dict]]:
     with _state_lock:
         return [(order_id, ctx.copy()) for order_id, ctx in _pending_fills.items()]
@@ -314,7 +322,11 @@ def check_option_stops() -> list[dict]:
             log(f"💥  failed to fetch quote for tracked option {contract_symbol}: {exc}")
             continue
 
-        expiration = datetime.strptime(ctx["expiration"], "%Y-%m-%d").date()
+        try:
+            expiration = datetime.strptime(ctx["expiration"], "%Y-%m-%d").date()
+        except (ValueError, TypeError) as exc:
+            log(f"💥  malformed expiration {ctx['expiration']!r} for tracked option {contract_symbol}: {exc}")
+            continue
         dte = (expiration - today).days
         entry_premium = ctx["entry_premium"]
         sl_price = entry_premium * cfg.options_trading.options_slP
@@ -402,6 +414,21 @@ def flatten_all_crypto(reason: str = "power_down_flatten") -> list[dict]:
     return events
 
 
+def flatten_all_options(reason: str = "power_down_flatten") -> list[dict]:
+    """Force-sells every open option position, no market-clock gating. Used by power_scheduler
+    right before it scales floor-broker to 0 -- check_option_stops()'s SL/TP/DTE-force-close
+    protection is only enforced by this process's own poll loop, so an open option position left
+    behind while the pod is scaled down would be completely unprotected until the next session."""
+    positions = [p for p in trading_client2.get_all_positions() if p.asset_class == AssetClass.US_OPTION]
+
+    events = []
+    for position in positions:
+        result = sell_option(position.symbol, reason=reason)
+        if result["status"] != "skipped":
+            events.append({"symbol": position.symbol, "reason": reason, "sell_result": result})
+    return events
+
+
 def is_state_reconciled() -> bool:
     with _state_lock:
         return _state_reconciled
@@ -442,6 +469,42 @@ def _rebuild_crypto_stops_from_positions(positions, cfg) -> int:
             if symbol in _crypto_stops or has_pending_buy:
                 continue
             _crypto_stops[symbol] = (reference_price * cfg.strategy.crypto_slP, reference_price * cfg.strategy.crypto_tpP)
+        restored += 1
+    return restored
+
+
+def _rebuild_option_positions_from_positions(positions, open_trades: list[dict]) -> int:
+    """Rebuilds _option_positions from Alpaca's own open-positions state, cross-referenced against
+    options_trades for the fields Alpaca's Position object doesn't carry (right, delta, reasoning
+    isn't needed here). Postgres returns NUMERIC as decimal.Decimal and DATE as datetime.date --
+    both must be explicitly cast, or check_option_stops()'s float/Decimal arithmetic and
+    datetime.strptime() on a date object will raise TypeError the first time this reconstructed
+    entry is polled."""
+    trades_by_symbol = {trade["contract_symbol"]: trade for trade in open_trades}
+    restored = 0
+    for position in positions:
+        contract_symbol = position.symbol
+        with _state_lock:
+            already_tracked = contract_symbol in _option_positions
+        if already_tracked:
+            continue
+
+        trade = trades_by_symbol.get(contract_symbol)
+        if trade is None:
+            log(f"⚠️  cannot reconstruct option position {contract_symbol}: no matching open row in options_trades")
+            continue
+
+        expiration = trade["expiration"]
+        with _state_lock:
+            _option_positions[contract_symbol] = {
+                "symbol": trade["symbol"],
+                "right": trade["right"],
+                "strike": float(trade["strike"]),
+                "expiration": expiration.isoformat() if hasattr(expiration, "isoformat") else expiration,
+                "delta": float(trade["delta"]) if trade["delta"] is not None else None,
+                "entry_premium": float(trade["entry_premium"]),
+                "qty": abs(int(float(position.qty))),
+            }
         restored += 1
     return restored
 
@@ -509,6 +572,19 @@ def reconcile_tracked_state_once() -> bool:
             log(f"🔄  reconstructed {crypto_stops_restored} crypto synthetic stop/target(s) from open positions")
     except APIError as exc:
         log(f"💥  failed to fetch open positions from Alpaca while backfilling position_opens: {exc}")
+
+    try:
+        option_positions = [p for p in trading_client2.get_all_positions() if p.asset_class == AssetClass.US_OPTION]
+        try:
+            open_trades = db.fetch_open_options_trades()
+            options_restored = _rebuild_option_positions_from_positions(option_positions, open_trades)
+        except Exception as exc:
+            options_restored = 0
+            log(f"💥  failed to reconstruct option positions while reconciling tracked state: {exc}")
+        if options_restored:
+            log(f"🔄  reconstructed {options_restored} option position(s) from Alpaca + options_trades")
+    except APIError as exc:
+        log(f"💥  failed to fetch open option positions from Alpaca while reconciling tracked state: {exc}")
 
     _set_state_reconciled(True)
     return True
@@ -1059,11 +1135,18 @@ def sell_option(contract_symbol: str, reason: str = "dealer_signal") -> dict:
     try:
         position = trading_client2.get_open_position(contract_symbol)
     except APIError as exc:
-        log(f"⚠️  no open option position of {contract_symbol} to sell: {exc}")
-        return {"status": "skipped", "detail": "no open position"}
+        if _is_position_not_found_error(exc):
+            log(f"⚠️  no open option position of {contract_symbol} to sell -- dropping tracking")
+            with _state_lock:
+                _option_positions.pop(contract_symbol, None)
+            return {"status": "skipped", "detail": "no open position"}
+        log(f"💥  failed to fetch option position {contract_symbol}: {exc}")
+        return {"status": "error", "detail": str(exc)}
 
     qty = abs(int(float(position.qty)))
     if qty <= 0:
+        with _state_lock:
+            _option_positions.pop(contract_symbol, None)
         return {"status": "skipped", "detail": "no open position"}
 
     req = MarketOrderRequest(symbol=contract_symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
