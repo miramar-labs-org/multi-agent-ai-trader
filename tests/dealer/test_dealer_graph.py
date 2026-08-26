@@ -367,6 +367,9 @@ def test_call_floor_broker_option_records_dealer_decision(monkeypatch):
     monkeypatch.setattr(
         graph.db, "record_dealer_decision", lambda *a, **k: recorded.setdefault("call", (a, k))
     )
+    monkeypatch.setattr(
+        graph.slack, "notify_dealer_signal", lambda *a, **k: recorded.setdefault("slack", a)
+    )
 
     class FakeResponse:
         status_code = 200
@@ -395,6 +398,8 @@ def test_call_floor_broker_option_records_dealer_decision(monkeypatch):
     args, kwargs = recorded["call"]
     assert args == ("CRV/USD", "BUY", "delta/DTE window", 0.5)
     assert kwargs == {"ohlcv_enrichment_active": False, "cycle_id": "cycle-1"}
+    # Verify slack notification is called
+    assert recorded["slack"] == ("CRV/USD", "BUY", "delta/DTE window")
 
 
 def _base_option_gate_cfg(**strategy_overrides):

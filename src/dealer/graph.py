@@ -475,6 +475,7 @@ def call_floor_broker_option(state: DealerState, cfg) -> DealerState:
     select_option_contract() maps a bearish SELL signal to buying a put (right = "call" if
     action == "BUY" else "put"), and that put purchase is exactly as much a new entry as a call
     purchase is -- it must not bypass macro blackout / symbol-stop cooldown / win-rate throttle."""
+    slack.notify_dealer_signal(state["symbol"], state["signal"]["action"], state["signal"]["reasoning"])
     db.record_dealer_decision(
         state["symbol"],
         state["signal"]["action"],
