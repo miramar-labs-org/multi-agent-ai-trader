@@ -187,6 +187,7 @@ def test_power_down_scales_dealer_first_then_flattens_and_scales_floor_broker(mo
     monkeypatch.setattr(main, "_stop_ollama_model", lambda cfg: None)
     monkeypatch.setattr(main.requests, "post", lambda url, timeout: FakeResponse(json_data={"events": [{"symbol": "BTC/USD"}]}))
     monkeypatch.setattr(main, "_wait_until_crypto_flat", lambda: True)
+    monkeypatch.setattr(main, "_wait_until_options_flat", lambda: True)
     notified = {}
     monkeypatch.setattr(main.slack, "notify_power_state", lambda action, detail: notified.update(action=action, detail=detail))
 
@@ -256,6 +257,7 @@ def test_power_down_stops_ollama_model_after_scaling_dealer_to_zero(monkeypatch)
     monkeypatch.setattr(main, "_stop_ollama_model", lambda cfg: order.append(("stop_ollama",)))
     monkeypatch.setattr(main.requests, "post", lambda url, timeout: FakeResponse(json_data={"events": []}))
     monkeypatch.setattr(main, "_wait_until_crypto_flat", lambda: True)
+    monkeypatch.setattr(main, "_wait_until_options_flat", lambda: True)
     monkeypatch.setattr(main.slack, "notify_power_state", lambda *a, **k: None)
 
     main._power_down(None, _cfg())
