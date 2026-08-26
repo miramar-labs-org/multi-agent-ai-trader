@@ -1856,6 +1856,172 @@ def test_check_pending_option_fills_does_not_resurrect_state_dropped_by_concurre
         assert "AAPL250117C00200000" not in execution._option_positions
 
 
+def test_check_pending_option_fills_closes_position_and_db_on_confirmed_sell_fill(monkeypatch):
+    """Regression (external review finding 1, 2026-08-26): a pending SELL entry (registered by
+    sell_option(), which no longer clears state synchronously) is only resolved -- position dropped,
+    DB row closed -- once check_pending_option_fills() observes the SELL's own confirmed fill."""
+    with execution._state_lock:
+        execution._option_positions["AAPL250117C00200000"] = {
+            "symbol": "AAPL", "right": "call", "strike": 200.0, "expiration": "2025-01-17",
+            "delta": 0.45, "entry_premium": 3.20, "qty": 2,
+        }
+    execution._pending_option_fills["order-opt-sell-1"] = {
+        "contract_symbol": "AAPL250117C00200000",
+        "symbol": "AAPL",
+        "action": "SELL",
+        "reason": "take_profit",
+    }
+    fake_client = FakePendingFillTradingClient({"order-opt-sell-1": FakePendingOrder(filled_avg_price="4.50")})
+    monkeypatch.setattr(execution, "trading_client2", fake_client)
+    recorded_db = {}
+    monkeypatch.setattr(execution.db, "record_options_trade_closed", lambda *a, **k: recorded_db.setdefault("closed", (a, k)))
+
+    events = execution.check_pending_option_fills()
+
+    assert events == [
+        {
+            "contract_symbol": "AAPL250117C00200000",
+            "symbol": "AAPL",
+            "action": "SELL",
+            "reason": "take_profit",
+            "kind": "fill",
+            "order_id": "order-opt-sell-1",
+            "fill_price": 4.5,
+        }
+    ]
+    assert recorded_db["closed"][0] == ("AAPL250117C00200000", "take_profit", 4.5)
+    assert "order-opt-sell-1" not in execution._pending_option_fills
+    with execution._state_lock:
+        assert "AAPL250117C00200000" not in execution._option_positions
+
+
+def test_check_pending_option_fills_leaves_position_and_pending_sell_tracked_on_partial_sell_fill(monkeypatch):
+    """Regression (external review finding 2, 2026-08-26 round 2): the first version of this fix
+    closed _option_positions/the DB row on ANY observed SELL fill, including a PARTIALLY_FILLED order
+    that's still open on Alpaca and could fill (or be canceled with qty still open) further. A
+    still-non-terminal partial fill must leave _option_positions, the pending SELL entry, and the DB
+    untouched -- no event either -- until the order is actually done."""
+    with execution._state_lock:
+        execution._option_positions["AAPL250117C00200000"] = {
+            "symbol": "AAPL", "right": "call", "strike": 200.0, "expiration": "2025-01-17",
+            "delta": 0.45, "entry_premium": 3.20, "qty": 2,
+        }
+    execution._pending_option_fills["order-opt-sell-1"] = {
+        "contract_symbol": "AAPL250117C00200000",
+        "symbol": "AAPL",
+        "action": "SELL",
+        "reason": "take_profit",
+    }
+    fake_client = FakePendingFillTradingClient(
+        {"order-opt-sell-1": FakePendingOrder(filled_avg_price="4.50", status=OrderStatus.PARTIALLY_FILLED)}
+    )
+    monkeypatch.setattr(execution, "trading_client2", fake_client)
+
+    def _fail_if_called(*a, **k):
+        raise AssertionError("db.record_options_trade_closed must not be called on a still-open partial SELL fill")
+
+    monkeypatch.setattr(execution.db, "record_options_trade_closed", _fail_if_called)
+
+    events = execution.check_pending_option_fills()
+
+    assert events == []
+    assert execution._pending_option_fills["order-opt-sell-1"]["action"] == "SELL"
+    with execution._state_lock:
+        assert execution._option_positions["AAPL250117C00200000"]["qty"] == 2
+
+
+def test_check_pending_option_fills_leaves_position_tracked_on_sell_terminal_no_fill(monkeypatch):
+    """Regression (external review finding 1, 2026-08-26): if the SELL order is canceled/rejected
+    without ever filling, the position must stay tracked (protection stays live) -- only the pending
+    SELL entry itself is dropped."""
+    with execution._state_lock:
+        execution._option_positions["AAPL250117C00200000"] = {
+            "symbol": "AAPL", "right": "call", "strike": 200.0, "expiration": "2025-01-17",
+            "delta": 0.45, "entry_premium": 3.20, "qty": 2,
+        }
+    execution._pending_option_fills["order-opt-sell-1"] = {
+        "contract_symbol": "AAPL250117C00200000",
+        "symbol": "AAPL",
+        "action": "SELL",
+        "reason": "stop_loss",
+    }
+    fake_client = FakePendingFillTradingClient(
+        {"order-opt-sell-1": FakePendingOrder(filled_avg_price=None, status=OrderStatus.REJECTED)}
+    )
+    monkeypatch.setattr(execution, "trading_client2", fake_client)
+
+    def _fail_if_called(*a, **k):
+        raise AssertionError("db.record_options_trade_closed must not be called on a zero-fill terminal SELL")
+
+    monkeypatch.setattr(execution.db, "record_options_trade_closed", _fail_if_called)
+
+    events = execution.check_pending_option_fills()
+
+    assert events == [
+        {
+            "contract_symbol": "AAPL250117C00200000",
+            "symbol": "AAPL",
+            "action": "SELL",
+            "reason": "stop_loss",
+            "kind": "terminal",
+            "order_id": "order-opt-sell-1",
+            "order_status": "rejected",
+        }
+    ]
+    assert "order-opt-sell-1" not in execution._pending_option_fills
+    with execution._state_lock:
+        assert "AAPL250117C00200000" in execution._option_positions
+
+
+def test_check_pending_option_fills_leaves_remaining_qty_tracked_on_terminal_partial_sell_fill(monkeypatch):
+    """Regression (external review finding 1, 2026-08-26 round 3): a partially-filled SELL that
+    reaches a terminal status (e.g. canceled after only 1 of 2 tracked contracts sold) still has a
+    non-null filled_avg_price, so it must not be treated as a full close -- the unsold remainder is
+    still open at Alpaca and must stay tracked (and the DB row must stay open), not get dropped
+    alongside the fully-filled portion."""
+    with execution._state_lock:
+        execution._option_positions["AAPL250117C00200000"] = {
+            "symbol": "AAPL", "right": "call", "strike": 200.0, "expiration": "2025-01-17",
+            "delta": 0.45, "entry_premium": 3.20, "qty": 2,
+        }
+    execution._pending_option_fills["order-opt-sell-1"] = {
+        "contract_symbol": "AAPL250117C00200000",
+        "symbol": "AAPL",
+        "action": "SELL",
+        "reason": "take_profit",
+    }
+    fake_order = FakePendingOrder(filled_avg_price="4.50", status=OrderStatus.CANCELED)
+    fake_order.filled_qty = "1"
+    fake_client = FakePendingFillTradingClient({"order-opt-sell-1": fake_order})
+    monkeypatch.setattr(execution, "trading_client2", fake_client)
+
+    def _fail_if_called(*a, **k):
+        raise AssertionError("db.record_options_trade_closed must not be called on a terminal partial SELL fill")
+
+    monkeypatch.setattr(execution.db, "record_options_trade_closed", _fail_if_called)
+    recorded_db = {}
+    monkeypatch.setattr(execution.db, "record_options_trade_updated", lambda *a, **k: recorded_db.setdefault("updated", a))
+
+    events = execution.check_pending_option_fills()
+
+    assert events == [
+        {
+            "contract_symbol": "AAPL250117C00200000",
+            "symbol": "AAPL",
+            "action": "SELL",
+            "reason": "take_profit",
+            "kind": "fill",
+            "order_id": "order-opt-sell-1",
+            "fill_price": 4.5,
+            "qty": 1.0,
+        }
+    ]
+    assert recorded_db["updated"] == ("AAPL250117C00200000", 3.20, 1)
+    assert "order-opt-sell-1" not in execution._pending_option_fills
+    with execution._state_lock:
+        assert execution._option_positions["AAPL250117C00200000"]["qty"] == 1
+
+
 def test_check_pending_option_fills_keeps_tracking_an_unfilled_order(monkeypatch):
     execution._pending_option_fills["order-opt-1"] = {
         "contract_symbol": "AAPL250117C00200000", "symbol": "AAPL", "right": "call", "strike": 200.0,
@@ -2227,10 +2393,11 @@ def test_reconcile_tracked_state_once_does_not_reconstruct_option_position_alrea
 
 
 class FakeOptionOrder:
-    def __init__(self, id, symbol, qty):
+    def __init__(self, id, symbol, qty, side=OrderSide.BUY):
         self.id = id
         self.symbol = symbol
         self.qty = qty
+        self.side = side
 
 
 def test_reconcile_tracked_state_once_restores_a_pending_option_order_from_open_orders(monkeypatch):
@@ -2252,6 +2419,7 @@ def test_reconcile_tracked_state_once_restores_a_pending_option_order_from_open_
     assert execution._pending_option_fills["order-opt-1"] == {
         "contract_symbol": "AAPL250117C00200000",
         "symbol": "AAPL",
+        "action": "BUY",
         "right": "call",
         "strike": 200.0,
         "expiration": "2025-01-17",
@@ -2260,6 +2428,46 @@ def test_reconcile_tracked_state_once_restores_a_pending_option_order_from_open_
         "reasoning": "reconstructed_after_restart",
         "cycle_id": None,
         "db_row_opened": False,
+    }
+
+
+def test_reconcile_tracked_state_once_restores_a_pending_option_sell_order(monkeypatch):
+    """Regression (external review finding 1, 2026-08-26): a restart between sell_option()
+    submitting a SELL and that SELL's fill must not permanently lose the fill, or options_trades
+    stays open forever. Reconciliation now fetches open orders of both sides and reconstructs a
+    pending SELL entry (action=SELL) for one still open on Alpaca, using _option_positions
+    (reconstructed separately, above, from Alpaca's own still-open position) to recover the
+    underlying symbol."""
+    monkeypatch.setattr(execution, "trading_client", FakeReconstructTradingClient([]))
+
+    class FakeOptionPosition:
+        symbol = "AAPL250117C00200000"
+        asset_class = AssetClass.US_OPTION
+        qty = "1"
+        avg_entry_price = "3.20"
+
+    class FakeTradingClient2:
+        def get_all_positions(self):
+            return [FakeOptionPosition()]
+
+        def get_orders(self, request):
+            return [FakeOptionOrder("order-opt-sell-1", "AAPL250117C00200000", "1", side=OrderSide.SELL)]
+
+    monkeypatch.setattr(execution, "trading_client2", FakeTradingClient2())
+    monkeypatch.setattr(db, "record_position_opened", lambda symbol: None)
+    monkeypatch.setattr(db, "fetch_open_options_trades", lambda: [
+        {"symbol": "AAPL", "contract_symbol": "AAPL250117C00200000", "right": "call",
+         "strike": Decimal("200.0"), "expiration": date(2025, 1, 17), "delta": Decimal("0.45"),
+         "entry_premium": Decimal("3.20"), "qty": 1}
+    ])
+
+    assert execution.reconcile_tracked_state_once() is True
+
+    assert execution._pending_option_fills["order-opt-sell-1"] == {
+        "contract_symbol": "AAPL250117C00200000",
+        "symbol": "AAPL",
+        "action": "SELL",
+        "reason": "reconstructed_after_restart",
     }
 
 
@@ -2538,6 +2746,7 @@ def test_buy_option_submits_order_and_defers_tracking_until_fill(monkeypatch):
         assert execution._pending_option_fills["order-opt-1"] == {
             "contract_symbol": "AAPL250117C00200000",
             "symbol": "AAPL",
+            "action": "BUY",
             "right": "call",
             "strike": 200.0,
             "expiration": "2025-01-17",
@@ -2732,7 +2941,10 @@ def test_buy_option_returns_error_when_requote_fails(monkeypatch):
     assert result["status"] == "error"
 
 
-def test_sell_option_submits_order_and_drops_tracking(monkeypatch):
+def test_sell_option_submits_order_and_registers_pending_sell(monkeypatch):
+    """Regression (external review finding 1, 2026-08-26): sell_option() must not clear tracking or
+    close the DB row synchronously on submit -- a submitted SELL can still be canceled/rejected or
+    never fill. State is only cleared once check_pending_option_fills() confirms the fill."""
     with execution._state_lock:
         execution._option_positions["AAPL250117C00200000"] = {
             "symbol": "AAPL", "right": "call", "strike": 200.0, "expiration": "2025-01-17",
@@ -2761,9 +2973,42 @@ def test_sell_option_submits_order_and_drops_tracking(monkeypatch):
 
     assert result["status"] == "submitted"
     assert result["order_id"] == "order-opt-2"
-    assert recorded_db["closed"][0] == ("AAPL250117C00200000", "take_profit", 4.50)
+    assert "closed" not in recorded_db
     with execution._state_lock:
-        assert "AAPL250117C00200000" not in execution._option_positions
+        assert "AAPL250117C00200000" in execution._option_positions
+        pending = execution._pending_option_fills["order-opt-2"]
+        assert pending["contract_symbol"] == "AAPL250117C00200000"
+        assert pending["symbol"] == "AAPL"
+        assert pending["action"] == "SELL"
+        assert pending["reason"] == "take_profit"
+
+
+def test_sell_option_skips_when_sell_already_pending(monkeypatch):
+    """Regression (external review finding 1, 2026-08-26): check_option_stops()/flatten_all_options()
+    re-evaluate every tracked position each poll cycle -- since a submitted SELL no longer drops
+    _option_positions immediately, sell_option() must refuse to submit a second SELL for a contract
+    that already has one in flight, or every poll would resubmit a duplicate order."""
+    with execution._state_lock:
+        execution._option_positions["AAPL250117C00200000"] = {
+            "symbol": "AAPL", "right": "call", "strike": 200.0, "expiration": "2025-01-17",
+            "delta": 0.45, "entry_premium": 3.20, "qty": 2,
+        }
+        execution._pending_option_fills["order-opt-inflight"] = {
+            "contract_symbol": "AAPL250117C00200000", "symbol": "AAPL", "action": "SELL", "reason": "stop_loss",
+        }
+
+    class FakeTradingClient2:
+        def get_open_position(self, contract_symbol):
+            raise AssertionError("must not re-fetch position when a sell is already pending")
+
+        def submit_order(self, req):
+            raise AssertionError("must not submit a duplicate sell order")
+
+    monkeypatch.setattr(execution, "trading_client2", FakeTradingClient2())
+
+    result = execution.sell_option("AAPL250117C00200000", reason="take_profit")
+
+    assert result == {"status": "skipped", "detail": "sell already pending"}
 
 
 def test_sell_option_refuses_to_sell_short_position_and_drops_tracking(monkeypatch):
@@ -2825,19 +3070,25 @@ def test_sell_option_drops_tracking_on_confirmed_position_not_found(monkeypatch)
 
 
 def test_sell_option_drops_matching_pending_option_fill_on_successful_sell(monkeypatch):
-    """Regression (fix-loop round 1, finding 3): a partially-filled BUY order for a contract can
-    stay in _pending_option_fills (finding 1's fix) after check_option_stops() sells the
-    already-filled portion via sell_option(). Left tracked, the next check_pending_option_fills()
-    poll would resurrect _option_positions for a contract that was just sold and whose DB row is
-    now closed -- a phantom in-memory-only position. sell_option() must drop the matching
-    _pending_option_fills entry (and only the matching one) in its successful-sell branch."""
+    """Regression (fix-loop round 1, finding 3; updated for external review finding 2, 2026-08-26,
+    which added cancellation of the stale BUY order itself): a partially-filled BUY order for a
+    contract can stay in _pending_option_fills (finding 1's fix) after check_option_stops() sells
+    the already-filled portion via sell_option(). Left tracked, the next
+    check_pending_option_fills() poll would resurrect _option_positions for a contract that was
+    just sold and whose DB row is now closed -- a phantom in-memory-only position. sell_option()
+    must cancel and drop the matching _pending_option_fills entry (and only the matching one) in
+    its successful-sell branch, leaving an unrelated contract's tracked entry untouched."""
     with execution._state_lock:
         execution._option_positions["AAPL250117C00200000"] = {
             "symbol": "AAPL", "right": "call", "strike": 200.0, "expiration": "2025-01-17",
             "delta": 0.45, "entry_premium": 3.20, "qty": 2,
         }
-        execution._pending_option_fills["order-opt-stale"] = {"contract_symbol": "AAPL250117C00200000", "qty": 1}
-        execution._pending_option_fills["order-opt-other"] = {"contract_symbol": "MSFT250117C00300000", "qty": 1}
+        execution._pending_option_fills["order-opt-stale"] = {
+            "contract_symbol": "AAPL250117C00200000", "symbol": "AAPL", "action": "BUY", "qty": 1,
+        }
+        execution._pending_option_fills["order-opt-other"] = {
+            "contract_symbol": "MSFT250117C00300000", "symbol": "MSFT", "action": "BUY", "qty": 1,
+        }
     monkeypatch.setattr(execution.db, "record_options_trade_closed", lambda *a, **k: None)
 
     class FakePosition:
@@ -2854,6 +3105,9 @@ def test_sell_option_drops_matching_pending_option_fill_on_successful_sell(monke
         def submit_order(self, req):
             return FakeOrder()
 
+        def cancel_order_by_id(self, order_id):
+            pass
+
     monkeypatch.setattr(execution, "trading_client2", FakeTradingClient2())
 
     result = execution.sell_option("AAPL250117C00200000", reason="take_profit")
@@ -2862,6 +3116,113 @@ def test_sell_option_drops_matching_pending_option_fill_on_successful_sell(monke
     with execution._state_lock:
         assert "order-opt-stale" not in execution._pending_option_fills
         assert "order-opt-other" in execution._pending_option_fills
+        assert execution._pending_option_fills["order-opt-2"]["action"] == "SELL"
+
+
+def test_sell_option_cancels_stale_pending_buy_order_before_registering_sell(monkeypatch):
+    """Regression (external review finding 2, 2026-08-26): a partially-filled BUY order can still be
+    non-terminal (tracked in _pending_option_fills with action=BUY) when check_option_stops() sells
+    the already-filled portion. Dropping the BUY's in-memory tracking alone doesn't stop it from
+    filling further on Alpaca's side -- sell_option() must also cancel the order itself."""
+    with execution._state_lock:
+        execution._option_positions["AAPL250117C00200000"] = {
+            "symbol": "AAPL", "right": "call", "strike": 200.0, "expiration": "2025-01-17",
+            "delta": 0.45, "entry_premium": 3.20, "qty": 1,
+        }
+        execution._pending_option_fills["order-opt-buy-stale"] = {
+            "contract_symbol": "AAPL250117C00200000", "symbol": "AAPL", "action": "BUY", "qty": 2,
+        }
+    monkeypatch.setattr(execution.db, "record_options_trade_closed", lambda *a, **k: None)
+
+    class FakePosition:
+        qty = "1"
+        current_price = "4.50"
+
+    class FakeOrder:
+        id = "order-opt-sell-1"
+
+    cancelled_order_ids = []
+
+    class FakeTradingClient2:
+        def get_open_position(self, contract_symbol):
+            return FakePosition()
+
+        def submit_order(self, req):
+            return FakeOrder()
+
+        def cancel_order_by_id(self, order_id):
+            cancelled_order_ids.append(order_id)
+
+    monkeypatch.setattr(execution, "trading_client2", FakeTradingClient2())
+
+    result = execution.sell_option("AAPL250117C00200000", reason="take_profit")
+
+    assert result["status"] == "submitted"
+    assert cancelled_order_ids == ["order-opt-buy-stale"]
+    with execution._state_lock:
+        assert "order-opt-buy-stale" not in execution._pending_option_fills
+
+
+def test_sell_option_sizes_sell_off_position_fetched_after_stale_buy_cancel_attempt(monkeypatch):
+    """Regression (external review finding 1, 2026-08-26 round 2): the first version of this fix
+    canceled the stale BUY only after sizing/submitting the SELL from an already-stale position
+    snapshot -- if the cancel then failed because the BUY's remaining qty had just filled, that
+    newly-filled remainder was left both unsold and untracked. Canceling the stale BUY BEFORE
+    fetching the position (as this now does) fixes the exact failure the earlier test locked in:
+    even when the cancel fails for exactly that reason, get_open_position() is called AFTER the
+    cancel attempt and so already reflects the just-filled remainder, and the SELL is sized off
+    that -- covering the whole position, not just the earlier partial fill.
+
+    Also covers external review finding 2, 2026-08-26 round 3: since a failed cancel can't be
+    reliably distinguished here between "already filled" (this test's stated scenario) and a
+    transient API error, sell_option() now leaves the stale BUY tracked on ANY cancel failure
+    rather than dropping it -- check_pending_option_fills() resolves it correctly either way on a
+    later poll."""
+    with execution._state_lock:
+        execution._option_positions["AAPL250117C00200000"] = {
+            "symbol": "AAPL", "right": "call", "strike": 200.0, "expiration": "2025-01-17",
+            "delta": 0.45, "entry_premium": 3.20, "qty": 1,
+        }
+        execution._pending_option_fills["order-opt-buy-stale"] = {
+            "contract_symbol": "AAPL250117C00200000", "symbol": "AAPL", "action": "BUY", "qty": 2,
+        }
+    monkeypatch.setattr(execution.db, "record_options_trade_closed", lambda *a, **k: None)
+
+    call_order = []
+    submitted_requests = []
+
+    class FakePosition:
+        # The BUY's remaining qty landed by the time this is fetched -- the cancel below "loses the
+        # race" for exactly that reason, so the true current qty is 2, not the earlier partial 1.
+        qty = "2"
+        current_price = "4.50"
+
+    class FakeOrder:
+        id = "order-opt-sell-1"
+
+    class FakeTradingClient2:
+        def cancel_order_by_id(self, order_id):
+            call_order.append(("cancel", order_id))
+            raise APIError("already filled")
+
+        def get_open_position(self, contract_symbol):
+            call_order.append(("get_open_position", contract_symbol))
+            return FakePosition()
+
+        def submit_order(self, req):
+            submitted_requests.append(req)
+            return FakeOrder()
+
+    monkeypatch.setattr(execution, "trading_client2", FakeTradingClient2())
+
+    result = execution.sell_option("AAPL250117C00200000", reason="take_profit")
+
+    assert result["status"] == "submitted"
+    assert call_order == [("cancel", "order-opt-buy-stale"), ("get_open_position", "AAPL250117C00200000")]
+    assert submitted_requests[0].qty == 2
+    with execution._state_lock:
+        assert "order-opt-buy-stale" in execution._pending_option_fills
+        assert execution._pending_option_fills["order-opt-sell-1"]["action"] == "SELL"
 
 
 def test_sell_option_drops_matching_pending_option_fill_on_short_position(monkeypatch):
