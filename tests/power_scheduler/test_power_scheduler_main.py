@@ -389,6 +389,34 @@ def test_power_down_continues_when_flatten_options_request_fails(monkeypatch):
     assert notified["action"] == "powered_down"
 
 
+def test_power_down_continues_when_wait_until_options_flat_raises(monkeypatch):
+    """Regression: an uncaught exception from _wait_until_options_flat() (e.g. Alpaca's APIError on
+    an outage, rate limit, or a bad account-2 credential) must not crash power-down and leave
+    floor-broker stuck up with no notification -- this is the same failure mode the request-failure/
+    timeout branches already guard against, just reached via an exception instead of a return."""
+    calls = []
+    monkeypatch.setattr(main, "_scale", lambda apps_v1, name, replicas: calls.append((name, replicas)))
+    monkeypatch.setattr(main, "_stop_ollama_model", lambda cfg: None)
+    monkeypatch.setattr(main.requests, "post", lambda url, timeout: FakeResponse(json_data={"events": []}))
+    monkeypatch.setattr(main, "_wait_until_crypto_flat", lambda: True)
+
+    def _raise():
+        raise RuntimeError("simulated outage")
+
+    monkeypatch.setattr(main, "_wait_until_options_flat", _raise)
+    errors = {}
+    monkeypatch.setattr(main.slack, "notify_error", lambda component, text: errors.setdefault("text", text))
+    notified = {}
+    monkeypatch.setattr(main.slack, "notify_power_state", lambda action, detail: notified.update(action=action, detail=detail))
+
+    main._power_down(None, _cfg(options_enabled=True))
+
+    assert calls[0] == ("dealer", 0)
+    assert calls[-1] == ("floor-broker", 0)
+    assert "text" in errors
+    assert notified["action"] == "powered_down"
+
+
 def test_power_up_scales_floor_broker_first_then_dealer(monkeypatch):
     calls = []
     monkeypatch.setattr(main, "_scale", lambda apps_v1, name, replicas: calls.append((name, replicas)))

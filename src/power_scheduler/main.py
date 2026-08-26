@@ -160,11 +160,12 @@ def _power_down(apps_v1, cfg) -> None:
             resp = requests.post(f"{cfg.floor_broker.base_url}/flatten-options", timeout=30)
             resp.raise_for_status()
             option_events = resp.json().get("events", [])
-        except requests.RequestException as exc:
-            log(f"💥  flatten-options request failed (power-down continuing): {exc}")
-            slack.notify_error("POWER", f"flatten-options request failed, power-down continuing: {exc}")
+            options_flat = _wait_until_options_flat()
+        except Exception as exc:
+            log(f"💥  flatten-options request/wait failed (power-down continuing): {exc}")
+            slack.notify_error("POWER", f"flatten-options request/wait failed, power-down continuing: {exc}")
         else:
-            if not _wait_until_options_flat():
+            if not options_flat:
                 log(
                     "⚠️  option positions still open after flatten timeout -- power-down continuing "
                     "(they stay protected by dte_force_close/synthetic SL-TP once Floor Broker restarts)"

@@ -6,7 +6,7 @@ from decimal import Decimal
 import pytest
 import pytz
 from alpaca.common.exceptions import APIError
-from alpaca.trading.enums import AssetClass, OrderSide, OrderStatus, OrderType
+from alpaca.trading.enums import AssetClass, OrderSide, OrderStatus, OrderType, PositionSide
 from omegaconf import OmegaConf
 
 from src.common import db
@@ -998,6 +998,34 @@ def test_flatten_all_crypto_uses_a_custom_reason(monkeypatch):
     assert events[0]["reason"] == "test_reason"
 
 
+def test_flatten_all_options_skips_short_positions(monkeypatch):
+    """Regression: this system never opens a short option position itself, so a short reaching
+    flatten_all_options() must be skipped, not sold -- selling it would open MORE short instead of
+    closing it."""
+
+    class FakeLongPosition:
+        symbol = "AAPL250117C00200000"
+        side = PositionSide.LONG
+        asset_class = AssetClass.US_OPTION
+
+    class FakeShortPosition:
+        symbol = "MSFT250117P00300000"
+        side = PositionSide.SHORT
+        asset_class = AssetClass.US_OPTION
+
+    class FakeTradingClient2:
+        def get_all_positions(self):
+            return [FakeLongPosition(), FakeShortPosition()]
+
+    sold = []
+    monkeypatch.setattr(execution, "trading_client2", FakeTradingClient2())
+    monkeypatch.setattr(execution, "sell_option", lambda contract_symbol, reason: sold.append(contract_symbol) or {"status": "submitted"})
+
+    execution.flatten_all_options()
+
+    assert sold == ["AAPL250117C00200000"]
+
+
 def test_check_bracket_fills_reports_take_profit_leg_filled(monkeypatch):
     execution._tracked_brackets["MGN"] = "parent-1"
     tp_leg = FakeLeg("tp-leg-1", OrderStatus.FILLED, OrderType.LIMIT, filled_avg_price="13.50", filled_qty="10")
@@ -1637,6 +1665,38 @@ def test_reconcile_tracked_state_once_rebuilds_option_position_from_matching_opt
     assert isinstance(restored["entry_premium"], float)
 
 
+def test_reconcile_tracked_state_once_skips_short_option_position(monkeypatch):
+    """Regression: a short option position must never be reconstructed into _option_positions --
+    tracking it as if long would eventually cause sell_option() to sell it again instead of closing
+    it. Uses a matching options_trades row on purpose, to prove the side check runs before either
+    reconstruction branch, not just the OCC-fallback one."""
+    monkeypatch.setattr(execution, "trading_client", FakeReconstructTradingClient([]))
+
+    class FakeOptionPosition:
+        symbol = "AAPL250117C00200000"
+        qty = "-2"
+        side = PositionSide.SHORT
+        asset_class = AssetClass.US_OPTION
+
+    class FakeTradingClient2:
+        def get_all_positions(self):
+            return [FakeOptionPosition()]
+
+    monkeypatch.setattr(execution, "trading_client2", FakeTradingClient2())
+    monkeypatch.setattr(db, "record_position_opened", lambda symbol: None)
+    open_trades = [{
+        "symbol": "AAPL", "contract_symbol": "AAPL250117C00200000", "right": "call",
+        "strike": Decimal("200.0"), "expiration": date(2025, 1, 17), "delta": Decimal("0.45"),
+        "entry_premium": Decimal("3.20"), "qty": 2,
+    }]
+    monkeypatch.setattr(db, "fetch_open_options_trades", lambda: open_trades)
+
+    assert execution.reconcile_tracked_state_once() is True
+
+    with execution._state_lock:
+        assert "AAPL250117C00200000" not in execution._option_positions
+
+
 def test_reconcile_tracked_state_once_reconstructs_option_position_from_occ_symbol_when_no_matching_trades_row(monkeypatch):
     """Regression: a missing options_trades row (e.g. the DB write failed after the Alpaca order
     filled) must not leave a live position with zero protection -- fall back to parsing the
@@ -2071,6 +2131,40 @@ def test_sell_option_submits_order_and_drops_tracking(monkeypatch):
     assert result["status"] == "submitted"
     assert result["order_id"] == "order-opt-2"
     assert recorded_db["closed"][0] == ("AAPL250117C00200000", "take_profit", 4.50)
+    with execution._state_lock:
+        assert "AAPL250117C00200000" not in execution._option_positions
+
+
+def test_sell_option_refuses_to_sell_short_position_and_drops_tracking(monkeypatch):
+    """Regression: sell_option() must never submit a SELL for a short position -- that would open
+    MORE short instead of closing anything. Defense in depth: this must hold even if a short position
+    somehow reaches sell_option() directly, bypassing the upstream flatten/reconcile filters."""
+    with execution._state_lock:
+        execution._option_positions["AAPL250117C00200000"] = {
+            "symbol": "AAPL", "right": "call", "strike": 200.0, "expiration": "2025-01-17",
+            "delta": 0.45, "entry_premium": 3.20, "qty": 2,
+        }
+
+    class FakePosition:
+        qty = "-2"
+        current_price = "4.50"
+
+    submitted = []
+
+    class FakeTradingClient2:
+        def get_open_position(self, contract_symbol):
+            return FakePosition()
+
+        def submit_order(self, req):
+            submitted.append(req)
+            raise AssertionError("must not submit an order for a short position")
+
+    monkeypatch.setattr(execution, "trading_client2", FakeTradingClient2())
+
+    result = execution.sell_option("AAPL250117C00200000")
+
+    assert result["status"] == "skipped"
+    assert submitted == []
     with execution._state_lock:
         assert "AAPL250117C00200000" not in execution._option_positions
 

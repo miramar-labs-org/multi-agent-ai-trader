@@ -6,7 +6,7 @@ from datetime import datetime
 
 import pytz
 from alpaca.common.exceptions import APIError
-from alpaca.trading.enums import AssetClass, OrderClass, OrderSide, OrderStatus, OrderType, TimeInForce
+from alpaca.trading.enums import AssetClass, OrderClass, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce
 from alpaca.trading.requests import (
     GetOrderByIdRequest,
     GetOrdersRequest,
@@ -420,11 +420,18 @@ def flatten_all_crypto(reason: str = "power_down_flatten") -> list[dict]:
 
 
 def flatten_all_options(reason: str = "power_down_flatten") -> list[dict]:
-    """Force-sells every open option position, no market-clock gating. Used by power_scheduler
+    """Force-sells every open LONG option position, no market-clock gating. Used by power_scheduler
     right before it scales floor-broker to 0 -- check_option_stops()'s SL/TP/DTE-force-close
     protection is only enforced by this process's own poll loop, so an open option position left
-    behind while the pod is scaled down would be completely unprotected until the next session."""
-    positions = [p for p in trading_client2.get_all_positions() if p.asset_class == AssetClass.US_OPTION]
+    behind while the pod is scaled down would be completely unprotected until the next session. This
+    system never itself opens a short option position, so a short reaching this list would only be
+    some other actor's position -- skipped rather than sold, since selling a short would open MORE
+    short instead of closing it (sell_option() itself refuses this too, as defense in depth)."""
+    positions = [
+        p
+        for p in trading_client2.get_all_positions()
+        if p.asset_class == AssetClass.US_OPTION and getattr(p, "side", PositionSide.LONG) == PositionSide.LONG
+    ]
 
     events = []
     for position in positions:
@@ -515,7 +522,12 @@ def _rebuild_option_positions_from_positions(positions, open_trades: list[dict])
     position with zero stop-loss/take-profit protection. delta is None in the fallback path;
     check_option_stops() never reads ctx["delta"], so this is a safe degradation. Only skips entirely
     when the OCC parse fails or avg_entry_price is missing/<= 0 -- both cases with no reliable way to
-    protect the position at all."""
+    protect the position at all.
+
+    A short option position (this system never opens one itself, so any short reaching this function
+    is some other actor's position) is skipped entirely, for the same reason flatten_all_options()
+    skips one -- tracking it as if it were long would eventually cause sell_option() to sell it again
+    rather than close it."""
     trades_by_symbol = {trade["contract_symbol"]: trade for trade in open_trades}
     restored = 0
     for position in positions:
@@ -523,6 +535,14 @@ def _rebuild_option_positions_from_positions(positions, open_trades: list[dict])
         with _state_lock:
             already_tracked = contract_symbol in _option_positions
         if already_tracked:
+            continue
+
+        if getattr(position, "side", PositionSide.LONG) != PositionSide.LONG:
+            log(
+                f"⚠️  skipping option position {contract_symbol}: not a long position -- this system "
+                "only opens long option positions, and reconstructing a short as tracked state would "
+                "cause sell_option() to double it instead of closing it"
+            )
             continue
 
         trade = trades_by_symbol.get(contract_symbol)
@@ -1210,8 +1230,10 @@ def sell_option(contract_symbol: str, reason: str = "dealer_signal") -> dict:
         log(f"💥  failed to fetch option position {contract_symbol}: {exc}")
         return {"status": "error", "detail": str(exc)}
 
-    qty = abs(int(float(position.qty)))
+    qty = int(float(position.qty))
     if qty <= 0:
+        if qty < 0:
+            log(f"⚠️  {contract_symbol} is a short position (qty={qty}) -- refusing to sell, dropping tracking")
         with _state_lock:
             _option_positions.pop(contract_symbol, None)
         return {"status": "skipped", "detail": "no open position"}
