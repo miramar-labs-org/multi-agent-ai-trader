@@ -341,7 +341,10 @@ def test_power_down_skips_options_flatten_when_disabled_by_config_flag(monkeypat
     assert not any(u.endswith("/flatten-options") for u in posted_urls)
 
 
-def test_power_down_aborts_when_options_never_flatten(monkeypatch):
+def test_power_down_continues_when_options_never_flatten(monkeypatch):
+    """Regression: unlike crypto, a failed/incomplete options flatten must never block power-down --
+    options stay protected by dte_force_close/synthetic SL-TP once Floor Broker restarts, and
+    retrying the flatten after the options market has closed for the day cannot succeed anyway."""
     calls = []
     monkeypatch.setattr(main, "_scale", lambda apps_v1, name, replicas: calls.append((name, replicas)))
     monkeypatch.setattr(main, "_stop_ollama_model", lambda cfg: None)
@@ -350,11 +353,40 @@ def test_power_down_aborts_when_options_never_flatten(monkeypatch):
     monkeypatch.setattr(main, "_wait_until_options_flat", lambda: False)
     errors = {}
     monkeypatch.setattr(main.slack, "notify_error", lambda component, text: errors.setdefault("text", text))
+    notified = {}
+    monkeypatch.setattr(main.slack, "notify_power_state", lambda action, detail: notified.update(action=action, detail=detail))
 
     main._power_down(None, _cfg(options_enabled=True))
 
-    assert calls == [("dealer", 0)]
+    assert calls[0] == ("dealer", 0)
+    assert calls[-1] == ("floor-broker", 0)
+    assert "text" in errors  # still notified, just doesn't block
+    assert notified["action"] == "powered_down"
+
+
+def test_power_down_continues_when_flatten_options_request_fails(monkeypatch):
+    calls = []
+    monkeypatch.setattr(main, "_scale", lambda apps_v1, name, replicas: calls.append((name, replicas)))
+    monkeypatch.setattr(main, "_stop_ollama_model", lambda cfg: None)
+
+    def _fake_post(url, timeout):
+        if url.endswith("/flatten-options"):
+            raise main.requests.RequestException("connection refused")
+        return FakeResponse(json_data={"events": []})
+
+    monkeypatch.setattr(main.requests, "post", _fake_post)
+    monkeypatch.setattr(main, "_wait_until_crypto_flat", lambda: True)
+    errors = {}
+    monkeypatch.setattr(main.slack, "notify_error", lambda component, text: errors.setdefault("text", text))
+    notified = {}
+    monkeypatch.setattr(main.slack, "notify_power_state", lambda action, detail: notified.update(action=action, detail=detail))
+
+    main._power_down(None, _cfg(options_enabled=True))
+
+    assert calls[0] == ("dealer", 0)
+    assert calls[-1] == ("floor-broker", 0)
     assert "text" in errors
+    assert notified["action"] == "powered_down"
 
 
 def test_power_up_scales_floor_broker_first_then_dealer(monkeypatch):

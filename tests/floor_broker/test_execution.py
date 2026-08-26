@@ -1637,12 +1637,43 @@ def test_reconcile_tracked_state_once_rebuilds_option_position_from_matching_opt
     assert isinstance(restored["entry_premium"], float)
 
 
-def test_reconcile_tracked_state_once_skips_option_position_with_no_matching_trades_row(monkeypatch):
+def test_reconcile_tracked_state_once_reconstructs_option_position_from_occ_symbol_when_no_matching_trades_row(monkeypatch):
+    """Regression: a missing options_trades row (e.g. the DB write failed after the Alpaca order
+    filled) must not leave a live position with zero protection -- fall back to parsing the
+    OCC-standard contract symbol plus Alpaca's own avg_entry_price."""
     monkeypatch.setattr(execution, "trading_client", FakeReconstructTradingClient([]))
 
     class FakeOptionPosition:
         symbol = "AAPL250117C00200000"
         qty = "2"
+        avg_entry_price = "3.20"
+        asset_class = AssetClass.US_OPTION
+
+    class FakeTradingClient2:
+        def get_all_positions(self):
+            return [FakeOptionPosition()]
+
+    monkeypatch.setattr(execution, "trading_client2", FakeTradingClient2())
+    monkeypatch.setattr(db, "record_position_opened", lambda symbol: None)
+    monkeypatch.setattr(db, "fetch_open_options_trades", lambda: [])
+
+    assert execution.reconcile_tracked_state_once() is True
+
+    with execution._state_lock:
+        restored = execution._option_positions["AAPL250117C00200000"]
+    assert restored == {
+        "symbol": "AAPL", "right": "call", "strike": 200.0, "expiration": "2025-01-17",
+        "delta": None, "entry_premium": 3.20, "qty": 2,
+    }
+
+
+def test_reconcile_tracked_state_once_skips_option_position_when_occ_fallback_has_no_usable_avg_entry_price(monkeypatch):
+    monkeypatch.setattr(execution, "trading_client", FakeReconstructTradingClient([]))
+
+    class FakeOptionPosition:
+        symbol = "AAPL250117C00200000"
+        qty = "2"
+        avg_entry_price = None
         asset_class = AssetClass.US_OPTION
 
     class FakeTradingClient2:
@@ -1789,7 +1820,7 @@ def test_buy_skips_when_state_not_reconciled(monkeypatch):
 
 def test_buy_option_submits_order_and_tracks_position(monkeypatch):
     monkeypatch.setattr(execution, "is_state_reconciled", lambda: True)
-    monkeypatch.setattr(execution, "get_current_option_mid_price", lambda contract_symbol: 3.20)
+    monkeypatch.setattr(execution, "get_current_option_ask_price", lambda contract_symbol: 3.20)
     recorded_db = {}
     monkeypatch.setattr(execution.db, "record_options_trade_opened", lambda *a, **k: recorded_db.setdefault("opened", (a, k)))
 
@@ -1898,7 +1929,7 @@ def test_buy_option_proceeds_when_contract_already_open_regardless_of_max_concur
     """Topping up / re-buying an already-open contract is exempt from the max-concurrent-positions
     cap, same as _max_concurrent_positions_skip's existing stock-path behavior."""
     monkeypatch.setattr(execution, "is_state_reconciled", lambda: True)
-    monkeypatch.setattr(execution, "get_current_option_mid_price", lambda contract_symbol: 3.20)
+    monkeypatch.setattr(execution, "get_current_option_ask_price", lambda contract_symbol: 3.20)
     monkeypatch.setattr(execution.db, "record_options_trade_opened", lambda *a, **k: None)
 
     class FakeOrder:
@@ -1931,9 +1962,9 @@ def test_buy_option_proceeds_when_contract_already_open_regardless_of_max_concur
 def test_buy_option_refuses_when_live_notional_exceeds_cap(monkeypatch):
     """The claimed entry_premium argument is deliberately NOT what's checked against the cap --
     a hallucinated low premium (which is what sized qty in the Dealer in the first place) must not
-    be able to bypass this gate. Only the live re-quoted mid price is used here."""
+    be able to bypass this gate. Only the live re-quoted ask price is used here."""
     monkeypatch.setattr(execution, "is_state_reconciled", lambda: True)
-    monkeypatch.setattr(execution, "get_current_option_mid_price", lambda contract_symbol: 50.0)  # 10 * 50 * 100 = $50,000, above the $2,000 cap
+    monkeypatch.setattr(execution, "get_current_option_ask_price", lambda contract_symbol: 50.0)  # 10 * 50 * 100 = $50,000, above the $2,000 cap
 
     class FakeTradingClient2:
         def get_account(self):
@@ -1957,13 +1988,39 @@ def test_buy_option_refuses_when_live_notional_exceeds_cap(monkeypatch):
         assert "AAPL250117C00200000" not in execution._option_positions
 
 
+def test_buy_option_refuses_when_live_ask_quote_is_not_executable(monkeypatch):
+    monkeypatch.setattr(execution, "is_state_reconciled", lambda: True)
+    monkeypatch.setattr(execution, "get_current_option_ask_price", lambda contract_symbol: 0.0)
+
+    class FakeTradingClient2:
+        def get_account(self):
+            return FakeAccount()
+
+        def get_open_position(self, symbol):
+            raise APIError("no position")
+
+        def get_all_positions(self):
+            return []
+
+    monkeypatch.setattr(execution, "trading_client2", FakeTradingClient2())
+
+    result = execution.buy_option(
+        "AAPL250117C00200000", 2, 3.20, "call", 200.0, "2025-01-17", 0.45, "test reasoning", "AAPL", "cycle-1"
+    )
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "no_ask_quote"
+    with execution._state_lock:
+        assert "AAPL250117C00200000" not in execution._option_positions
+
+
 def test_buy_option_returns_error_when_requote_fails(monkeypatch):
     monkeypatch.setattr(execution, "is_state_reconciled", lambda: True)
 
     def _raise(contract_symbol):
         raise APIError("no quote available")
 
-    monkeypatch.setattr(execution, "get_current_option_mid_price", _raise)
+    monkeypatch.setattr(execution, "get_current_option_ask_price", _raise)
 
     class FakeTradingClient2:
         def get_account(self):
@@ -2144,6 +2201,35 @@ def test_check_option_stops_skips_contract_with_malformed_expiration_without_poi
     with execution._state_lock:
         execution._option_positions["BAD250117C00200000"] = {
             "symbol": "BAD", "right": "call", "strike": 200.0, "expiration": "not-a-date",
+            "delta": 0.45, "entry_premium": 3.20, "qty": 1,
+        }
+        execution._option_positions["AAPL250117C00200000"] = {
+            "symbol": "AAPL", "right": "call", "strike": 200.0, "expiration": "2099-01-17",
+            "delta": 0.45, "entry_premium": 3.20, "qty": 2,
+        }
+
+    events = execution.check_option_stops()
+
+    assert sell_calls == [("AAPL250117C00200000", "stop_loss")]
+    assert len(events) == 1
+
+
+def test_check_option_stops_skips_contract_when_quote_fetch_raises_keyerror_without_poisoning_others(monkeypatch):
+    cfg = OmegaConf.create({"options_trading": {"enabled": True, "options_slP": 0.50, "options_tpP": 1.75, "dte_force_close": 3}})
+    monkeypatch.setattr(execution, "load_config", lambda: cfg)
+
+    def _mid(contract_symbol):
+        if contract_symbol == "BAD250117C00200000":
+            raise KeyError(contract_symbol)  # malformed Alpaca SDK quote response, not an APIError
+        return 1.50
+
+    monkeypatch.setattr(execution, "get_current_option_mid_price", _mid)
+    sell_calls = []
+    monkeypatch.setattr(execution, "sell_option", lambda contract_symbol, reason: sell_calls.append((contract_symbol, reason)) or {"status": "submitted", "detail": "x", "order_id": "o1"})
+
+    with execution._state_lock:
+        execution._option_positions["BAD250117C00200000"] = {
+            "symbol": "BAD", "right": "call", "strike": 200.0, "expiration": "2099-01-17",
             "delta": 0.45, "entry_premium": 3.20, "qty": 1,
         }
         execution._option_positions["AAPL250117C00200000"] = {

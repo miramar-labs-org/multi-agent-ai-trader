@@ -489,6 +489,27 @@ def test_call_floor_broker_option_skips_sell_during_macro_blackout(monkeypatch):
     assert result["execution_result"]["reason"] == "macro_blackout"
 
 
+def test_call_floor_broker_option_skips_when_no_authorized_budget(monkeypatch):
+    """A held-only position carries budget=0 -- refuse the entry rather than forward it, mirroring
+    call_floor_broker's no_authorized_budget guard. Applies to SELL too: unlike stocks, an option
+    SELL is a new put entry, never a close."""
+    monkeypatch.setattr(graph.slack, "notify_floor_broker_result", lambda *a, **k: None)
+    monkeypatch.setattr(graph.db, "record_floor_broker_event", lambda *a, **k: None)
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("Floor Broker must not be called for a held-only (budget=0) position")
+
+    monkeypatch.setattr(graph.requests, "post", _fail_if_called)
+
+    cfg = _base_option_gate_cfg()
+    state = {**_option_pick_state(action="SELL"), "budget": 0.0}
+
+    result = graph.call_floor_broker_option(state, cfg)
+
+    assert result["execution_result"]["status"] == "skipped"
+    assert result["execution_result"]["reason"] == "no_authorized_budget"
+
+
 def test_call_floor_broker_option_skips_when_risk_per_trade_usd_not_configured(monkeypatch):
     monkeypatch.setattr(graph.slack, "notify_floor_broker_result", lambda *a, **k: None)
     monkeypatch.setattr(graph.db, "record_floor_broker_event", lambda *a, **k: None)

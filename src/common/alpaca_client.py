@@ -45,3 +45,10 @@ def get_current_option_mid_price(contract_symbol: str) -> float:
     )
     q = quote[contract_symbol]
     return (q.bid_price + q.ask_price) / 2
+
+
+def get_current_option_ask_price(contract_symbol: str) -> float:
+    quote = option_data_client2.get_option_latest_quote(
+        OptionLatestQuoteRequest(symbol_or_symbols=contract_symbol)
+    )
+    return quote[contract_symbol].ask_price

@@ -1,4 +1,5 @@
 import json
+import re
 import threading
 import time
 from datetime import datetime
@@ -18,6 +19,7 @@ from src.common import db, kill_switch
 from src.common.alpaca_client import (
     get_current_ask_price,
     get_current_bid_price,
+    get_current_option_ask_price,
     get_current_option_mid_price,
     trading_client,
     trading_client2,
@@ -321,7 +323,7 @@ def check_option_stops() -> list[dict]:
     for contract_symbol, ctx in tracked:
         try:
             mid = get_current_option_mid_price(contract_symbol)
-        except APIError as exc:
+        except (APIError, KeyError, TypeError) as exc:
             log(f"💥  failed to fetch quote for tracked option {contract_symbol}: {exc}")
             continue
 
@@ -476,13 +478,44 @@ def _rebuild_crypto_stops_from_positions(positions, cfg) -> int:
     return restored
 
 
+_OCC_SYMBOL_RE = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
+
+
+def _parse_occ_contract_symbol(contract_symbol: str) -> dict | None:
+    """Parses an OCC-standard option contract symbol (e.g. "AAPL250117C00200000" -> root AAPL,
+    expiration 2025-01-17, call, strike $200.00) with no DB dependency, mirroring
+    _crypto_reference_price's DB-free reconstruction for crypto. Returns None if the symbol doesn't
+    match the OCC format."""
+    m = _OCC_SYMBOL_RE.match(contract_symbol)
+    if m is None:
+        return None
+    root, yymmdd, right_code, strike_digits = m.groups()
+    try:
+        expiration = datetime.strptime(yymmdd, "%y%m%d").date()
+    except ValueError:
+        return None
+    return {
+        "symbol": root,
+        "right": "call" if right_code == "C" else "put",
+        "strike": int(strike_digits) / 1000,
+        "expiration": expiration.isoformat(),
+    }
+
+
 def _rebuild_option_positions_from_positions(positions, open_trades: list[dict]) -> int:
     """Rebuilds _option_positions from Alpaca's own open-positions state, cross-referenced against
     options_trades for the fields Alpaca's Position object doesn't carry (right, delta, reasoning
     isn't needed here). Postgres returns NUMERIC as decimal.Decimal and DATE as datetime.date --
     both must be explicitly cast, or check_option_stops()'s float/Decimal arithmetic and
     datetime.strptime() on a date object will raise TypeError the first time this reconstructed
-    entry is polled."""
+    entry is polled. When no options_trades row matches (e.g. the row predates this table, or the DB
+    write failed after the Alpaca order filled), falls back to a DB-free reconstruction from the
+    OCC-standard contract symbol plus Alpaca's own avg_entry_price -- mirroring
+    _crypto_reference_price's DB-free pattern for crypto, so a missing DB row never leaves a live
+    position with zero stop-loss/take-profit protection. delta is None in the fallback path;
+    check_option_stops() never reads ctx["delta"], so this is a safe degradation. Only skips entirely
+    when the OCC parse fails or avg_entry_price is missing/<= 0 -- both cases with no reliable way to
+    protect the position at all."""
     trades_by_symbol = {trade["contract_symbol"]: trade for trade in open_trades}
     restored = 0
     for position in positions:
@@ -493,19 +526,42 @@ def _rebuild_option_positions_from_positions(positions, open_trades: list[dict])
             continue
 
         trade = trades_by_symbol.get(contract_symbol)
-        if trade is None:
-            log(f"⚠️  cannot reconstruct option position {contract_symbol}: no matching open row in options_trades")
+        if trade is not None:
+            expiration = trade["expiration"]
+            with _state_lock:
+                _option_positions[contract_symbol] = {
+                    "symbol": trade["symbol"],
+                    "right": trade["right"],
+                    "strike": float(trade["strike"]),
+                    "expiration": expiration.isoformat() if hasattr(expiration, "isoformat") else expiration,
+                    "delta": float(trade["delta"]) if trade["delta"] is not None else None,
+                    "entry_premium": float(trade["entry_premium"]),
+                    "qty": abs(int(float(position.qty))),
+                }
+            restored += 1
             continue
 
-        expiration = trade["expiration"]
+        parsed = _parse_occ_contract_symbol(contract_symbol)
+        avg_entry_price = getattr(position, "avg_entry_price", None)
+        if parsed is None or avg_entry_price is None or float(avg_entry_price) <= 0:
+            log(
+                f"⚠️  cannot reconstruct option position {contract_symbol}: no matching open row in "
+                "options_trades and no usable OCC-symbol/avg_entry_price fallback"
+            )
+            continue
+
+        log(
+            f"⚠️  reconstructing option position {contract_symbol} from OCC symbol + avg_entry_price "
+            "(degraded: no matching options_trades row, delta unknown)"
+        )
         with _state_lock:
             _option_positions[contract_symbol] = {
-                "symbol": trade["symbol"],
-                "right": trade["right"],
-                "strike": float(trade["strike"]),
-                "expiration": expiration.isoformat() if hasattr(expiration, "isoformat") else expiration,
-                "delta": float(trade["delta"]) if trade["delta"] is not None else None,
-                "entry_premium": float(trade["entry_premium"]),
+                "symbol": parsed["symbol"],
+                "right": parsed["right"],
+                "strike": parsed["strike"],
+                "expiration": parsed["expiration"],
+                "delta": None,
+                "entry_premium": float(avg_entry_price),
                 "qty": abs(int(float(position.qty))),
             }
         restored += 1
@@ -1092,18 +1148,26 @@ def buy_option(
         return skip
 
     try:
-        live_mid = get_current_option_mid_price(contract_symbol)
+        live_ask = get_current_option_ask_price(contract_symbol)
     except APIError as exc:
         log(f"💥  failed to re-quote {contract_symbol} before BUY: {exc}")
         return {"status": "error", "detail": f"failed to fetch live quote for {contract_symbol}: {exc}"}
 
-    notional = qty * live_mid * 100
+    if live_ask <= 0:
+        log(f"⚠️  no executable ask quote for {contract_symbol} -- skipping BUY")
+        return {
+            "status": "skipped",
+            "reason": "no_ask_quote",
+            "detail": f"no executable ask quote for {contract_symbol}: {live_ask}",
+        }
+
+    notional = qty * live_ask * 100
     if notional > cfg.options_trading.max_notional_usd:
         log(f"🛑  option BUY notional (${notional:.2f}) exceeds cap (${cfg.options_trading.max_notional_usd}) -- skipping {contract_symbol}")
         return {
             "status": "skipped",
             "reason": "notional_cap_exceeded",
-            "detail": f"live-quoted notional ${notional:.2f} (qty={qty} @ live mid ${live_mid:.2f}) exceeds cap ${cfg.options_trading.max_notional_usd}",
+            "detail": f"live-quoted notional ${notional:.2f} (qty={qty} @ live ask ${live_ask:.2f}) exceeds cap ${cfg.options_trading.max_notional_usd}",
         }
 
     req = MarketOrderRequest(symbol=contract_symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY)

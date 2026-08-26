@@ -126,9 +126,13 @@ def _start_ollama_model(cfg) -> None:
 
 def _power_down(apps_v1, cfg) -> None:
     """Dealer stops first (no state/positions, safe to kill immediately) so it can't fire a new
-    BUY mid-flatten. Floor Broker stays up until crypto (and, if enabled, options) are confirmed
-    flat -- it's the only thing enforcing their synthetic stop-loss/take-profit, so scaling it to 0
-    with a position still open would leave that position completely unprotected overnight."""
+    BUY mid-flatten. Floor Broker stays up until crypto is confirmed flat -- it's the only thing
+    enforcing crypto's synthetic stop-loss/take-profit, so scaling it to 0 with a crypto position
+    still open would leave that position completely unprotected overnight. Options are different:
+    they don't trade 24/7 and stay protected by dte_force_close/synthetic SL-TP resuming the moment
+    Floor Broker is back up, so a failed/incomplete options flatten is logged and Slack-notified but
+    never blocks power-down -- unlike crypto, retrying it later cannot succeed anyway once the
+    options market has closed for the day (flatten_all_options() submits DAY-TIF orders)."""
     _scale(apps_v1, "dealer", 0)
 
     if cfg.power_schedule.manage_ollama_model:
@@ -151,20 +155,24 @@ def _power_down(apps_v1, cfg) -> None:
         return
 
     option_events = []
-    if cfg.power_schedule.get("flatten_options_before_powerdown", True):
+    if cfg.power_schedule.get("flatten_options_before_powerdown", False):
         try:
             resp = requests.post(f"{cfg.floor_broker.base_url}/flatten-options", timeout=30)
             resp.raise_for_status()
             option_events = resp.json().get("events", [])
         except requests.RequestException as exc:
-            log(f"💥  flatten-options request failed: {exc}")
-            slack.notify_error("POWER", f"power-down aborted -- flatten-options request failed: {exc}")
-            return
-
-        if not _wait_until_options_flat():
-            log("💥  option positions still open after flatten timeout -- aborting power-down")
-            slack.notify_error("POWER", "power-down aborted -- option positions still open after flatten timeout")
-            return
+            log(f"💥  flatten-options request failed (power-down continuing): {exc}")
+            slack.notify_error("POWER", f"flatten-options request failed, power-down continuing: {exc}")
+        else:
+            if not _wait_until_options_flat():
+                log(
+                    "⚠️  option positions still open after flatten timeout -- power-down continuing "
+                    "(they stay protected by dte_force_close/synthetic SL-TP once Floor Broker restarts)"
+                )
+                slack.notify_error(
+                    "POWER",
+                    "option positions still open after flatten timeout -- power-down continuing",
+                )
 
     _scale(apps_v1, "floor-broker", 0)
     slack.notify_power_state(
