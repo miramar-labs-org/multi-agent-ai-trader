@@ -39,7 +39,7 @@ trading:
   tpP: 1.05
   pollsecs: 600
   buffer: 15
-  market_override: true
+  market_override: false
   stocks:
     enabled: true         # set false to pause Analyst/Dealer handling of equities entirely
   crypto:
