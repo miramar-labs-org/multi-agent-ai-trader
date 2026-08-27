@@ -2771,28 +2771,26 @@ def test_buy_option_blocked_when_stock_heavy_book_fills_the_concurrent_positions
     assert result["reason"] == "max_concurrent_positions_reached"
 
 
-def test_buy_option_proceeds_when_contract_already_open_regardless_of_max_concurrent_positions(monkeypatch):
-    """Topping up / re-buying an already-open contract is exempt from the max-concurrent-positions
-    cap, same as _max_concurrent_positions_skip's existing stock-path behavior."""
+def test_buy_option_refuses_when_contract_already_held_at_alpaca(monkeypatch):
+    """Options have no top-up concept: a contract already open at Alpaca must not get a second BUY --
+    that over-positions the account and corrupts _option_positions (keyed by OCC, overwritten on
+    each fill)."""
     monkeypatch.setattr(execution, "is_state_reconciled", lambda: True)
-    monkeypatch.setattr(execution, "get_current_option_ask_price", lambda contract_symbol: 3.20)
-    monkeypatch.setattr(execution.db, "record_options_trade_opened", lambda *a, **k: None)
 
-    class FakeOrder:
-        id = "order-opt-3"
+    def _submit_must_not_be_called(req):
+        raise AssertionError("must not submit a duplicate BUY for an already-held contract")
 
     class FakeTradingClient2:
         def get_account(self):
             return FakeAccount()
 
         def get_open_position(self, symbol):
-            return object()  # contract already open -- exempt from the concurrent-positions cap
+            return object()  # contract already open
 
         def get_all_positions(self):
-            return [object()] * 10  # at the cap, but exempt applies before this is even checked
+            return []
 
-        def submit_order(self, req):
-            return FakeOrder()
+        submit_order = _submit_must_not_be_called
 
     monkeypatch.setattr(execution, "trading_client", FakeTradingClient2())
 
@@ -2800,7 +2798,81 @@ def test_buy_option_proceeds_when_contract_already_open_regardless_of_max_concur
         "AAPL250117C00200000", 2, 3.20, "call", 200.0, "2025-01-17", 0.45, "test reasoning", "AAPL", "cycle-1"
     )
 
-    assert result["status"] == "submitted"
+    assert result["status"] == "skipped"
+    assert result["reason"] == "already_holding_contract"
+
+
+def test_buy_option_refuses_when_contract_in_option_positions(monkeypatch):
+    monkeypatch.setattr(execution, "is_state_reconciled", lambda: True)
+
+    class FakeTradingClient2:
+        def get_account(self):
+            return FakeAccount()
+
+        def get_open_position(self, symbol):
+            raise APIError("no position")  # Alpaca doesn't show it yet, but we already track it
+
+        def get_all_positions(self):
+            return []
+
+        def submit_order(self, req):
+            raise AssertionError("must not submit a duplicate BUY for a tracked contract")
+
+    monkeypatch.setattr(execution, "trading_client", FakeTradingClient2())
+    with execution._state_lock:
+        execution._option_positions["AAPL250117C00200000"] = {
+            "symbol": "AAPL", "right": "call", "strike": 200.0, "expiration": "2025-01-17",
+            "delta": 0.45, "entry_premium": 3.10, "qty": 1,
+        }
+
+    result = execution.buy_option(
+        "AAPL250117C00200000", 2, 3.20, "call", 200.0, "2025-01-17", 0.45, "test reasoning", "AAPL", "cycle-1"
+    )
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "already_holding_contract"
+
+
+def test_buy_option_refuses_when_a_buy_is_already_in_flight(monkeypatch):
+    monkeypatch.setattr(execution, "is_state_reconciled", lambda: True)
+
+    class FakeTradingClient2:
+        def get_account(self):
+            return FakeAccount()
+
+        def get_open_position(self, symbol):
+            raise APIError("no position")
+
+        def get_all_positions(self):
+            return []
+
+        def submit_order(self, req):
+            raise AssertionError("must not submit a second BUY while one is in flight")
+
+    monkeypatch.setattr(execution, "trading_client", FakeTradingClient2())
+    execution._set_pending_option_fill("order-inflight-1", {
+        "contract_symbol": "AAPL250117C00200000", "symbol": "AAPL", "action": "BUY",
+        "right": "call", "strike": 200.0, "expiration": "2025-01-17", "delta": 0.45, "qty": 1,
+    })
+
+    result = execution.buy_option(
+        "AAPL250117C00200000", 2, 3.20, "call", 200.0, "2025-01-17", 0.45, "test reasoning", "AAPL", "cycle-1"
+    )
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "option_buy_in_flight"
+
+
+def test_option_exposure_contract_symbols_unions_held_and_pending_buys():
+    with execution._state_lock:
+        execution._option_positions["AAPL250117C00200000"] = {"symbol": "AAPL", "qty": 1}
+    execution._set_pending_option_fill("o-buy", {"contract_symbol": "MSFT250117C00400000", "action": "BUY"})
+    execution._set_pending_option_fill("o-sell", {"contract_symbol": "NVDA250117C00900000", "action": "SELL"})
+
+    assert execution.option_exposure_contract_symbols() == [
+        "AAPL250117C00200000",
+        "MSFT250117C00400000",
+    ]  # sorted; a pending SELL is not "exposure to acquire" so it's excluded
 
 
 def test_buy_option_refuses_when_live_notional_exceeds_cap(monkeypatch):

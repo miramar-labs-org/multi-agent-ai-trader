@@ -1256,6 +1256,55 @@ def _max_concurrent_positions_skip(symbol: str, cfg) -> dict | None:
     return None
 
 
+def _duplicate_option_buy_skip(contract_symbol: str) -> dict | None:
+    """Refuses a second BUY for a contract this process already holds or already has a BUY order in
+    flight for. Options have no top-up concept (unlike the stock path): every Dealer option_pick is
+    a brand-new entry, _fallback_pick is deterministic so a slow-filling BUY gets re-picked
+    identically on the next Dealer cycle, and _option_positions is keyed by OCC symbol and
+    overwritten wholesale on each observed fill (see check_pending_option_fills) -- so a doubled BUY
+    both over-positions the account and corrupts the tracked qty / entry premium that synthetic
+    SL/TP/DTE protection sizes off. The reconcile scan (gated by is_state_reconciled(), which
+    _buy_preflight_skip enforces) seeds _pending_option_fills from every open Alpaca option order,
+    so the in-memory view here is authoritative; _fetch_open_position is a final cross-check against
+    Alpaca. Mirrors buy()'s open-orders guard for the stock/crypto path."""
+    with _state_lock:
+        buy_in_flight = any(
+            ctx.get("contract_symbol") == contract_symbol and ctx.get("action") == "BUY"
+            for ctx in _pending_option_fills.values()
+        )
+        tracked = contract_symbol in _option_positions
+    if buy_in_flight:
+        log(f"🛑  option BUY {contract_symbol} skipped -- a BUY for this contract is already in flight")
+        return {
+            "status": "skipped",
+            "reason": "option_buy_in_flight",
+            "detail": f"a BUY order for {contract_symbol} is already in flight; not submitting a duplicate",
+        }
+    if tracked or _fetch_open_position(contract_symbol) is not None:
+        log(f"🛑  option BUY {contract_symbol} skipped -- this contract is already an open position")
+        return {
+            "status": "skipped",
+            "reason": "already_holding_contract",
+            "detail": f"{contract_symbol} is already an open position; not submitting a duplicate BUY",
+        }
+    return None
+
+
+def option_exposure_contract_symbols() -> list[str]:
+    """Every option contract this process currently holds or has a BUY order in flight for. The
+    Dealer reads this (GET /option-exposure) before a new option entry so it can skip a contract
+    that would be a duplicate; buy_option() enforces the same rule authoritatively via
+    _duplicate_option_buy_skip -- this is only the earlier, quieter check."""
+    with _state_lock:
+        held = set(_option_positions)
+        pending_buys = {
+            ctx["contract_symbol"]
+            for ctx in _pending_option_fills.values()
+            if ctx.get("action") == "BUY" and ctx.get("contract_symbol")
+        }
+    return sorted(held | pending_buys)
+
+
 def _spread_reference_price_or_skip(symbol: str, cfg) -> tuple[float | None, dict | None]:
     max_spread_pct = cfg.strategy.get("max_bid_ask_spread_pct")
     if max_spread_pct is None:
@@ -1526,6 +1575,10 @@ def buy_option(
     cfg = load_config()  # fresh (within its own refresh window) so a live strategy change never needs a restart
 
     skip = _buy_preflight_skip(contract_symbol, cfg)
+    if skip is not None:
+        return skip
+
+    skip = _duplicate_option_buy_skip(contract_symbol)
     if skip is not None:
         return skip
 

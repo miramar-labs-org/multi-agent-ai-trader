@@ -726,6 +726,15 @@ def call_floor_broker_option(state: DealerState, cfg) -> DealerState:
         graph_slack_and_record(state, action, result)
         return {**state, "execution_result": result}
 
+    if _option_contract_already_exposed(cfg, option_pick["contract_symbol"]):
+        result = {
+            "status": "skipped",
+            "reason": "duplicate_option_position",
+            "detail": f"{option_pick['contract_symbol']} is already held or has a BUY order in flight",
+        }
+        graph_slack_and_record(state, action, result)
+        return {**state, "execution_result": result}
+
     payload = {
         "contract_symbol": option_pick["contract_symbol"],
         "side": "BUY",
@@ -759,6 +768,23 @@ def call_floor_broker_option(state: DealerState, cfg) -> DealerState:
         result = {"status": "error", "detail": str(exc)}
         graph_slack_and_record(state, action, result)
         return {**state, "execution_result": result}
+
+
+def _option_contract_already_exposed(cfg, contract_symbol: str) -> bool:
+    """Best-effort pre-check against the Floor Broker's current option exposure so the Dealer skips
+    a contract it already holds (or has a pending BUY for) before spending an /execute-option round
+    trip on it -- _fallback_pick is deterministic, so a slow-filling BUY otherwise gets re-picked
+    and re-submitted identically every cycle. buy_option() enforces this authoritatively; any
+    transient failure here just falls through to that."""
+    try:
+        resp = requests.get(f"{cfg.floor_broker.base_url}/option-exposure", timeout=10)
+        if resp.status_code != 200:
+            log(f"⚠️ option-exposure check for {contract_symbol} returned {resp.status_code}; proceeding")
+            return False
+        return contract_symbol in set(resp.json().get("contracts", []))
+    except requests.RequestException as exc:
+        log(f"⚠️ option-exposure check for {contract_symbol} failed ({exc}); proceeding")
+        return False
 
 
 def graph_slack_and_record(state: DealerState, action: str, result: dict) -> None:
