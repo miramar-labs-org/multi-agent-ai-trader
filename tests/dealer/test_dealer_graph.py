@@ -230,15 +230,26 @@ def test_select_option_contract_async_passes_api_key_and_needs_no_openai_env(mon
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     captured = {}
 
-    async def _fake_get_options_tools():
-        return []
+    class _Tool:
+        name = "get_option_chain"
 
-    class _Resp:
-        tool_calls = []
+        async def ainvoke(self, args):
+            return json.dumps(
+                {"snapshots": {"AAPL250117C00200000": {"latestQuote": {"bp": 3.0, "ap": 3.4}, "greeks": {"delta": 0.45}}}}
+            )
+
+    async def _fake_get_options_tools():
+        return [_Tool()]
 
     class _Bound:
+        def __init__(self):
+            self.n = 0
+
         def invoke(self, messages):
-            return _Resp()
+            self.n += 1
+            if self.n == 1:
+                return type("R", (), {"tool_calls": [{"name": "get_option_chain", "args": {}, "id": "c"}]})()
+            return type("R", (), {"tool_calls": []})()
 
     class _Structured:
         def invoke(self, messages):
@@ -541,6 +552,197 @@ def test_select_option_contract_async_uses_fallback_when_structured_output_raise
     assert pick is not None
     assert pick.right == "call"
     assert "fallback" in pick.reasoning.lower()
+
+
+def _single_call_chain():
+    """A one-contract chain whose sole row (a call, mid-delta, ~25 DTE, quoted) qualifies for the
+    deterministic fallback -- so tests can assert the fallback engaged by checking the pick came back
+    as that contract with fallback reasoning."""
+    ok_exp = (datetime.now(pytz.timezone("US/Eastern")).date() + timedelta(days=25)).isoformat()
+    occ = f"AAPL{ok_exp.replace('-', '')[2:]}C00145000"
+    chain = json.dumps({"snapshots": {occ: {"latestQuote": {"bp": 1.0, "ap": 1.2}, "greeks": {"delta": 0.46}}}})
+    return occ, chain
+
+
+def _bound_one_tool_then_stop(chain_holder):
+    class _Bound:
+        def __init__(self):
+            self.n = 0
+
+        def invoke(self, messages):
+            self.n += 1
+            chain_holder["rounds"] = self.n
+            if self.n == 1:
+                return type("R", (), {"tool_calls": [{"name": "get_option_chain", "args": {}, "id": "c"}]})()
+            return type("R", (), {"tool_calls": []})()
+
+    return _Bound
+
+
+def test_select_option_contract_async_rejects_wrong_direction_structured_pick(monkeypatch):
+    captured = {}
+    occ, chain = _single_call_chain()
+
+    class _Tool:
+        name = "get_option_chain"
+
+        async def ainvoke(self, args):
+            return chain
+
+    class _Structured:
+        def invoke(self, messages):
+            # schema-valid but points the wrong way for a BUY signal
+            return graph.OptionContractPick(
+                contract_symbol=occ, strike=145.0, expiration="2025-06-20",
+                right="put", delta=0.46, premium=1.1, reasoning="model said put",
+            )
+
+    pick = _run_async_select(monkeypatch, _Tool(), _bound_one_tool_then_stop(captured), _Structured, captured)
+
+    assert pick is not None
+    assert pick.right == "call"  # fell back to the direction-safe deterministic pick
+    assert pick.contract_symbol == occ
+    assert "fallback" in pick.reasoning.lower()
+
+
+def test_select_option_contract_async_rejects_unseen_structured_pick(monkeypatch):
+    captured = {}
+    occ, chain = _single_call_chain()
+
+    class _Tool:
+        name = "get_option_chain"
+
+        async def ainvoke(self, args):
+            return chain
+
+    class _Structured:
+        def invoke(self, messages):
+            return graph.OptionContractPick(
+                contract_symbol="AAPL991231C09999000", strike=9999.0, expiration="2099-12-31",
+                right="call", delta=0.46, premium=1.1, reasoning="hallucinated OCC",
+            )
+
+    pick = _run_async_select(monkeypatch, _Tool(), _bound_one_tool_then_stop(captured), _Structured, captured)
+
+    assert pick is not None
+    assert pick.contract_symbol == occ  # only contracts actually seen in a chain are eligible
+    assert "fallback" in pick.reasoning.lower()
+
+
+def test_select_option_contract_async_accepts_valid_structured_pick(monkeypatch):
+    captured = {}
+    occ, chain = _single_call_chain()
+
+    class _Tool:
+        name = "get_option_chain"
+
+        async def ainvoke(self, args):
+            return chain
+
+    class _Structured:
+        def invoke(self, messages):
+            return graph.OptionContractPick(
+                contract_symbol=occ, strike=145.0, expiration="2025-06-20",
+                right="call", delta=0.46, premium=1.1, reasoning="right direction, real contract",
+            )
+
+    pick = _run_async_select(monkeypatch, _Tool(), _bound_one_tool_then_stop(captured), _Structured, captured)
+
+    assert pick.contract_symbol == occ
+    assert pick.reasoning == "right direction, real contract"  # LLM pick kept, not overridden
+
+
+def test_select_option_contract_async_recovers_from_unknown_tool_call(monkeypatch):
+    captured = {}
+    occ, chain = _single_call_chain()
+
+    class _Tool:
+        name = "get_option_chain"
+
+        async def ainvoke(self, args):
+            return chain
+
+    class _Bound:
+        def __init__(self):
+            self.n = 0
+
+        def invoke(self, messages):
+            self.n += 1
+            if self.n == 1:
+                return type("R", (), {"tool_calls": [{"name": "nonexistent_tool", "args": {}, "id": "bad"}]})()
+            if self.n == 2:
+                return type("R", (), {"tool_calls": [{"name": "get_option_chain", "args": {}, "id": "c"}]})()
+            return type("R", (), {"tool_calls": []})()
+
+    class _Structured:
+        def invoke(self, messages):
+            return graph.OptionContractPick(
+                contract_symbol=occ, strike=145.0, expiration="2025-06-20",
+                right="call", delta=0.46, premium=1.1, reasoning="recovered",
+            )
+
+    pick = _run_async_select(monkeypatch, _Tool(), _Bound, _Structured, captured)
+
+    assert pick is not None  # a hallucinated tool name no longer aborts the whole selector
+    assert pick.contract_symbol == occ
+
+
+def test_select_option_contract_async_recovers_from_failing_tool_call(monkeypatch):
+    captured = {}
+
+    class _Tool:
+        name = "get_option_chain"
+
+        async def ainvoke(self, args):
+            raise RuntimeError("alpaca-mcp-server exploded")
+
+    pick = _run_async_select(monkeypatch, _Tool(), _bound_one_tool_then_stop(captured), _raise_structured(), captured)
+
+    assert pick is None  # no rows gathered -> fallback finds nothing, but nothing raised either
+
+
+def _raise_structured():
+    class _Structured:
+        def invoke(self, messages):
+            raise ValueError("no parse")
+
+    return _Structured
+
+
+def test_fallback_pick_enforces_configured_liquidity_when_fields_present():
+    today = date(2025, 6, 1)
+    ok_exp = "2025-06-20"
+    thin = _row("THIN", 0.45, ok_exp)
+    thin["oi"] = 5  # below min_open_interest 100
+    deep = _row("DEEP", 0.50, ok_exp)
+    cfg = OmegaConf.create(
+        {
+            "options_trading": {
+                "dte_min": 14, "dte_max": 45, "target_delta_min": 0.30, "target_delta_max": 0.60,
+                "min_open_interest": 100, "min_volume": 10,
+            }
+        }
+    )
+    pick = graph._fallback_pick([thin, deep], "call", cfg, delta_mid=0.45, today=today)
+    assert pick.contract_symbol == "DEEP"  # THIN skipped despite being closer to target delta
+
+
+def test_fallback_pick_keeps_rows_missing_liquidity_fields():
+    today = date(2025, 6, 1)
+    ok_exp = "2025-06-20"
+    row = _row("NOLIQ", 0.45, ok_exp)
+    row["oi"] = None
+    row["volume"] = None
+    cfg = OmegaConf.create(
+        {
+            "options_trading": {
+                "dte_min": 14, "dte_max": 45, "target_delta_min": 0.30, "target_delta_max": 0.60,
+                "min_open_interest": 100, "min_volume": 10,
+            }
+        }
+    )
+    pick = graph._fallback_pick([row], "call", cfg, delta_mid=0.45, today=today)
+    assert pick.contract_symbol == "NOLIQ"  # Alpaca usually omits OI/volume; absence is not a fail
 
 
 def test_llm_call_sets_request_timeout_and_no_retries(monkeypatch):

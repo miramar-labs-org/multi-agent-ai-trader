@@ -444,10 +444,12 @@ def _trim_history(messages: list, hard_cap: int) -> list:
 
 
 def _fallback_pick(rows: list[dict], right: str, cfg, delta_mid: float, today) -> OptionContractPick | None:
-    """Deterministic pick when the structured LLM call fails: the contract whose |delta| is closest
-    to the target-delta midpoint, among those matching right / delta window / DTE window with a
-    usable quote. Keeps options trading working when qwen3.6 flakes; the Floor Broker's risk gates
-    still run on the result."""
+    """Deterministic pick when the structured LLM call fails or is rejected: the contract whose
+    |delta| is closest to the target-delta midpoint, among those matching right / delta window /
+    DTE window with a usable quote. Configured min_open_interest / min_volume are enforced only for
+    rows where Alpaca actually returned those fields (its option snapshots usually omit them). Keeps
+    options trading working when qwen3.6 flakes; the Floor Broker's risk gates still run on the
+    result."""
     ot = cfg.options_trading
     best = None
     for r in rows:
@@ -461,6 +463,12 @@ def _fallback_pick(rows: list[dict], right: str, cfg, delta_mid: float, today) -
         except ValueError:
             continue
         if not (ot.dte_min <= dte <= ot.dte_max):
+            continue
+        min_oi, min_vol = ot.get("min_open_interest"), ot.get("min_volume")
+        oi, vol = r.get("oi"), r.get("volume")
+        if min_oi is not None and oi is not None and oi < min_oi:
+            continue
+        if min_vol is not None and vol is not None and vol < min_vol:
             continue
         bid, ask = r.get("bid"), r.get("ask")
         if not bid or not ask or ask <= 0:
@@ -546,8 +554,17 @@ async def _select_option_contract_async(state: DealerState, cfg, signal: dict) -
         if not response.tool_calls:
             break
         for call in response.tool_calls:
-            tool = tools_by_name[call["name"]]
-            result = await tool.ainvoke(call["args"])
+            tool = tools_by_name.get(call["name"])
+            if tool is None:
+                log(f"⚠️ option selection for {state['symbol']}: LLM called unknown tool {call['name']!r}, skipping")
+                messages.append(ToolMessage(content=f"error: unknown tool {call['name']!r}", tool_call_id=call["id"]))
+                continue
+            try:
+                result = await tool.ainvoke(call["args"])
+            except Exception as exc:  # noqa: BLE001 - a bad tool call must not abort the whole selector
+                log(f"⚠️ option selection for {state['symbol']}: tool {call['name']} failed ({exc}), skipping")
+                messages.append(ToolMessage(content=f"error: tool {call['name']} failed: {exc}", tool_call_id=call["id"]))
+                continue
             raw = str(result)
             seen_rows.extend(parse_option_chain(raw))
             messages.append(
@@ -565,10 +582,26 @@ async def _select_option_contract_async(state: DealerState, cfg, signal: dict) -
     try:
         pick = structured_llm.invoke(messages)
         if pick:
-            return pick
+            reject = _structured_pick_rejection(pick, right, seen_rows)
+            if reject is None:
+                return pick
+            log(f"⚠️ option selection for {state['symbol']}: {reject}; using fallback")
     except Exception as exc:  # noqa: BLE001 - any parse/transport failure falls back deterministically
         log(f"⚠️ option selection for {state['symbol']}: structured pick failed ({exc}); using fallback")
     return _fallback_pick(seen_rows, right, cfg, delta_mid, today)
+
+
+def _structured_pick_rejection(pick: OptionContractPick, right: str, seen_rows: list[dict]) -> str | None:
+    """Guards the LLM's structured pick before it reaches the Floor Broker. The model can return a
+    schema-valid contract that points the wrong way (a put on a BUY signal, a call on a SELL) or an
+    OCC symbol it never actually saw in a chain response. Either one is rejected here so the
+    deterministic fallback -- which is direction-safe and only picks from observed rows -- runs
+    instead. Returns a reason string when the pick must be rejected, or None when it is safe to use."""
+    if pick.right != right:
+        return f"structured pick right={pick.right!r} != intended {right!r}"
+    if pick.contract_symbol not in {r.get("symbol") for r in seen_rows}:
+        return f"structured pick {pick.contract_symbol} was not in any observed option chain"
+    return None
 
 
 def _route_after_llm_call(state: DealerState, cfg) -> str:
