@@ -25,6 +25,8 @@ a new feature ships.
 
 | Date | Feature | Summary | Status |
 |---|---|---|---|
+| 2026-08-14 | Options trading | When on, every stock buy/sell call is expressed as a long option instead of a stock trade — a call for a buy, a put for a sell (never a short). The Dealer's AI picks a specific contract by exploring the live option chain (expiration 14–45 days out, delta 0.30–0.60), and the order goes to the same paper account as every other trade. Since the broker offers no automatic stop-loss on options, the system watches each contract itself and force-closes on a 50% loss, a 175% gain, or when expiration gets within 3 days. Crypto is unaffected. | On |
+| 2026-08-14 | Configurable Alpaca account | The single paper-trading login the whole floor uses — stocks, crypto and options alike — is now a config setting that can be switched while running, instead of being fixed in code. Currently the base funded paper account; the switch target is the competition's $100k options account. | On |
 | 2026-08-13 | Dealer OHLCV enrichment | Dealer prompts now include stock-only multi-timeframe Alpaca candle context (5m/1h/1d) and derived market-structure features such as return, volatility, ATR, VWAP distance, relative volume, and EMA context alongside TAAPI's current indicator snapshot. | On |
 | 2026-08-12 | Analyst candidate mix | Composes the daily candidate pool as a configurable percentage split (default 40% large-cap / 30% crypto / 30% today's screener movers) instead of letting the day's movers ranking alone decide it, so large-cap names are reliably represented and always get real indicator data — still subject to the earnings blackout filter like any other candidate. | On |
 | 2026-08-11 | Same-symbol stop-loss cooldown | After a symbol stops out, the Dealer pauses new BUY entries for that symbol during the configured lookback window, preventing repeated re-entry into the same failing setup. | On |
@@ -142,6 +144,14 @@ already been made. Its job is purely mechanical order execution and safety check
   buy fills, it remembers a stop-loss and take-profit price for that coin (also from config) and
   checks the live price against them on the same 30-second cadence described below, selling
   automatically if either is crossed.
+- **Buying an option** (only when options trading is on): the Dealer has already picked a
+  specific contract by exploring the live option chain through the AI model. The Floor Broker
+  re-checks the current asking price, sizes the number of contracts so the premium outlay stays
+  within the per-trade risk budget, rejects it if the total cost exceeds the configured cap, and
+  places a plain market order on the same single paper account everything else trades on. Alpaca has no automatic stop-loss
+  for options either, so — as with crypto — the Floor Broker watches each open contract on the
+  same 30-second cadence and force-closes it on a 50% loss, a 175% gain, or once expiration is
+  within 3 days, whichever comes first.
 - **Selling:** sells the full position at market. If Alpaca briefly rejects the sell because of
   a conflicting order, it clears the blocker and retries automatically rather than giving up.
 - **Watching orders fill:** buys and sells are submitted and acknowledged immediately rather than
@@ -291,3 +301,10 @@ its output reliably machine-usable.
   be reconstructed after the fact.
 - It only trades what the Analyst put on the morning watchlist (plus any pre-existing position
   it discovers). It doesn't react to a brand-new, off-watchlist opportunity mid-day.
+- Its options trading only ever *buys* single long calls or puts — there are no spreads, no
+  multi-leg structures, and nothing that sells premium. The Analyst is also not options-aware: it
+  still screens and picks the same stock universe, and the options layer just re-expresses those
+  picks as long contracts.
+- All reporting — the end-of-day Slack recap, the README P/L badges, the Analyst's mid-day
+  position-P&L note — reads the one live paper account. Stocks, crypto and options all trade
+  there, so everything is covered by a single read; there is no multi-account aggregation.

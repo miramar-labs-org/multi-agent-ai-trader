@@ -8,7 +8,7 @@ from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 
 from src.common import slack
-from src.common.alpaca_client import trading_client, trading_client2
+from src.common.alpaca_client import trading_client
 from src.common.config import load_config
 from src.common.logging import get_logger
 from src.common.market_calendar import get_stock_market_hours
@@ -70,7 +70,7 @@ def _wait_until_options_flat(timeout_s: int = OPTIONS_FLAT_TIMEOUT_S) -> bool:
     while True:
         positions = [
             p
-            for p in trading_client2.get_all_positions()
+            for p in trading_client.get_all_positions()
             if p.asset_class == AssetClass.US_OPTION and getattr(p, "side", PositionSide.LONG) == PositionSide.LONG
         ]
         if not positions:

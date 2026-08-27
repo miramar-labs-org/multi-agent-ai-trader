@@ -139,6 +139,18 @@ latency — well under the 600s (`trading.pollsecs`) poll interval. Confirms
 the existing unbounded-`max_tokens` `ChatOpenAI` call in
 `src/dealer/graph.py` needs no change for this model.
 
+## Note (2026-08-14): options contract-selection uses the same model, agentically
+
+The options path (`options_trading.enabled`, ROADMAP P1.16) adds a *third* LLM call site, but no
+new model or endpoint: `select_option_contract` (`src/dealer/graph.py`) uses the same `cfg.llm`
+model via `ChatOpenAI`, differing only in shape — instead of one structured-output turn it runs a
+tool-calling **agent loop** (`_MAX_TOOL_CALL_ROUNDS = 6`) with Alpaca's options-data MCP tools
+bound (`src/dealer/mcp_options.py`), so the model issues several `tool_calls` rounds to walk the
+option chain before returning a final `OptionContractPick`. Both models discussed above already
+reach `finish_reason: "tool_calls"` reliably, which is the only capability this loop depends on;
+worst case is ~6× the single-call latency, still far under the 600s poll interval. No `max_tokens`
+cap here either.
+
 ## Sources
 
 - [Atlas: Open-source inference engine for DGX Spark](https://forums.developer.nvidia.com/t/atlas-open-source-inference-engine-for-dgx-spark-2minute-cold-start-100-tok-s-on-qwen3-6-35b-fp8-13-supported-models/369263)

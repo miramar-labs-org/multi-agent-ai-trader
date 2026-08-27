@@ -16,24 +16,19 @@ slack:
 floor_broker:
   base_url: "http://floor-broker.multi-agent-ai-trader.svc.cluster.local:8000"
 
-# Which env vars each Alpaca account's clients read credentials from (see
-# src/common/alpaca_client.py) -- account1 is stocks/crypto (trading_client/stock_data_client/
-# crypto_data_client), account2 is options-only (trading_client2/option_data_client2, and the
-# Alpaca MCP server Dealer's contract-selection tool-calling launches). Changing key_env/secret_env
-# here repoints a running pod at a different paper account with no rebuild/redeploy -- config.yaml
-# is polled fresh every 60s (src/common/config.py) -- as long as that account's credentials already
-# exist under those env var names in the mlabs-api-keys k8s Secret (a pod restart is still needed
-# the first time a new named pair is added to the Secret, since env var values are fixed at pod
-# start; only which pair is *active* is live-switchable).
-# account2 defaults to the same credentials as account1 (there's only one funded paper account
-# today). ALPACA_PAPER_API_KEY2/ALPACA_PAPER_API_SECRET2 are pre-wired as the switch target: once
-# a real second paper account's credentials are added to the mlabs-api-keys k8s Secret under those
-# names (+ one pod restart), flip account2.key_env/secret_env below to them to split it out live.
+# The one live paper account the whole floor trades on -- every order (stocks, crypto, options
+# alike) routes here, and the EOD recap + README P/L badges report this account only. key_env/
+# secret_env name the env vars its credentials are read from (see src/common/alpaca_client.py).
+# Changing them repoints a running pod at a different paper account with no rebuild/redeploy --
+# config.yaml is polled fresh every 60s (src/common/config.py) -- as long as that account's
+# credentials already exist under those env var names in the mlabs-api-keys k8s Secret (a pod
+# restart is still needed the first time a new named pair is added to the Secret, since env var
+# values are fixed at pod start; only which pair is *active* is live-switchable).
+# ALPACA_PAPER_API_KEY2/ALPACA_PAPER_API_SECRET2 are pre-wired as the switch target for the Alpaca
+# competition's dedicated $100k Level-3 account: add its credentials to the k8s Secret under those
+# names (+ one pod restart), then point key_env/secret_env below at them to move the floor.
 alpaca:
-  account1:
-    key_env: "ALPACA_PAPER_API_KEY"
-    secret_env: "ALPACA_PAPER_API_SECRET"
-  account2:
+  live:
     key_env: "ALPACA_PAPER_API_KEY"
     secret_env: "ALPACA_PAPER_API_SECRET"
 
@@ -69,6 +64,11 @@ strategy:
   position_sizing: flat_budget    # only this is enforced (analyst.default_budget); risk_based is recorded intent only
   risk_per_trade_usd: null        # recorded intent only -- see position_sizing note above
   max_concurrent_positions: 10    # recorded intent only -- analyst.max_universe_size already caps concurrent picks
+  min_confidence: 0.6             # Dealer BUY confidence gate (src/dealer/graph.py); 0.0 disables it
+  min_win_rate: 0.30             # trailing TP/SL win-rate floor below which new BUYs pause
+  win_rate_min_sample: 5          # completed exits required before the win-rate throttle evaluates
+  win_rate_throttle:
+    enabled: true
   win_rate_throttle_scope: symbol
   symbol_stop_cooldown:
     enabled: true
@@ -93,6 +93,37 @@ options_trading:
   options_tpP: 1.75         # synthetic take-profit, fraction of entry premium
   max_notional_usd: 2000    # hard cap on a single option order's live-quoted notional (qty * mid-price * 100); re-quoted against the market at BUY time, not the LLM-claimed premium (20x strategy.risk_per_trade_usd's default of 100)
 
+eod_flatten:
+  enabled: false   # off by default -- opt-in "day trading mode"; when false poll_eod_flatten()
+                   # (src/floor_broker/main.py) short-circuits before touching the clock or Alpaca
+  minutes_before_close: 10
+  conditional: false   # when true, only flatten if aggregate open-stock unrealized P&L >= 0
+  max_days_held_loss: 5   # only consulted when conditional: true
+
+power_schedule:
+  enabled: true   # scale dealer/floor-broker to 0 outside the trading window; when false
+                   # src/power_scheduler/main.py exits immediately every tick
+  minutes_after_close: 60
+  minutes_before_open: 60
+  flatten_crypto_before_powerdown: true   # crypto's stop-loss is synthetic (Floor Broker poll
+                                           # loop) -- force-sell before floor-broker scales to 0
+  manage_ollama_model: true   # stop/preload llm.model in Ollama around the scale-down/up
+  flatten_options_before_powerdown: false  # operator escape hatch only -- options are already
+                                            # protected by dte_force_close + synthetic SL/TP
+
+earnings_blackout:
+  enabled: true    # drop screener candidates near their earnings date; requires FINNHUB_API_KEY
+  days_before: 2
+  days_after: 1
+
+macro_blackout:
+  enabled: true    # pause new BUY entries on scheduled macro-release days (SELL/HOLD unaffected).
+                   # Quad-witching days are auto-detected in code; `dates` is a hand-maintained
+                   # list of other releases (FOMC/CPI/NFP/PCE ...) -- left empty in the baseline
+                   # since it's time-sensitive, repopulate from federalreserve.gov / bls.gov /
+                   # bea.gov (see config.yaml for the format).
+  dates: []
+
 eod_report:
   schedule: "30 21 * * *"   # informational copy of the CronJob's own spec.schedule — 21:30 UTC daily, after
                             # market close; runs every day so closed days get a Slack notice, not silence
@@ -100,8 +131,22 @@ eod_report:
 analyst:
   schedule: "55 8 * * *"      # informational copy of the CronJob's own spec.schedule — 08:55 America/New_York
                                # daily (spec.timeZone), ~30min before the 9:30 ET open
+  midday_run:
+    enabled: true     # optional second Analyst run at ~12:30pm ET for intraday movers/news
+  midday_schedule: "30 12 * * *"   # informational copy of k8s/analyst-midday-cronjob-k3s.yaml's spec.schedule
+  news:
+    enabled: true           # Alpaca News API + Yahoo RSS headlines as an Analyst input
+  indicators:
+    enabled: true           # TAAPI technical indicator data as an Analyst input
+  track_record:
+    enabled: true           # Analyst's own recent pick history + Dealer/Floor Broker outcomes (read-only)
+  track_record_days: 5        # lookback window in calendar days; excludes today by construction
+  position_pnl:
+    enabled: true           # live unrealized P&L snapshot of open Alpaca positions as an Analyst input
   max_universe_size: 10
   default_budget: 5000
+  max_total_budget_usd: 50000  # cap on the sum of every pick's budget in one selection
+                                # (default = max_universe_size x default_budget)
   screener_top_n: 20          # candidates pulled from Alpaca Screener before research/filtering
   min_price_usd: 1.0          # screener candidates below this price are dropped (movers only -- see
                                # sources.py; most-actives has no price field to filter on). Sub-$1

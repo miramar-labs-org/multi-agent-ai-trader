@@ -56,6 +56,10 @@ win rate, average win/loss, expectancy, exposure, trade count.
 - **Position sizing**: fixed `cfg.analyst.default_budget` per trade (matching the live
   Analyst's fixed per-symbol budget), not a compounding fraction of account equity. Stocks size
   to whole shares; crypto sizes fractionally off notional.
+- **Instruments**: stocks and crypto only. The harness has **no options support** — it simulates
+  the underlying's own bars, so it does not model the `options_trading.enabled` path (MCP
+  contract selection, premium/delta/DTE dynamics, the synthetic option SL/TP/DTE-force-close).
+  A backtest run reflects the equity-bracket-order behavior regardless of the live options flag.
 
 ## Config
 

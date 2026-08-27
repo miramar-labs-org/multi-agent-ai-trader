@@ -6,10 +6,13 @@
 # section for the initial-create form.
 #
 # Also mirrors GHA_SECRET_KEYS (the subset of keys a GitHub Actions workflow reads directly --
-# currently just ALPACA_PAPER_API_KEY/SECRET, for .github/workflows/pl-badges.yaml, which runs
-# on a self-hosted runner outside the cluster and so can't read the k8s Secret) to matching
-# GitHub Actions repo secrets via `gh secret set`, so the two credential stores can't drift --
-# see docs/architecture.md's Secrets section.
+# the ALPACA_PAPER_API_KEY/SECRET and ...KEY2/SECRET2 pairs, for .github/workflows/pl-badges.yaml,
+# which runs on a self-hosted runner outside the cluster and so can't read the k8s Secret) to
+# matching GitHub Actions repo secrets via `gh secret set`, so the two credential stores can't
+# drift -- see docs/architecture.md's Secrets section. Both ALPACA paper-account pairs are
+# mirrored so the badge job keeps working whichever one `alpaca.live` in config.yaml currently
+# names (the default pair, or the competition $100k Level-3 pair); the code only ever reads the
+# one live account.
 #
 # Usage:
 #   export ALPACA_PAPER_API_KEY=PK...
@@ -29,7 +32,7 @@ set -euo pipefail
 NAMESPACE="multi-agent-ai-trader"
 SECRET_NAME="mlabs-api-keys"
 KNOWN_KEYS=(TAAPI_API_KEY ALPACA_PAPER_API_KEY ALPACA_PAPER_API_SECRET ALPACA_PAPER_API_KEY2 ALPACA_PAPER_API_SECRET2 LANGCHAIN_API_KEY SLACK_WEBHOOK_URL2 DATABASE_URL)
-GHA_SECRET_KEYS=(ALPACA_PAPER_API_KEY ALPACA_PAPER_API_SECRET)
+GHA_SECRET_KEYS=(ALPACA_PAPER_API_KEY ALPACA_PAPER_API_SECRET ALPACA_PAPER_API_KEY2 ALPACA_PAPER_API_SECRET2)
 RESTART=true
 
 if [[ "${1:-}" == "--restart" ]]; then

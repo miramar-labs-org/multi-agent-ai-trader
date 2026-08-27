@@ -6,7 +6,7 @@ from alpaca.data.historical.news import NewsClient
 from alpaca.data.requests import NewsRequest
 from bs4 import BeautifulSoup
 
-from src.common.alpaca_client import account_env_names, get_current_ask_price
+from src.common.alpaca_client import get_current_ask_price, live_account_env_names
 from src.common.logging import get_logger
 
 log = get_logger("ANALYST")
@@ -23,7 +23,7 @@ def html_to_text(html_content):
 
 
 def _alpaca_headers() -> dict:
-    key_env, secret_env = account_env_names("account1", "ALPACA_PAPER_API_KEY", "ALPACA_PAPER_API_SECRET")
+    key_env, secret_env = live_account_env_names()
     return {
         "APCA-API-KEY-ID": os.getenv(key_env, ""),
         "APCA-API-SECRET-KEY": os.getenv(secret_env, ""),
@@ -182,7 +182,7 @@ def fetch_large_cap_candidates(symbols: list[str]) -> list[dict]:
 
 
 def fetch_news(days: int, limit: int = 20) -> str:
-    key_env, secret_env = account_env_names("account1", "ALPACA_PAPER_API_KEY", "ALPACA_PAPER_API_SECRET")
+    key_env, secret_env = live_account_env_names()
     client = NewsClient(
         api_key=os.getenv(key_env),
         secret_key=os.getenv(secret_env),
