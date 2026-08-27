@@ -648,8 +648,107 @@ def test_select_option_contract_async_accepts_valid_structured_pick(monkeypatch)
 
     pick = _run_async_select(monkeypatch, _Tool(), _bound_one_tool_then_stop(captured), _Structured, captured)
 
+    ok_exp = (datetime.now(pytz.timezone("US/Eastern")).date() + timedelta(days=25)).isoformat()
     assert pick.contract_symbol == occ
-    assert pick.reasoning == "right direction, real contract"  # LLM pick kept, not overridden
+    assert pick.reasoning == "right direction, real contract"  # the model's rationale is kept
+    assert pick.strike == 145.0  # numeric fields are re-grounded in the observed chain row
+    assert pick.expiration == ok_exp
+    assert pick.delta == 0.46
+    assert pick.premium == 1.1
+
+
+def test_select_option_contract_async_reconciles_fabricated_metadata_from_observed_row(monkeypatch):
+    """A schema-valid pick that names a real, seen contract but attaches a fabricated low premium
+    and an out-of-window delta must be re-grounded in the observed chain row before it can drive
+    Floor Broker sizing -- otherwise qty = risk_per_trade_usd // (premium * 100) is oversized."""
+    captured = {}
+    ok_exp = (datetime.now(pytz.timezone("US/Eastern")).date() + timedelta(days=25)).isoformat()
+    occ, chain = _single_call_chain()
+
+    class _Tool:
+        name = "get_option_chain"
+
+        async def ainvoke(self, args):
+            return chain
+
+    class _Structured:
+        def invoke(self, messages):
+            return graph.OptionContractPick(
+                contract_symbol=occ, strike=999.0, expiration="2025-06-20",
+                right="call", delta=0.99, premium=0.01, reasoning="cheap and juicy",
+            )
+
+    pick = _run_async_select(monkeypatch, _Tool(), _bound_one_tool_then_stop(captured), _Structured, captured)
+
+    assert pick.contract_symbol == occ
+    assert pick.reasoning == "cheap and juicy"  # the model's rationale is preserved
+    assert pick.strike == 145.0  # from the OCC symbol, not the model
+    assert pick.expiration == ok_exp  # from the OCC symbol, not the model
+    assert pick.delta == 0.46  # from the observed greeks
+    assert pick.premium == 1.1  # mid of the observed quote, not the fabricated 0.01
+
+
+def test_select_option_contract_async_falls_back_when_picked_row_has_no_quote(monkeypatch):
+    """A contract seen only without a usable quote can't be reconciled, so the deterministic
+    fallback (which requires a quote) picks a different, quoted contract instead."""
+    captured = {}
+    ok_exp = (datetime.now(pytz.timezone("US/Eastern")).date() + timedelta(days=25)).isoformat()
+    ymd = ok_exp.replace("-", "")[2:]
+    quoted = f"AAPL{ymd}C00145000"
+    unquoted = f"AAPL{ymd}C00150000"
+    chain = json.dumps(
+        {
+            "snapshots": {
+                quoted: {"latestQuote": {"bp": 1.0, "ap": 1.2}, "greeks": {"delta": 0.46}},
+                unquoted: {"greeks": {"delta": 0.44}},  # no latestQuote
+            }
+        }
+    )
+
+    class _Tool:
+        name = "get_option_chain"
+
+        async def ainvoke(self, args):
+            return chain
+
+    class _Structured:
+        def invoke(self, messages):
+            return graph.OptionContractPick(
+                contract_symbol=unquoted, strike=150.0, expiration=ok_exp,
+                right="call", delta=0.44, premium=0.9, reasoning="prefer the 150",
+            )
+
+    pick = _run_async_select(monkeypatch, _Tool(), _bound_one_tool_then_stop(captured), _Structured, captured)
+
+    assert pick.contract_symbol == quoted  # fell back to the quoted contract
+    assert "fallback" in pick.reasoning.lower()
+
+
+def test_reconcile_structured_pick_overwrites_numeric_fields_from_row():
+    rows = [_row("AAPL250620C00145000", 0.52, "2025-06-20", bid=2.0, ask=2.4, right="call")]
+    pick = graph.OptionContractPick(
+        contract_symbol="AAPL250620C00145000", strike=1.0, expiration="2000-01-01",
+        right="call", delta=0.01, premium=0.02, reasoning="keep me",
+    )
+    out = graph._reconcile_structured_pick(pick, "call", rows)
+    assert out.strike == 100.0  # _row's strike
+    assert out.expiration == "2025-06-20"
+    assert out.delta == 0.52
+    assert out.premium == 2.2  # mid of 2.0 / 2.4
+    assert out.reasoning == "keep me"
+
+
+def test_reconcile_structured_pick_rejects_direction_mismatch_in_observed_row():
+    """The provenance check only compares the model's self-reported right; reconciliation also
+    checks the right of the *matched* row, catching a call-labelled pick whose seen OCC symbol is
+    actually a put."""
+    put_occ = "AAPL250620P00145000"
+    rows = [_row(put_occ, -0.40, "2025-06-20", right="put")]
+    pick = graph.OptionContractPick(
+        contract_symbol=put_occ, strike=145.0, expiration="2025-06-20",
+        right="call", delta=0.40, premium=1.1, reasoning="mislabelled",
+    )
+    assert graph._reconcile_structured_pick(pick, "call", rows) is None
 
 
 def test_select_option_contract_async_recovers_from_unknown_tool_call(monkeypatch):

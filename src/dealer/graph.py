@@ -584,8 +584,16 @@ async def _select_option_contract_async(state: DealerState, cfg, signal: dict) -
         if pick:
             reject = _structured_pick_rejection(pick, right, seen_rows)
             if reject is None:
-                return pick
-            log(f"⚠️ option selection for {state['symbol']}: {reject}; using fallback")
+                reconciled = _reconcile_structured_pick(pick, right, seen_rows)
+                if reconciled is not None:
+                    return reconciled
+                log(
+                    f"⚠️ option selection for {state['symbol']}: structured pick "
+                    f"{pick.contract_symbol} could not be reconciled against observed chain data; "
+                    "using fallback"
+                )
+            else:
+                log(f"⚠️ option selection for {state['symbol']}: {reject}; using fallback")
     except Exception as exc:  # noqa: BLE001 - any parse/transport failure falls back deterministically
         log(f"⚠️ option selection for {state['symbol']}: structured pick failed ({exc}); using fallback")
     return _fallback_pick(seen_rows, right, cfg, delta_mid, today)
@@ -602,6 +610,42 @@ def _structured_pick_rejection(pick: OptionContractPick, right: str, seen_rows: 
     if pick.contract_symbol not in {r.get("symbol") for r in seen_rows}:
         return f"structured pick {pick.contract_symbol} was not in any observed option chain"
     return None
+
+
+def _reconcile_structured_pick(
+    pick: OptionContractPick, right: str, seen_rows: list[dict]
+) -> OptionContractPick | None:
+    """Re-ground the LLM pick's numeric fields in the values actually observed for that contract in
+    the option chain, so call_floor_broker_option()'s DTE / |delta| gates and its
+    risk_per_trade_usd // (premium * 100) sizing never run on model-supplied numbers. A schema-valid
+    pick can name a real, seen OCC symbol yet attach a fabricated low premium (-> oversized qty) or
+    an in-window delta -- only the observed row is trusted here. Also rejects a pick whose matched
+    row points the other way (a call-labelled pick on a seen put symbol), which
+    _structured_pick_rejection -- comparing only the model's self-reported right -- would let
+    through. Returns the reconciled pick (model rationale preserved), or None -> the deterministic
+    fallback runs -- when the matched row lacks a usable direction, delta, or quote. Assumes
+    _structured_pick_rejection has already passed, so a matching row exists."""
+    row = next((r for r in seen_rows if r.get("symbol") == pick.contract_symbol), None)
+    if row is None:  # defensive: _structured_pick_rejection should have guaranteed this
+        return None
+    if row.get("right") != right:
+        return None
+    delta, strike, expiration = row.get("delta"), row.get("strike"), row.get("expiration")
+    bid, ask = row.get("bid"), row.get("ask")
+    if delta is None or strike is None or not expiration or not bid or not ask or ask <= 0:
+        return None
+    mid = round((bid + ask) / 2, 2)
+    if mid <= 0:
+        return None
+    return pick.model_copy(
+        update={
+            "strike": float(strike),
+            "expiration": expiration,
+            "right": right,
+            "delta": abs(delta),
+            "premium": mid,
+        }
+    )
 
 
 def _route_after_llm_call(state: DealerState, cfg) -> str:

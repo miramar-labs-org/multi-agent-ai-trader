@@ -113,8 +113,10 @@ options_trading:
   dte_force_close: 3        # force-close regardless of P&L once DTE drops to/below this
   target_delta_min: 0.30
   target_delta_max: 0.60
-  min_open_interest: 100
-  min_volume: 10
+  min_open_interest: 100    # best-effort liquidity floors: enforced only for contracts where Alpaca's
+  min_volume: 10            # snapshot actually returns OI / volume (it usually omits both). A row
+                           # missing the field is NOT rejected -- a hard gate would block all options
+                           # trading. Also passed to the LLM selector via its prompt.
   options_slP: 0.50         # synthetic stop-loss, fraction of entry premium
   options_tpP: 1.75         # synthetic take-profit, fraction of entry premium
   max_notional_usd: 2000    # hard cap on a single option order's live-quoted notional (qty * mid-price * 100); re-quoted against the market at BUY time, not the LLM-claimed premium (20x strategy.risk_per_trade_usd's default of 100)
