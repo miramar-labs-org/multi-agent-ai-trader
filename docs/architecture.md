@@ -330,6 +330,14 @@ Dealer, bound to Alpaca's options tools via MCP:
   `OptionContractPick` (`src/dealer/schema.py`): `contract_symbol`, `strike`, `expiration`,
   `right`, `delta`, mid-price `premium`, and a per-contract `reasoning`. Any exception →
   `option_pick = None` → the entry is skipped cleanly.
+- The loop is **token-bounded** so a chatty tool result can't grow the prompt without limit
+  (this caused a silent DGX hard-hang on 2026-08-27 — see `docs/models.md`): raw chain JSON is
+  compacted to ≤40 delta-ranked rows before entering history (`src/dealer/option_chain.py`), the
+  loop stops requesting tools past ~12k estimated tokens, old tool-message bodies are neutralized
+  before any call that would exceed a 24k hard cap, and each Ollama call has a
+  `llm.request_timeout_s` ceiling with no retries. If structured output still fails,
+  `_fallback_pick` deterministically picks from the rows already seen (delta + DTE + quote gates)
+  instead of returning nothing.
 
 **`call_floor_broker_option`** re-validates the pick server-side before executing — it does not
 trust the LLM's copy of the constraints:
