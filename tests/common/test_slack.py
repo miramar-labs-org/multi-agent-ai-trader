@@ -118,6 +118,63 @@ def test_notify_floor_broker_result_uses_a_distinct_emoji_for_submitted(monkeypa
     assert "✅" not in text
 
 
+def test_asset_icon_infers_stock_for_an_unknown_base():
+    assert slack._asset_icon("ZZZZ", None) == "🏛️"
+
+
+def test_asset_icon_infers_crypto_from_a_usd_pair():
+    assert slack._asset_icon("BTC/USD", None) == "🪙"
+
+
+def test_asset_icon_uses_an_explicit_class_over_inference():
+    # symbol looks like an equity ticker, but the option path passes the underlying
+    assert slack._asset_icon("AAPL", "option") == "📜"
+
+
+def test_notify_dealer_signal_prefixes_the_stock_icon_for_an_equity_symbol(monkeypatch):
+    posted = {}
+    monkeypatch.setattr(slack, "_post", lambda text: posted.update(text=text))
+
+    slack.notify_dealer_signal("MGN", "BUY", "strong momentum")
+
+    assert "🏛️ MGN" in posted["text"]
+
+
+def test_notify_dealer_signal_prefixes_the_crypto_icon_for_a_usd_pair(monkeypatch):
+    posted = {}
+    monkeypatch.setattr(slack, "_post", lambda text: posted.update(text=text))
+
+    slack.notify_dealer_signal("BTC/USD", "BUY", "funding flipped positive")
+
+    assert "🪙 BTC/USD" in posted["text"]
+
+
+def test_notify_dealer_signal_uses_the_option_icon_when_asset_class_is_option(monkeypatch):
+    posted = {}
+    monkeypatch.setattr(slack, "_post", lambda text: posted.update(text=text))
+
+    slack.notify_dealer_signal("AAPL", "BUY", "buying the 30-delta call", asset_class="option")
+
+    assert "📜 AAPL" in posted["text"]
+    assert "🏛️" not in posted["text"]
+
+
+def test_notify_floor_broker_result_prefixes_the_asset_icon(monkeypatch):
+    posted = {}
+    monkeypatch.setattr(slack, "_post", lambda text: posted.update(text=text))
+
+    slack.notify_floor_broker_result("MGN", "BUY", "executed", "buy order filled: order-1")
+    assert "🏛️ MGN" in posted["text"]
+
+    slack.notify_floor_broker_result("BTC/USD", "SELL", "executed", "synthetic take_profit @ 68000")
+    assert "🪙 BTC/USD" in posted["text"]
+
+    slack.notify_floor_broker_result(
+        "AAPL", "BUY", "executed", "option buy order filled: order-2", asset_class="option"
+    )
+    assert "📜 AAPL" in posted["text"]
+
+
 def test_notify_buy_kill_switch_activated_mentions_buy_blocked_and_sell_allowed(monkeypatch):
     posted = {}
     monkeypatch.setattr(slack, "_post", lambda text: posted.update(text=text))

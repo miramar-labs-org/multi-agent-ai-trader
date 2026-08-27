@@ -484,7 +484,9 @@ def call_floor_broker_option(state: DealerState, cfg) -> DealerState:
     select_option_contract() maps a bearish SELL signal to buying a put (right = "call" if
     action == "BUY" else "put"), and that put purchase is exactly as much a new entry as a call
     purchase is -- it must not bypass macro blackout / symbol-stop cooldown / win-rate throttle."""
-    slack.notify_dealer_signal(state["symbol"], state["signal"]["action"], state["signal"]["reasoning"])
+    slack.notify_dealer_signal(
+        state["symbol"], state["signal"]["action"], state["signal"]["reasoning"], asset_class="option"
+    )
     db.record_dealer_decision(
         state["symbol"],
         state["signal"]["action"],
@@ -612,7 +614,10 @@ def call_floor_broker_option(state: DealerState, cfg) -> DealerState:
             graph_slack_and_record(state, action, result)
             return {**state, "execution_result": result}
         result = response.json()
-        slack.notify_floor_broker_result(state["symbol"], action, result["status"], result["detail"], reason=result.get("reason"))
+        slack.notify_floor_broker_result(
+            state["symbol"], action, result["status"], result["detail"],
+            asset_class="option", reason=result.get("reason"),
+        )
         db.record_floor_broker_event(state["symbol"], f"option_{result['status']}", result["detail"])
         return {**state, "execution_result": result}
     except requests.RequestException as exc:
@@ -623,7 +628,11 @@ def call_floor_broker_option(state: DealerState, cfg) -> DealerState:
 
 
 def graph_slack_and_record(state: DealerState, action: str, result: dict) -> None:
-    slack.notify_floor_broker_result(state["symbol"], action, result["status"], result["detail"], reason=result.get("reason"))
+    # Option-entry path only -- every call site is inside call_floor_broker_option().
+    slack.notify_floor_broker_result(
+        state["symbol"], action, result["status"], result["detail"],
+        asset_class="option", reason=result.get("reason"),
+    )
     db.record_floor_broker_event(state["symbol"], "skip" if result["status"] == "skipped" else result["status"], result["detail"])
 
 
