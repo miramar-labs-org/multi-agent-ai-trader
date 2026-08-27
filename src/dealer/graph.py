@@ -72,6 +72,8 @@ def llm_call(state: DealerState, cfg) -> DealerState:
         api_key="not-needed",
         model=cfg.llm.model,
         temperature=cfg.llm.temperature,
+        timeout=_llm_timeout(cfg),
+        max_retries=0,
     ).with_structured_output(Signal)
 
     system_prompt = (
@@ -418,6 +420,12 @@ def select_option_contract(state: DealerState, cfg) -> DealerState:
     return {**state, "option_pick": pick.model_dump() if pick else None}
 
 
+def _llm_timeout(cfg) -> float:
+    """Per-request wall-clock ceiling for every Ollama call. A hung generation fails fast
+    instead of stacking behind the Dealer's 10-minute poll cycle."""
+    return float(cfg.llm.get("request_timeout_s", 120))
+
+
 def _trim_history(messages: list, hard_cap: int) -> list:
     """Keep every message (no orphaned tool results) but blank the content of the oldest large
     ToolMessages until estimate_tokens(messages) <= hard_cap. No-op when already under."""
@@ -490,6 +498,8 @@ async def _select_option_contract_async(state: DealerState, cfg, signal: dict) -
         api_key="not-needed",
         model=cfg.llm.model,
         temperature=cfg.llm.temperature,
+        timeout=_llm_timeout(cfg),
+        max_retries=0,
     )
     agent_llm = llm.bind_tools(tools)
     right = "call" if signal["action"] == "BUY" else "put"

@@ -543,6 +543,39 @@ def test_select_option_contract_async_uses_fallback_when_structured_output_raise
     assert "fallback" in pick.reasoning.lower()
 
 
+def test_llm_call_sets_request_timeout_and_no_retries(monkeypatch):
+    captured = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def with_structured_output(self, schema):
+            class _S:
+                def invoke(self, m):
+                    return graph.Signal(
+                        symbol="AAPL", action="HOLD", reasoning="r", size_hint=0.0, confidence=0.5
+                    )
+
+            return _S()
+
+    monkeypatch.setattr(graph, "ChatOpenAI", FakeChatOpenAI)
+    monkeypatch.setattr(graph, "_symbol_memory_text", lambda *a, **k: "")
+    cfg = OmegaConf.create(
+        {"llm": {"base_url": "http://llm.test/v1", "model": "m", "temperature": 0.0, "request_timeout_s": 90}}
+    )
+
+    graph.llm_call({**_state("rsi: 71"), "symbol": "AAPL"}, cfg)
+
+    assert captured["timeout"] == 90.0
+    assert captured["max_retries"] == 0
+
+
+def test_llm_timeout_defaults_to_120_when_unset():
+    cfg = OmegaConf.create({"llm": {"base_url": "x", "model": "m", "temperature": 0.0}})
+    assert graph._llm_timeout(cfg) == 120.0
+
+
 def _option_cfg(**overrides):
     base = {
         "floor_broker": {"base_url": "http://floor-broker.test:8000"},
