@@ -190,6 +190,31 @@ The Ollama side of the switch (evict `nemotron-3-super`, preload
 `manage_ollama_model` path on the next power cycle, and manually at
 switch time.
 
+### Postmortem (2026-08-27): the switch stranded `nemotron-3-super` and OOM'd the box
+
+The config change alone did **not** free the old model. `power_scheduler`
+only ever stopped/started `cfg.llm.model` (the *new* name), so
+`nemotron-3-super` stayed pinned (`keep_alive: -1`, ~94GB) while the next
+power-up loaded `qwen3.6:35b-a3b` *on top of it*. GB10 unified memory hit
+zero -- `NVRM ... _memdescAllocInternal` out-of-memory fired 6x between 10:20
+and 10:41, Ollama hung, Aaron rebooted the DGX manually. Not a crash, not
+thermal (no panic / thermal trip / GPU reset in `journalctl -b -1`; 16h
+uptime).
+
+**Fix:** `_start_ollama_model` now calls `_evict_other_ollama_models(cfg)`
+first -- it `GET`s `/api/ps` and unloads (`keep_alive: 0`) every resident
+model whose name != `cfg.llm.model` before preloading the configured one.
+This makes every power-up self-healing after a model swap, matching the
+platform's "one pinned model at a time" convention
+(`dgx/ollama/deploy_ollama.sh`). A stale request is logged + Slack-notified,
+never raised.
+
+**Manual model-swap procedure** (between `config.yaml` merge and the next
+power cycle): `POST /api/generate {"model": "<old>", "keep_alive": 0}`,
+confirm `/api/ps` shows only the new model (or nothing), then
+`POST /api/generate {"model": "<new>", "keep_alive": -1}`. `power_scheduler`
+now enforces this each power-up regardless.
+
 ## Sources
 
 - [Atlas: Open-source inference engine for DGX Spark](https://forums.developer.nvidia.com/t/atlas-open-source-inference-engine-for-dgx-spark-2minute-cold-start-100-tok-s-on-qwen3-6-35b-fp8-13-supported-models/369263)

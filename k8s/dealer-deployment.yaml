@@ -25,7 +25,7 @@ spec:
           resources:
             requests:
               cpu: "100m"
-              memory: "256Mi"
+              memory: "512Mi"
             limits:
               cpu: "500m"
-              memory: "512Mi"
+              memory: "1Gi"  # Dealer forks the MCP-server subprocess (2nd Python) during _select_option_contract_async; 512Mi memcg-OOM-killed it 2026-08-27
