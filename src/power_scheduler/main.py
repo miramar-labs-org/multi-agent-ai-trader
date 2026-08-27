@@ -22,6 +22,7 @@ OPTIONS_FLAT_TIMEOUT_S = 60
 FLOOR_BROKER_READY_TIMEOUT_S = 60
 OLLAMA_STOP_TIMEOUT_S = 10
 OLLAMA_PRELOAD_TIMEOUT_S = 60
+OLLAMA_PS_TIMEOUT_S = 10
 
 
 def _now_eastern() -> datetime:
@@ -114,7 +115,46 @@ def _stop_ollama_model(cfg) -> None:
         slack.notify_error("POWER", f"failed to stop ollama model {cfg.llm.model}: {exc}")
 
 
+def _evict_other_ollama_models(cfg) -> None:
+    """Unload every model Ollama currently holds resident except cfg.llm.model.
+
+    The DGX runs one pinned LLM at a time (keep_alive=-1). When config.yaml's llm.model
+    is swapped, the previously pinned model stays loaded forever -- nothing else evicts
+    it -- and on the GB10's shared 128GB unified pool that stranded model can starve the
+    new one on preload (2026-08-27: nemotron-3-super left pinned, qwen preload drove
+    unified memory to NV_ERR_NO_MEMORY). Clearing the stragglers here makes every
+    power-up self-healing after a model swap.
+    """
+    try:
+        resp = requests.get(
+            f"{_ollama_native_url(cfg)}/api/ps",
+            timeout=OLLAMA_PS_TIMEOUT_S,
+        )
+        resp.raise_for_status()
+        loaded = [m.get("model") or m.get("name") for m in resp.json().get("models", [])]
+    except requests.RequestException as exc:
+        log(f"💥  failed to list loaded ollama models: {exc}")
+        slack.notify_error("POWER", f"failed to list loaded ollama models: {exc}")
+        return
+
+    for model in loaded:
+        if not model or model == cfg.llm.model:
+            continue
+        try:
+            resp = requests.post(
+                f"{_ollama_native_url(cfg)}/api/generate",
+                json={"model": model, "keep_alive": 0},
+                timeout=OLLAMA_STOP_TIMEOUT_S,
+            )
+            resp.raise_for_status()
+            log(f"🧠  evicted stale ollama model {model}")
+        except requests.RequestException as exc:
+            log(f"💥  failed to evict stale ollama model {model}: {exc}")
+            slack.notify_error("POWER", f"failed to evict stale ollama model {model}: {exc}")
+
+
 def _start_ollama_model(cfg) -> None:
+    _evict_other_ollama_models(cfg)
     try:
         resp = requests.post(
             f"{_ollama_native_url(cfg)}/api/generate",

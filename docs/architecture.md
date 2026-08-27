@@ -708,7 +708,14 @@ before `dealer` scales to 1, so Dealer's first poll never hits a cold model. Bot
 non-blocking: a failed stop/preload is logged and `slack.notify_error`'d but never aborts or
 delays power-down/power-up — this is a power-saving optimization, not a trading safety control,
 and Ollama auto-loads on first request regardless (just slower, ~10-30s for this model's ~23GB
-off NVMe) if a preload is missed. Analyst's earliest run (`55 8 * * *` `America/New_York`, i.e.
+off NVMe) if a preload is missed. `_start_ollama_model` first calls `_evict_other_ollama_models`:
+`GET /api/ps`, then `keep_alive: 0` on every resident model whose name != `llm.model`. This closes
+the model-swap gap — changing `config.yaml`'s `llm.model` alone never unloads the old name (nothing
+stops a model the scheduler is no longer configured for), so before this the previously pinned
+model stayed resident and a preload of the new one on top of it exhausted the GB10's shared 128GB
+unified pool (2026-08-27: `nemotron-3-super` left pinned at ~94GB, `NV_ERR_NO_MEMORY` ×6, manual
+reboot — see `docs/models.md`). Eviction failures are logged/Slack-notified, never raised. Analyst's
+earliest run (`55 8 * * *` `America/New_York`, i.e.
 08:55 ET) lands well after the power-up window opens (`open - minutes_before_open`, e.g. 08:30 ET
 for a 09:30 open) and power_scheduler's 15-minute tick, so the model is already warm by the time
 Analyst needs it.
@@ -996,7 +1003,7 @@ trade attribution without adding a separate trade-ledger table yet.
 | `power_schedule` | `minutes_before_open` | scale back to 1 replica this many minutes before the next trading day's official open (default 60) |
 | `power_schedule` | `flatten_crypto_before_powerdown` | when true (default), force-sells every open crypto position and verifies it's flat before scaling `floor-broker` down — crypto's stop-loss/take-profit is only enforced by that pod's own poll loop, so an open position would otherwise be unprotected while it's scaled to 0 |
 | `power_schedule` | `flatten_options_before_powerdown` | when true, `POST /flatten-options` and wait for flat before scaling `floor-broker` down. Default **false** — unlike crypto, options don't trade overnight and are already `dte_force_close`-bounded, so an unattended overnight hold is acceptable |
-| `power_schedule` | `manage_ollama_model` | when true (default), stops `llm.model` in Ollama (`keep_alive: 0`) right after `dealer` scales to 0, and preloads it (`keep_alive: -1`) right after `floor-broker` is confirmed ready on power-up, before `dealer` scales back to 1 — avoids leaving the GPU pinned in its max-power P0 state overnight; failures are logged/Slack-notified but never block power-down/power-up |
+| `power_schedule` | `manage_ollama_model` | when true (default), stops `llm.model` in Ollama (`keep_alive: 0`) right after `dealer` scales to 0, and preloads it (`keep_alive: -1`) right after `floor-broker` is confirmed ready on power-up, before `dealer` scales back to 1 — avoids leaving the GPU pinned in its max-power P0 state overnight; failures are logged/Slack-notified but never block power-down/power-up. The preload step first evicts any *other* resident model (`GET /api/ps` → `keep_alive: 0` on every name != `llm.model`), so a bare `config.yaml` model swap can't strand the old pinned model and OOM the unified-memory pool on the next preload |
 | `earnings_blackout` | `enabled` | feature gate for the earnings-date filter in `discover_candidates` (`src/analyst/graph.py`) — `true` as of 2026-08-05; when false, the stock screener list is unfiltered by earnings dates and Finnhub is never called; requires `FINNHUB_API_KEY` (verified working 2026-08-05) |
 | `earnings_blackout` | `days_before` | drop a screener candidate if it's reporting earnings within this many calendar days from today (default 2) — anticipation/IV-crush risk pre-report |
 | `earnings_blackout` | `days_after` | drop a screener candidate if it reported earnings within this many calendar days before today (default 1) — post-report gap risk, covers both BMO and AMC reporters without a week-long exclusion |

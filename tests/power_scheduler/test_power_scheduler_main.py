@@ -156,6 +156,7 @@ def test_start_ollama_model_posts_keep_alive_forever(monkeypatch):
         return FakeResponse()
 
     monkeypatch.setattr(main.requests, "post", _fake_post)
+    monkeypatch.setattr(main, "_evict_other_ollama_models", lambda cfg: None)
 
     main._start_ollama_model(_cfg())
 
@@ -181,12 +182,83 @@ def test_start_ollama_model_notifies_but_does_not_raise_on_request_failure(monke
         raise main.requests.RequestException("timed out")
 
     monkeypatch.setattr(main.requests, "post", _raise)
+    monkeypatch.setattr(main, "_evict_other_ollama_models", lambda cfg: None)
     errors = {}
     monkeypatch.setattr(main.slack, "notify_error", lambda component, text: errors.setdefault("text", text))
 
     main._start_ollama_model(_cfg())  # must not raise
 
     assert "text" in errors
+
+
+# --- _evict_other_ollama_models --------------------------------------------
+
+
+def test_evict_other_ollama_models_unloads_a_mismatched_loaded_model(monkeypatch):
+    posts = []
+
+    monkeypatch.setattr(
+        main.requests,
+        "get",
+        lambda url, timeout=None: FakeResponse(json_data={"models": [{"model": "nemotron-3-super:latest"}]}),
+    )
+
+    def _fake_post(url, json=None, timeout=None):
+        posts.append({"url": url, "json": json})
+        return FakeResponse()
+
+    monkeypatch.setattr(main.requests, "post", _fake_post)
+
+    main._evict_other_ollama_models(_cfg())
+
+    assert posts == [
+        {
+            "url": "http://ollama.test:11434/api/generate",
+            "json": {"model": "nemotron-3-super:latest", "keep_alive": 0},
+        }
+    ]
+
+
+def test_evict_other_ollama_models_is_a_noop_when_only_the_configured_model_is_loaded(monkeypatch):
+    posts = []
+    monkeypatch.setattr(
+        main.requests,
+        "get",
+        lambda url, timeout=None: FakeResponse(json_data={"models": [{"model": "qwen3.6:35b-a3b"}]}),
+    )
+    monkeypatch.setattr(main.requests, "post", lambda *a, **k: posts.append(1) or FakeResponse())
+
+    main._evict_other_ollama_models(_cfg())
+
+    assert posts == []
+
+
+def test_evict_other_ollama_models_notifies_but_does_not_raise_when_listing_fails(monkeypatch):
+    def _raise(*a, **k):
+        raise main.requests.RequestException("connection refused")
+
+    monkeypatch.setattr(main.requests, "get", _raise)
+    errors = {}
+    monkeypatch.setattr(main.slack, "notify_error", lambda component, text: errors.setdefault("text", text))
+
+    main._evict_other_ollama_models(_cfg())  # must not raise
+
+    assert "text" in errors
+
+
+def test_start_ollama_model_evicts_stale_models_before_preloading(monkeypatch):
+    order = []
+    monkeypatch.setattr(main, "_evict_other_ollama_models", lambda cfg: order.append("evict"))
+
+    def _fake_post(url, json=None, timeout=None):
+        order.append(("preload", json))
+        return FakeResponse()
+
+    monkeypatch.setattr(main.requests, "post", _fake_post)
+
+    main._start_ollama_model(_cfg())
+
+    assert order == ["evict", ("preload", {"model": "qwen3.6:35b-a3b", "keep_alive": -1})]
 
 
 # --- _power_down / _power_up orchestration ----------------------------------
