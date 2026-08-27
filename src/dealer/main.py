@@ -12,6 +12,7 @@ from src.common.config import load_config
 from src.common.logging import get_logger
 from src.common.portfolio_state import merge_held_positions, read_portfolio
 from src.dealer.graph import build_graph
+from src.dealer.mcp_options import reset_options_tools_cache
 
 log = get_logger("DEALER")
 
@@ -97,6 +98,7 @@ def main():
 
     while True:
         cfg = load_config()  # reloaded every poll cycle so a live config change never needs a restart
+        reset_options_tools_cache()  # MCP tool list is stable within a cycle; rebuild once per cycle
         refresh_symbol_bases_if_due()
         if market_is_open(cfg, log):
             try:
