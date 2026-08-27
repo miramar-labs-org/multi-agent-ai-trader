@@ -7,7 +7,7 @@
 [![YTD P/L](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/miramar-labs-org/multi-agent-ai-trader/main/badges/ytd-pl.json)](https://app.alpaca.markets/paper/dashboard/overview)
 [![Dealer LLM](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/miramar-labs-org/multi-agent-ai-trader/main/badges/model.json)](docs/models.md)
 
-Multi-agent AI trading system (Analyst, Dealer, Floor Broker) trading on Alpaca, powered by a locally-hosted LLM on the DGX via k3s
+Multi-agent AI trading system (Analyst, Dealer, Floor Broker) trading stocks, crypto, and options on Alpaca, powered by a locally-hosted LLM on the DGX via k3s
 
 Trades are paper-only — see the [Alpaca paper trading dashboard](https://app.alpaca.markets/paper/dashboard/overview) for live account state, positions, and order history.
 
@@ -15,8 +15,8 @@ Trades are paper-only — see the [Alpaca paper trading dashboard](https://app.a
 
 ## What this is
 
-Four independently-deployed Kubernetes workloads that together run a daily equities
-trading loop against Alpaca's **paper** trading account:
+Four independently-deployed Kubernetes workloads that together run a daily
+trading loop (stocks, crypto, and options) against Alpaca's **paper** trading accounts:
 
 - **Analyst** — a `CronJob` that runs once a day before market open, screens for candidate
   symbols, decides a tradeable watchlist for the day, and posts a Morning Report to Slack.
@@ -27,7 +27,14 @@ trading loop against Alpaca's **paper** trading account:
   BUY, HOLD, or SELL.
 - **Floor Broker** — a `Deployment` + `Service` that is the only component that actually
   places orders. It never calls an LLM — it takes a BUY/SELL decision and executes it as a
-  bracket order (stocks) or notional market order (crypto) on Alpaca.
+  bracket order (stocks), a notional market order (crypto), or a single-leg option market
+  order (options, when `options_trading.enabled` — see below) on Alpaca.
+
+When `options_trading.enabled` is on, every stock Dealer signal is instead expressed as a long
+option (call for BUY, put for SELL) — the Dealer picks a concrete contract via an MCP
+tool-calling loop against Alpaca's options data and Floor Broker submits it on a **second paper
+account** (`alpaca.account2`). Crypto is unaffected. See
+[docs/architecture.md](docs/architecture.md#options-trading--mcp-backed-contract-selection).
 - **EOD Report** — a `CronJob` that runs once a day after market close, and posts an account
   balance + trade summary to Slack. It makes no trading decisions — pure reporting.
 
@@ -54,6 +61,7 @@ accounts/API keys, put them in one k8s Secret, then run the two GHA deploy workf
 | Key | Where to get it | Required? |
 |---|---|---|
 | `ALPACA_PAPER_API_KEY` / `ALPACA_PAPER_API_SECRET` | [Alpaca](https://alpaca.markets/) — generate a **paper trading** key pair from the dashboard | Required — every component needs this |
+| `ALPACA_PAPER_API_KEY2` / `ALPACA_PAPER_API_SECRET2` | [Alpaca](https://alpaca.markets/) — a second paper key pair, used for options orders (`alpaca.account2`) | Required — set to the same values as `ALPACA_PAPER_API_KEY`/`_SECRET` if you only have one funded paper account (the current default) |
 | `TAAPI_API_KEY` | [TAAPI.io](https://taapi.io/) — free plan works (1 request/15s, see `config.yaml`'s `taapi.min_request_interval_secs`) | Required — Dealer's technical indicators |
 | `LANGCHAIN_API_KEY` | [smith.langchain.com](https://smith.langchain.com/) | Optional — only if `config.yaml`'s `langsmith.enabled: true` |
 | `SLACK_WEBHOOK_URL2` | An [incoming webhook](https://api.slack.com/messaging/webhooks) for whatever channel you want notifications in | Optional — only if `config.yaml`'s `slack.enabled: true` |
@@ -82,6 +90,8 @@ kubectl create secret generic mlabs-api-keys -n multi-agent-ai-trader \
   --from-literal=TAAPI_API_KEY=... \
   --from-literal=ALPACA_PAPER_API_KEY=... \
   --from-literal=ALPACA_PAPER_API_SECRET=... \
+  --from-literal=ALPACA_PAPER_API_KEY2=... \
+  --from-literal=ALPACA_PAPER_API_SECRET2=... \
   --from-literal=LANGCHAIN_API_KEY=... \
   --from-literal=SLACK_WEBHOOK_URL2=...
 ```
@@ -95,8 +105,10 @@ At minimum, set `llm.base_url` to your DGX's Ollama endpoint. Also worth checkin
 `trading.market_override` (forces "market open" for testing outside trading hours),
 `trading.stocks.enabled`/`trading.crypto.enabled` (independently gate equities/crypto for both
 Analyst's daily candidate screening and Dealer's poll loop — crypto also merges pre-existing
-positions into the watchlist), `analyst.default_budget`/`max_universe_size`, and the
-`slack`/`langsmith` `enabled` flags.
+positions into the watchlist), `options_trading.enabled` (route every stock signal through MCP
+option-contract selection instead of an equity bracket order — see
+[docs/architecture.md](docs/architecture.md#options-trading--mcp-backed-contract-selection)),
+`analyst.default_budget`/`max_universe_size`, and the `slack`/`langsmith` `enabled` flags.
 
 ### 5. Deploy
 
@@ -141,10 +153,14 @@ context, and parse the response into a strict structured-output schema (via Lang
   if crypto is enabled, post a crypto-only EOD report to Slack. News, indicators, track record,
   and the P&L snapshot are each individually feature-gated (`analyst.news.enabled`/
   `indicators.enabled`/`track_record.enabled`/`position_pnl.enabled`).
-- **Dealer** (3 nodes, per symbol per poll): fetch technical indicators → LLM decides
-  BUY/HOLD/SELL with recent same-symbol history in the prompt when enabled → apply local BUY
-  gates (macro blackout, same-symbol stop cooldown, win-rate throttle, confidence, budget) → if
-  not HOLD and not locally skipped, dispatch to Floor Broker over HTTP.
+- **Dealer** (7 nodes, per symbol per poll): fetch technical indicators → fetch recent OHLCV →
+  LLM decides BUY/HOLD/SELL with recent same-symbol history in the prompt when enabled → apply
+  local BUY gates (macro blackout, same-symbol stop cooldown, win-rate throttle, confidence,
+  budget) → if not HOLD and not locally skipped, dispatch to Floor Broker over HTTP. When
+  `options_trading.enabled` and the symbol is a stock, the signal instead flows through
+  `select_option_contract` (an MCP tool-calling loop against Alpaca's options data that picks a
+  concrete call/put contract) → `call_floor_broker_option` (re-validates DTE/delta/risk, sizes
+  by `strategy.risk_per_trade_usd`, POSTs `/execute-option`).
 
 ```mermaid
 flowchart TD
@@ -162,14 +178,19 @@ flowchart TD
 
     subgraph Dealer["Dealer — every 10 min while market is open, per symbol"]
         direction TB
-        D1[fetch_indicators] --> D2[llm_call]
-        D2 --> D3{call_floor_broker}
-        D3 -->|HOLD| D4[skipped — no order]
-        D3 -->|BUY / SELL| D5[POST /execute]
+        D1[fetch_indicators] --> D1b[fetch_market_data]
+        D1b --> D2[llm_call]
+        D2 --> D3{stock + options_trading.enabled?}
+        D3 -->|no| D6{call_floor_broker}
+        D6 -->|HOLD| D4[skipped — no order]
+        D6 -->|BUY / SELL| D5[POST /execute]
+        D3 -->|yes| D7[select_option_contract] --> D8[call_floor_broker_option]
+        D8 --> D9[POST /execute-option]
     end
 
     A8 -.->|portfolio ConfigMap| D1
     D5 -.->|HTTP| FB[[Floor Broker]]
+    D9 -.->|HTTP| FB
 
     classDef gated stroke-dasharray: 4 3
     class A2,A3,A4,A5,A9 gated
@@ -185,19 +206,23 @@ decision), so no external LLM API key is required for trading decisions themselv
 Floor Broker has no LLM decision logic of its own — by the time it receives a request, the
 BUY/SELL call has already been made; it only handles order placement and deterministic safety
 checks: no duplicate/open-order conflicts, daily P/L halt, max concurrent positions, risk-based
-sizing, bid/ask spread gating for stock BUYs, and Alpaca's order-conflict retry cases.
+sizing, bid/ask spread gating for stock BUYs, and Alpaca's order-conflict retry cases. Option
+orders re-quote the live ask and enforce `options_trading.max_notional_usd`; since Alpaca has no
+server-side option brackets, open contracts are protected by a synthetic stop-loss / take-profit
+/ DTE-force-close poll loop (`check_option_stops()`) instead.
 
 ## External APIs used
 
 | API | Used by | Purpose |
 |---|---|---|
-| [Alpaca Trading API](https://docs.alpaca.markets/) | Floor Broker | The only component that places/cancels orders — bracket orders for stocks, notional market orders for crypto. Paper account only, hardcoded (not a config toggle). |
+| [Alpaca Trading API](https://docs.alpaca.markets/) | Floor Broker | The only component that places/cancels orders — bracket orders for stocks, notional market orders for crypto, single-leg option market orders for options. Paper accounts only; which paper key pair `account1` (stocks/crypto) and `account2` (options) each use is set in `config.yaml`'s `alpaca:` section (`src/common/alpaca_client.py`), switchable at runtime. |
+| [Alpaca Options Data API](https://docs.alpaca.markets/) | Dealer | `select_option_contract`'s MCP tool-calling loop (`alpaca-mcp-server` via `langchain-mcp-adapters`, read-only `assets,options-data,account` toolsets) — the option chain, greeks, and quotes the Dealer LLM uses to pick a contract. Runs on `account2`. |
 | [Alpaca Market Data / Screener / News API](https://docs.alpaca.markets/) | Analyst, Dealer | Screener `most-actives`/`movers` endpoints and News API for Analyst's daily candidate research; live bid/ask quotes for Floor Broker's order sizing. |
 | [TAAPI.io](https://taapi.io/) | Analyst, Dealer | Technical indicators (RSI, MACD, VWAP, Bollinger Bands, SMA, EMA) — Analyst for its top candidates by move size (`fetch_indicators`, capped by `analyst.indicator_fetch_limit`), Dealer for every watchlist symbol each poll. A third-party service, unrelated to any Miramar platform component. |
 | Yahoo Finance RSS | Analyst | Supplementary headline research alongside Alpaca's News API. |
 | [LangSmith](https://www.langchain.com/langsmith) | Analyst, Dealer | Tracing for both LangGraph agent runs (optional, `config.yaml`'s `langsmith.enabled`). This is the tracing layer actually in use — not MLflow, despite MLflow appearing in the platform endpoint table below. |
 | [Slack](https://api.slack.com/messaging/webhooks) | Analyst, Dealer, Floor Broker, EOD Report | Incoming-webhook notifications for interesting events (morning report, BUY/SELL/HOLD signals, executions, EOD summary, errors) to `#miramar-trading-floor` — optional, `config.yaml`'s `slack.enabled`. |
-| OpenAI-compatible LLM endpoint (Ollama on DGX) | Analyst, Dealer | Both agents' BUY/HOLD/SELL and symbol-selection decisions, served locally via Ollama (`config.yaml`'s `llm.base_url`/`llm.model`) — see `docs/models.md` for the Ollama-vs-vLLM decision. |
+| OpenAI-compatible LLM endpoint (Ollama on DGX) | Analyst, Dealer | Both agents' BUY/HOLD/SELL and symbol-selection decisions, plus the Dealer's MCP option-contract selection (a tool-calling agent loop over the same model, ≤6 rounds), served locally via Ollama (`config.yaml`'s `llm.base_url`/`llm.model`) — see `docs/models.md` for the Ollama-vs-vLLM decision. |
 
 ## Quick links
 

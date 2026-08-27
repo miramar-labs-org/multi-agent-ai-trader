@@ -41,6 +41,7 @@ All trading remains **paper-only**. SELL operations that reduce exposure should 
 | P1.9 | Core operational metrics | P1 | Planned | P1.1 |
 | P1.14 | Multi-modal Dealer: OHLCV enrichment + AGX-Orin Visual Analyst (shadow) | P1 | Planned (full plan drafted, approved, not started; see below) | P1.1 |
 | P1.15 | Analyst candidate-mix: fixed large-cap/crypto/screener pool ratio | P1 | Done | — |
+| P1.16 | Options trading via MCP contract selection | P1 | Done | P1.1 |
 | P2.1 | Full Prometheus and Grafana observability | P2 | Planned | P1.9 |
 | P2.2 | Automatic circuit breakers | P2 | Planned | P1.8, P1.9 |
 | P2.3 | Distributed execution coordination | P2 | Planned | Future scaling need |
@@ -1086,6 +1087,83 @@ each earnings-blackout-filtered and indicator-backed). The pipeline was confirme
 Analyst mix pick → Dealer BUY decision → Floor Broker bracket order → fill — on NVDA (13 shares @
 \$223.98, bracket order `880e66c2-f430-41f8-93c4-dbc15dd9f05a`). See `docs/analysis.md`'s
 `2026-08-12 13:35 ET` entry for the full narrative.
+
+---
+
+## P1.16 — Options trading via MCP contract selection
+
+**Done.** A new instrument path at the **Dealer** layer (the Analyst is unchanged — it still
+screens and picks the same stock/crypto universe). When `options_trading.enabled` (`config.yaml`,
+currently `true`), every **stock** Dealer signal is expressed as a long option instead of an
+equity bracket order; crypto is untouched.
+
+**Direction.** `right = "call" if signal["action"] == "BUY" else "put"` — a bearish SELL becomes
+a long put. There is no short-premium / naked path anywhere; put entries are additionally gated
+the same way call entries are.
+
+**Contract selection.** New `select_option_contract` node (`src/dealer/graph.py`) runs
+`_select_option_contract_async()`, a LangChain tool-calling loop (`_MAX_TOOL_CALL_ROUNDS = 6`)
+over the same `cfg.llm` model with Alpaca's options data bound as MCP tools via
+`langchain-mcp-adapters` + `alpaca-mcp-server` (`src/dealer/mcp_options.py`,
+`ALPACA_TOOLSETS=assets,options-data,account`, all read-only, run against **account 2**). The
+prompt carries the `dte_min`–`dte_max`, `target_delta_min`–`target_delta_max`, and
+`min_open_interest`/`min_volume` windows; output schema `OptionContractPick`
+(`src/dealer/schema.py`). HOLD or sub-`strategy.min_confidence` signals produce no pick.
+
+**Re-validation + sizing + execution.** `call_floor_broker_option` re-runs the macro-blackout /
+symbol-stop-cooldown / win-rate-throttle gates, re-checks the picked contract's DTE and
+`abs(delta)` are still in-window, requires `strategy.risk_per_trade_usd` to be set, sizes
+`qty = int(risk_per_trade_usd // (premium * 100))` (skip reasons `dte_out_of_range`,
+`delta_out_of_range`, `risk_per_trade_usd_not_configured`, `qty_zero`), then
+`POST /execute-option` → `execution.buy_option()` on `trading_client2`. `buy_option()` re-quotes
+the live ask, rejects with `reason="notional_cap_exceeded"` if
+`qty * live_ask * 100 > options_trading.max_notional_usd` (outer ceiling
+`MAX_OPTION_NOTIONAL = $100k`), and submits a single-leg `MarketOrderRequest` (`TimeInForce.DAY`),
+returning `status="submitted"`.
+
+**Fill tracking + protection.** `_option_positions` and the `options_trades` DB row are written
+only on a confirmed fill, observed by a dedicated `poll_pending_option_fills()` thread (Floor
+Broker now runs seven daemon threads). Alpaca has no server-side option brackets, so
+`check_option_stops()` — run inside `poll_bracket_fills()` and **unconditionally regardless of
+`options_trading.enabled`**, so already-open contracts stay protected after the flag is flipped
+off — force-closes via `sell_option()` on `dte <= options_trading.dte_force_close` (checked
+first, regardless of P&L), `mid <= entry_premium * options_slP`, or
+`mid >= entry_premium * options_tpP`. `/flatten-options` → `flatten_all_options()` is wired into
+the power scheduler behind `power_schedule.flatten_options_before_powerdown` (default false).
+
+**Account split.** `src/common/alpaca_client.py` now exposes `account1` (stocks/crypto) and
+`account2` (options); `config.yaml`'s `alpaca.account1`/`account2` `key_env`/`secret_env` name
+which secret env var each reads, re-resolved on the normal 60 s config refresh. Today both point
+at `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET` (one funded paper account);
+`ALPACA_PAPER_API_KEY2`/`ALPACA_PAPER_API_SECRET2` are pre-wired as the switch target and are now
+required entries in the `mlabs-api-keys` secret.
+
+**Persistence.** New `options_trades` table (`src/common/db.py`), one row per option position:
+`record_options_trade_opened()` on the confirmed BUY fill, `record_options_trade_updated()` /
+`record_options_trade_closed()` on exit (`closed_at`/`exit_reason`/`exit_premium`). Schema is now
+six tables.
+
+New config: `options_trading` block (`enabled`, `dte_min`/`dte_max`, `dte_force_close`,
+`target_delta_min`/`target_delta_max`, `min_open_interest`/`min_volume`, `options_slP`/
+`options_tpP`, `max_notional_usd`); `strategy.risk_per_trade_usd` doubles as the per-option
+budget; `power_schedule.flatten_options_before_powerdown`. New dependencies: `alpaca-mcp-server`,
+`langchain-mcp-adapters`.
+
+Commits: `d74ec6f`/`a97775a` (design spec + implementation plan), `9dccab2` (config block),
+`83bbeed` (account-2 client), `379531a` (deps), `a3cdf1e` (`options_trades` table), `6c725c3`
+(`OptionContractPick` schema), plus the `mcp_options.py` / `graph.py` / `execution.py` /
+`buy_option`/`sell_option` work and a long review-driven fix chain (`86e9ef4`, `fb8dc7c`,
+`c316fc9`, `3c1ca1a`, `59188b2`, `996c5cb`, `a528def`, `3e521a4`, `7e94220`), merged via PR #1
+(`d080e74`) and PR #2 (`df9d10e`). Config-driven credentials: `8009fbe`, `c22c983`. Enabled
+live: `44d87e9`. Tests: `tests/dealer/test_mcp_options.py`, `tests/dealer/test_dealer_graph.py`,
+`tests/dealer/test_schema.py`, `tests/floor_broker/test_execution.py` /
+`test_app.py` / `test_floor_broker_main.py`, `tests/common/test_db.py`,
+`tests/power_scheduler/test_power_scheduler_main.py`.
+
+**Known gaps (not blockers).** The EOD Report (`src/common/eod.py`) and README P/L badges
+(`src/pl_badges/`) read account 1 only, so option P&L on account 2 isn't yet reflected there. The
+backtesting harness has no options support. Options are buy-only single legs — no spreads, no
+premium selling.
 
 ---
 

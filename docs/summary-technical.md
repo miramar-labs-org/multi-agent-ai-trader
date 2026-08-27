@@ -116,10 +116,17 @@ while True:
     sleep(cfg.trading.pollsecs)              # 600s
 ```
 
-`src/dealer/graph.py` is a 3-node graph: `fetch_indicators` (TAAPI `/bulk`, one request per
-symbol per cycle) → `llm_call` (same `ChatOpenAI(...).with_structured_output()` pattern as
-Analyst, output schema `Signal = {symbol, action: BUY|HOLD|SELL, reasoning, size_hint}` in
-`src/dealer/schema.py`) → `call_floor_broker`, which is a plain synchronous HTTP POST:
+`src/dealer/graph.py` is a 7-node graph: `fetch_indicators` (TAAPI `/bulk`, one request per
+symbol per cycle; a missing-indicator result routes to `skip_missing_indicators` and ends the
+cycle) → `fetch_market_data` (multi-timeframe Alpaca candles + derived features, stock-only) →
+`llm_call` (same `ChatOpenAI(...).with_structured_output()` pattern as Analyst, output schema
+`Signal = {symbol, action: BUY|HOLD|SELL, reasoning, size_hint}` in `src/dealer/schema.py`).
+After `llm_call` the graph branches: for crypto, or when `options_trading.enabled` is off, it
+goes to `call_floor_broker` (a plain synchronous HTTP POST); for a stock when
+`options_trading.enabled` is on, it goes to `select_option_contract` → `call_floor_broker_option`
+(see "Options trading" below).
+
+`call_floor_broker` is:
 
 ```python
 requests.post(f"{cfg.floor_broker.base_url}/execute", json={
@@ -147,6 +154,26 @@ BUY signals are now gated locally in this order before the HTTP call:
 `llm_call()` also includes a compact "Recent same-symbol trading history" block when
 `strategy.dealer_memory.enabled` is true. It is advisory prompt context only: DB read failures
 log a warning and fail open, while the deterministic cooldown above is the hard re-entry guard.
+
+### Options trading (`options_trading.enabled`)
+
+When on, a **stock** signal never reaches `call_floor_broker`; it goes through two extra nodes
+instead (crypto is unaffected):
+
+- `select_option_contract` — `_select_option_contract_async()` runs a LangChain tool-calling
+  loop (`_MAX_TOOL_CALL_ROUNDS = 6`) over the same `cfg.llm` model, with Alpaca's options data
+  bound as MCP tools via `langchain-mcp-adapters` + `alpaca-mcp-server` (`ALPACA_TOOLSETS=
+  assets,options-data,account`, all read-only, run against **account 2**). `right = "call" if
+  action == "BUY" else "put"` — a bearish SELL becomes a long put, never a short. The prompt
+  carries the `dte_min`–`dte_max`, `target_delta_min`–`target_delta_max`, and
+  `min_open_interest`/`min_volume` windows. Output schema `OptionContractPick`. HOLD or
+  sub-`min_confidence` signals produce no pick.
+- `call_floor_broker_option` — re-runs the same macro-blackout / symbol-stop-cooldown /
+  win-rate-throttle gates, re-validates the picked contract's DTE and `abs(delta)` are still
+  in-window, requires `strategy.risk_per_trade_usd` to be set, sizes
+  `qty = int(risk_per_trade_usd // (premium * 100))` (skips on `qty == 0`), then
+  `POST {floor_broker.base_url}/execute-option`. Records a `dealer_decisions` row and a Slack
+  notice on the underlying, plus an `option_<status>` `floor_broker_events` row.
 
 ## Floor Broker — the only order-placement path
 
@@ -207,6 +234,24 @@ the profit target or breaches the loss limit, the BUY is skipped
 (`reason="daily_profit_target_reached"`/`"daily_loss_limit_reached"`); `sell()` is unaffected.
 No dedicated poller — the normal per-BUY Slack notice already reports the skip reason.
 
+**Options (`/execute-option` → `buy_option()`/`sell_option()`, account 2).** `app.py`'s
+`/execute-option` handler calls `execution.buy_option(...)` against `trading_client2`. It runs
+the same `_buy_preflight_skip` / `_max_concurrent_positions_skip` checks (client=`trading_client2`),
+re-quotes the live option ask, rejects with `reason="notional_cap_exceeded"` if
+`qty * live_ask * 100 > cfg.options_trading.max_notional_usd` (and an outer hard ceiling
+`MAX_OPTION_NOTIONAL = $100k`), and submits a single-leg `MarketOrderRequest`
+(`TimeInForce.DAY`), returning `status="submitted"`. The `_option_positions` dict and the
+`options_trades` DB row are written only on the confirmed fill, observed by a dedicated
+`poll_pending_option_fills()` thread (the account-2 mirror of `poll_pending_fills()`).
+`check_option_stops()` — run inside `poll_bracket_fills()` like the crypto check, and
+*unconditionally* regardless of `options_trading.enabled` — force-closes via `sell_option()` on
+`dte <= dte_force_close` (checked first), `mid <= entry_premium * options_slP`, or
+`mid >= entry_premium * options_tpP`. `/flatten-options` (used by the power scheduler when
+`power_schedule.flatten_options_before_powerdown`, default false) calls `flatten_all_options()`.
+Floor Broker runs **seven** daemon threads, not the two named above:
+`poll_pending_option_fills()`, `poll_eod_flatten()`, `poll_symbol_bases()`, `poll_kill_switch()`,
+and `poll_reconciliation()` are the others.
+
 **Crypto synthetic stop-loss/take-profit (`strategy.crypto_slP`/`crypto_tpP`).** Alpaca's
 bracket orders are equity-only, so crypto has no server-side SL/TP. `check_pending_fills()`
 computes `sl_price`/`tp_price` off the real fill price on a crypto BUY fill and stores them in a
@@ -247,14 +292,21 @@ official market close and sends exactly once when close+30min has passed, so nor
 report at 16:30 ET and 13:00 early closes report at 13:30 ET. Closed days post a "market was
 closed" notice rather than silently doing nothing. No dependency on the `portfolio` ConfigMap or
 on Dealer/Floor Broker — it reads Alpaca's account/positions/fills directly and formats a Slack
-summary via `src/common/eod.py`'s `fetch_fills()`/`summarize_positions()`.
+summary via `src/common/eod.py`'s `fetch_fills()`/`summarize_positions()`. `eod.py` imports only
+`trading_client` (account 1), so option P&L on account 2 is not yet included in the recap or the
+README P/L badges (`src/pl_badges/`) — an open gap now that options trading is live.
 
 ## Shared code (`src/common/`)
 
 - `config.py` — `load_config(path="config.yaml")` returns `OmegaConf.load(path)`, an
   `OmegaConf` `DictConfig`, not a custom class. One schema, imported by every service.
-- `alpaca_client.py` — one shared `TradingClient(..., paper=True)` (hardcoded, no code path to
-  live trading), credentials from `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET`.
+- `alpaca_client.py` — lazily-built `TradingClient(..., paper=True)` clients (hardcoded
+  `paper=True`, no code path to live trading). Two logical accounts: `account1`
+  (`trading_client`, stocks/crypto) and `account2` (`trading_client2`/`option_data_client2`,
+  options). `config.yaml`'s `alpaca.account1`/`account2` `key_env`/`secret_env` name which secret
+  env var each account reads, re-resolved on the normal 60 s config refresh — today both point at
+  `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET`, with `..._KEY2`/`..._SECRET2` pre-wired as
+  the switch target for a future second funded account.
 - `portfolio_state.py` — the `portfolio` ConfigMap I/O (above), plus `merge_held_positions()`,
   which folds any pre-existing Alpaca position not already in the watchlist into it on every
   Dealer poll, tagged `budget=0.0, is_held_only=True` so a large held position can't silently
@@ -268,7 +320,10 @@ summary via `src/common/eod.py`'s `fetch_fills()`/`summarize_positions()`.
   execution events, added in v0.6.0 (a schema bug meant no rows actually landed until the
   v0.6.1 fix). Fire-and-forget writes (catch and log, never raise) via `psycopg[binary,pool]`,
   no ORM, no migrations — `CREATE TABLE IF NOT EXISTS` run lazily on first use. Backs the
-  `/analyst-explain` skill. See [architecture.md](architecture.md#persistence) for the schema.
+  `/analyst-explain` skill. Now six tables — the options path added `options_trades` (one row per
+  option position, inserted on the confirmed BUY fill via `record_options_trade_opened()`, closed
+  in place with `closed_at`/`exit_reason`/`exit_premium`). See
+  [architecture.md](architecture.md#persistence) for the schema.
 - `langsmith.py` — `configure(cfg)` wires LangGraph/LangChain tracing, gated by
   `cfg.langsmith.enabled` and capped by `cfg.langsmith.sampling_rate` to stay under LangSmith's
   free-tier 5k-traces/month quota.

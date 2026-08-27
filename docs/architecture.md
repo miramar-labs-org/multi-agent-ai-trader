@@ -1,7 +1,8 @@
 # Architecture
 
 `multi-agent-ai-trader` is a three-agent trading floor — **Analyst**, **Dealer**, **Floor
-Broker** — that trades US equities (paper account) on Alpaca, deployed as independent
+Broker** — that trades US equities, crypto, and (when `options_trading.enabled`) single-leg
+options on Alpaca paper accounts, deployed as independent
 Kubernetes workloads on the DGX Spark k3s cluster. It is a re-platforming of an earlier
 single-process script (`gpt-trader.py`) onto three independently-scaled k8s workloads that
 communicate via a shared ConfigMap and plain HTTP, rather than a monolithic loop.
@@ -25,9 +26,11 @@ communicate via a shared ConfigMap and plain HTTP, rather than a monolithic loop
                          ┌─────────────────────────┐
         every 600s  ───► │          Dealer          │  (long-running Deployment)
         while market     │ indicators + bars → LLM  │
-        is open          └────────────┬─────────────┘
-                                      │ HTTP POST /execute
-                                      │ (if action != HOLD)
+        is open          │ (+ MCP option pick when  │
+                         │  options_trading on)     │
+                         └────────────┬─────────────┘
+                                      │ HTTP POST /execute or
+                                      │ /execute-option (if action != HOLD)
                                       ▼
                          ┌─────────────────────────┐
                          │       Floor Broker        │  (Deployment + Service)
@@ -35,7 +38,7 @@ communicate via a shared ConfigMap and plain HTTP, rather than a monolithic loop
                          └────────────┬─────────────┘
                                       │
                                       ▼
-                              Alpaca paper account
+                        Alpaca paper accounts (1: stocks/crypto, 2: options)
 ```
 
 Analyst and Floor Broker never talk to each other directly. There is no message queue and
@@ -228,14 +231,17 @@ every 600s poll while the market stays closed for hours. This is distinct from E
 own live status signal, so a genuinely closed market and a stuck/crashed Dealer pod are
 distinguishable from Slack alone.
 
-**Graph** (`src/dealer/graph.py`), a 4-node state machine over `DealerState`:
+**Graph** (`src/dealer/graph.py`), a 7-node state machine over `DealerState`:
 
 | Node | What it does |
 |---|---|
 | `fetch_indicators` | fetches every indicator configured for the symbol (or all of `cfg.indicators` if the entry says `["ALL"]`) from **TAAPI.io** — a third-party technical-analysis API, unrelated to any Miramar platform service — in a single `/bulk` POST request (`indicators.py`), and builds a natural-language indicator text block |
+| `skip_missing_indicators` | terminal fallback when `fetch_indicators` comes back empty (TAAPI 200 with no data — typically too few historical bars for a thinly-traded pair): records a `HOLD` decision and skips the cycle rather than sending an empty indicator block to the LLM (which otherwise improvises a "please provide indicators" HOLD) |
 | `fetch_market_data` | gated by `ohlcv_enrichment.enabled` — for stock entries only (`exchange == "stocks"`), fetches Alpaca OHLCV bars at the configured timeframes (`5m`, `1h`, `1d` by default) via `src.common.bars.fetch_multi_timeframe_bars`, computes derived market-structure features (`src.dealer.features`), and formats a compact prompt block. Crypto entries skip this node cleanly and keep the indicator-only path |
 | `llm_call` | the decision LLM call — see below. It receives TAAPI indicators first, optional OHLCV-derived context second, and, when `strategy.dealer_memory.enabled` is true, recent same-symbol Dealer decisions and Floor Broker events from Postgres as the final prompt context |
-| `call_floor_broker` | HTTP POST to Floor Broker if action != HOLD; a BUY is additionally refused locally (never forwarded) by macro blackout, same-symbol stop cooldown, win-rate throttle, confidence, or authorized-budget gates — see [Risk controls](#risk-controls-and-failure-handling) |
+| `select_option_contract` | **only reached when `options_trading.enabled` and `exchange == "stocks"`** — an MCP-backed tool-calling agent that turns the underlying signal into one option contract. See [Options trading](#options-trading--mcp-backed-contract-selection) below |
+| `call_floor_broker` | HTTP `POST /execute` to Floor Broker if action != HOLD; a BUY is additionally refused locally (never forwarded) by macro blackout, same-symbol stop cooldown, win-rate throttle, confidence, or authorized-budget gates — see [Risk controls](#risk-controls-and-failure-handling). Reached for crypto always, and for stocks only when options trading is off |
+| `call_floor_broker_option` | HTTP `POST /execute-option` to Floor Broker with the selected contract. Applies the same macro-blackout / symbol-stop-cooldown / win-rate-throttle / budget gates as `call_floor_broker`, plus a re-validation of the LLM's pick against the config DTE and delta windows, then sizes the order (`risk_per_trade_usd // (premium * 100)` contracts) |
 
 ```mermaid
 flowchart TD
@@ -243,9 +249,13 @@ flowchart TD
     B -- no --> E[skip_missing_indicators]
     B -- yes --> C[fetch_market_data]
     C --> D[llm_call]
-    D --> F[call_floor_broker]
+    D --> H{stocks + options_trading.enabled?}
+    H -- no --> F[call_floor_broker]
+    H -- yes --> I[select_option_contract]
+    I --> J[call_floor_broker_option]
     E --> G([END])
     F --> G
+    J --> G
 ```
 
 **LLM call:** same pattern as Analyst — `ChatOpenAI(base_url=cfg.llm.base_url, ...).with_structured_output(Signal)`.
@@ -296,6 +306,51 @@ the actual fill price and TP/SL levels, not just the request Dealer sent. The er
 request-exception branches are unchanged — they call `notify_floor_broker_result` with only the
 original 4 positional arguments, so those optional fields simply render as absent.
 
+### Options trading — MCP-backed contract selection
+
+Gated by `options_trading.enabled` (`config.yaml`, currently **on**). When enabled, the Dealer's
+graph routes **every stock signal** — not crypto — through `select_option_contract` →
+`call_floor_broker_option` instead of `call_floor_broker`; the plain equity bracket-order path is
+only used for stocks when this flag is off. The Dealer's own `Signal` LLM call is unchanged: it
+still decides BUY/SELL/HOLD on the *underlying*, and that direction maps to
+`right = "call" if action == "BUY" else "put"` (a bearish SELL becomes a long put, never a short
+position). `HOLD`, or confidence below `strategy.min_confidence`, produces no contract.
+
+**Contract selector** (`_select_option_contract_async`, `src/dealer/graph.py`) — a LangChain
+tool-calling loop (≤ `_MAX_TOOL_CALL_ROUNDS` = 6 rounds) using the same `cfg.llm` model as the
+Dealer, bound to Alpaca's options tools via MCP:
+
+- `src/dealer/mcp_options.py` launches the `alpaca-mcp-server` package (`langchain-mcp-adapters`)
+  with `ALPACA_TOOLSETS=assets,options-data,account` — **read-only**; the Dealer never places
+  orders over MCP. It runs against **account 2** (`ALPACA_PAPER_API_KEY2` /
+  `ALPACA_PAPER_API_SECRET2`, see `alpaca_client.py`'s `option_data_client2`).
+- The LLM is given the underlying, desired `right`, and the config windows
+  (`dte_min`/`dte_max`, `target_delta_min`/`target_delta_max`, `min_open_interest`, `min_volume`),
+  calls the MCP tools to pull the option chain, quotes, and Greeks, then returns a structured
+  `OptionContractPick` (`src/dealer/schema.py`): `contract_symbol`, `strike`, `expiration`,
+  `right`, `delta`, mid-price `premium`, and a per-contract `reasoning`. Any exception →
+  `option_pick = None` → the entry is skipped cleanly.
+
+**`call_floor_broker_option`** re-validates the pick server-side before executing — it does not
+trust the LLM's copy of the constraints:
+
+- All the same entry gates as `call_floor_broker` apply, and unconditionally (unlike the stock
+  path where they only guard `action == "BUY"`): macro blackout, same-symbol stop cooldown,
+  win-rate throttle, `budget > 0`. Every option entry — call *or* put — is a brand-new position;
+  there is no "SELL means close" case here.
+- DTE (recomputed in US/Eastern) must fall in `[dte_min, dte_max]`; `abs(delta)` must fall in
+  `[target_delta_min, target_delta_max]`; `strategy.risk_per_trade_usd` must be set. Otherwise
+  `status="skipped"` with `reason` `dte_out_of_range` / `delta_out_of_range` /
+  `risk_per_trade_usd_not_configured`.
+- Sizing: `qty = int(risk_per_trade_usd // (premium * 100))`; `qty < 1` →
+  `status="skipped", reason="qty_zero"`.
+- On success it POSTs `POST /execute-option` to Floor Broker (payload includes `contract_symbol`,
+  `qty`, `right`, `strike`, `expiration`, `delta`, `premium`, `reasoning`, `cycle_id`).
+
+The Dealer decision itself is still recorded via `db.record_dealer_decision` and
+`slack.notify_dealer_signal` on the underlying symbol (commit `3e521a4`); the Floor Broker
+outcome is recorded as an `option_<status>` `floor_broker_events` row.
+
 ## Agent 3 — Floor Broker (`src/floor_broker/`)
 
 **Workload:** `apps/v1 Deployment` + `ClusterIP Service` on port 8000. Uses the shared
@@ -312,6 +367,9 @@ calls an LLM.
 |---|---|
 | `GET /healthz` | `{"status": "ok"}` — backs the Deployment's readiness/liveness probes |
 | `POST /execute` | body: `{symbol, exchange, action: BUY\|SELL, budget, slP, tpP}` → dispatches to `execution.buy()`/`execution.sell()` |
+| `POST /execute-option` | body: `{contract_symbol, qty, premium, right, strike, expiration, delta, reasoning, symbol, cycle_id}` → `execution.buy_option()` (account 2). Only called when `options_trading.enabled`; see [Options trading](#options-trading--mcp-backed-contract-selection) |
+| `POST /flatten-crypto` | force-sells every open crypto position; called by Power Scheduler before it scales this pod to 0 (`power_schedule.flatten_crypto_before_powerdown`, default true) |
+| `POST /flatten-options` | force-sells every open option position (account 2); called by Power Scheduler before scale-to-0 when `power_schedule.flatten_options_before_powerdown` (default **false** — options are already DTE-force-closed well before expiry, so an overnight hold is acceptable) |
 
 Alpaca `APIError`s are caught and returned as `{"status": "error", "detail": ...}` (HTTP 200)
 rather than raised; unexpected exceptions become a 500.
@@ -369,6 +427,21 @@ pollers below send directly.
   path: if Alpaca rejects with error code `40310000` (conflicting orders blocking the sell),
   it cancels the blocking orders (ignoring 404s), *re-fetches* the now-current open quantity
   (it can change once blockers clear), and resubmits.
+- **`buy_option()`** — the options entry path, on `trading_client2` (account 2). Runs the same
+  buy-preflight and `max_concurrent_positions` skips as `buy()`, then **re-quotes the contract's
+  live ask** (`get_current_option_ask_price`) and rejects it if `qty * live_ask * 100` exceeds
+  `options_trading.max_notional_usd` (`reason="notional_cap_exceeded"`) — the cap is enforced
+  against the market, not the LLM's claimed premium. A plain `MarketOrderRequest`
+  (`TimeInForce.DAY`) is submitted; the order id is registered in `_pending_option_fills` and the
+  function returns `status="submitted"` immediately. `_option_positions` and the `options_trades`
+  DB row are written **only on a confirmed fill**, by `check_pending_option_fills()` (below).
+  `app.py`'s `ExecuteOptionRequest` also enforces an outer non-configurable `MAX_OPTION_NOTIONAL`
+  ($100k) sanity ceiling on the raw request.
+- **`sell_option()`** — closes an option position on account 2. Submit-only, like `sell()`: it
+  does not clear `_option_positions` or close the DB row synchronously — `check_pending_option_fills()`
+  does that once the SELL's own fill (or terminal non-fill) is observed. Also cancels a still-unfilled
+  BUY order for the same contract before selling. Called by `check_option_stops()` (synthetic
+  SL/TP/DTE-force-close) and `flatten_all_options()`.
 
 **Asynchronous order submission (ROADMAP P0.14).** Both `buy()` and `sell()` submit the order to
 Alpaca and return immediately with `status="submitted"` — they no longer block waiting to learn
@@ -387,10 +460,11 @@ order_id]` (stocks only — crypto has no bracket legs), and `sell()` removes th
 immediately before submitting an explicit sell (so a manual/Dealer-driven SELL doesn't also get
 reported as a TP/SL fill once the bracket's legs are cancelled as a side effect).
 
-`src/floor_broker/main.py` starts four daemon background threads alongside uvicorn's HTTP server
-in the same process — `poll_reconciliation()` (restart recovery, see below) and
-`poll_kill_switch()` (see the kill switch section below) are the other two; the two fill-watchers
-are:
+`src/floor_broker/main.py` starts seven daemon background threads alongside uvicorn's HTTP server
+in the same process — `poll_reconciliation()` (restart recovery, see below), `poll_kill_switch()`
+(see the kill switch section below), `poll_eod_flatten()` (day-trading-mode flatten, see
+`eod_flatten` config), and `poll_symbol_bases()` (refreshes the known-USD-crypto-base set from
+Alpaca) are four of them; the three fill-watchers are:
 - **`poll_pending_fills()`** — every `PENDING_FILL_POLL_INTERVAL_S` (30s) calls
   `execution.check_pending_fills()`, which re-fetches each tracked order by id and, once
   `filled_avg_price` is populated, returns a `kind="fill"` event (dropping the entry once it
@@ -407,7 +481,14 @@ are:
   (`FILLED` vs. `CANCELED`/`EXPIRED`/`REJECTED`), untracks the symbol once either leg reaches a
   terminal state, and returns a `kind="fill"` event per resolved fill or a `kind="terminal"` event
   if both legs closed with no fill. `main.py` posts each event to Slack the same way (`"executed"`
-  vs. `"no_fill"`).
+  vs. `"no_fill"`). The same loop also drains `execution.check_crypto_stops()` and
+  `execution.check_option_stops()` (below) — no separate thread for either.
+- **`poll_pending_option_fills()`** — every 30s calls `execution.check_pending_option_fills()`,
+  the account-2 (`trading_client2`) equivalent of `poll_pending_fills()`. This is the **only**
+  place `_option_positions` and the `options_trades` row are written for a BUY, and the only place
+  they are cleared for a SELL — both keyed to a confirmed fill, with partial-fill and
+  restart-recovery handling (Tasks 27/28). A zero-fill terminal order writes no position and no DB
+  row.
 
 **Transient-vs-terminal error handling.** A poll's `get_order_by_id()` call can itself fail —
 rate limit, timeout, an Alpaca-side 5xx. `execution._is_order_not_found()` only treats this as
@@ -463,7 +544,7 @@ before any position/order lookup. If active, the BUY is skipped
 completely untouched, so SELL always remains available even with the switch on. A missing
 ConfigMap (e.g. before the deploy workflow's seed step has ever run) fails open — treated as
 inactive rather than blocking every BUY on a setup gap — but any other k8s API error propagates.
-`src/floor_broker/main.py::poll_kill_switch()` is one of the four daemon threads described above,
+`src/floor_broker/main.py::poll_kill_switch()` is one of the seven daemon threads described above,
 checking the switch every `KILL_SWITCH_POLL_INTERVAL_S` (30s) purely to post a
 Slack notice (`slack.notify_buy_kill_switch`) on a state *transition* — `/execute` itself already
 re-checks the switch fresh on every request, so this thread never gates trading, only reports on
@@ -512,6 +593,18 @@ bid-fetch failure just skips that symbol for the round — it stays tracked and 
 the next poll, same transient-vs-terminal philosophy as the order-status polling above. `sell()`
 also pops any tracked symbol from `_crypto_stops` on an explicit/Dealer-driven SELL, so the poller
 never double-sells.
+
+**Option synthetic stop-loss / take-profit / DTE-force-close (`options_trading.options_slP`/
+`options_tpP`/`dte_force_close`).** Alpaca has no server-side brackets for options either, so
+`execution.check_option_stops()` fills the same gap for account-2 option positions, also polled
+from `poll_bracket_fills()` on the 30s cadence. For each tracked contract in `_option_positions`
+it fetches the current mid (`get_current_option_mid_price`) and closes via
+`sell_option(contract_symbol, reason=...)` when **any** of: `dte <= dte_force_close` (checked
+first, regardless of P&L), `mid <= entry_premium * options_slP`, or `mid >= entry_premium *
+options_tpP`. It runs **unconditionally regardless of `options_trading.enabled`** — that flag only
+gates *opening* new positions, so an already-open contract stays protected even if the flag is
+flipped off as an emergency rollback (same design as `check_crypto_stops()`). `flatten_all_options()`
+(the `POST /flatten-options` handler) force-closes every open contract at once for power-down.
 
 ## EOD Report (`src/eod_report/`)
 
@@ -739,9 +832,15 @@ same deploy workflow; the connection string is `DATABASE_URL` in the `mlabs-api-
 (see [Secrets](#secrets)).
 
 `src/common/db.py` uses `psycopg[binary,pool]` directly — no ORM, no migration framework.
-Schema is four tables (`analyst_picks`, `dealer_decisions`, `floor_broker_events`,
-`position_opens`), created idempotently (`CREATE TABLE IF NOT EXISTS`) by `db.py` itself on
-first use — there is no separate migrations step or Job. `dealer_decisions` records the
+Schema is six tables (`analyst_picks`, `dealer_decisions`, `floor_broker_events`,
+`options_trades`, `position_opens`, `eod_report_runs`), created idempotently
+(`CREATE TABLE IF NOT EXISTS`) by `db.py` itself on first use — there is no separate migrations
+step or Job. `options_trades` is a trade ledger, not an event log: one row per option position,
+inserted on a confirmed BUY fill with the contract details (`symbol`, `contract_symbol`, `right`,
+`strike`, `expiration`, `delta`, `entry_premium`, `qty`, `reasoning`, `cycle_id`) and updated
+in place with `closed_at`/`exit_reason`/`exit_premium` on close. It is also what
+`_rebuild_option_positions_from_positions()` cross-references on restart to recover the fields
+Alpaca's `Position` object doesn't carry. `dealer_decisions` records the
 Dealer's decision only, with no execution-outcome columns; `/analyst-explain` correlates it to
 `floor_broker_events` at query time by symbol + same-day timestamp proximity, not a shared
 foreign key — deliberately, since a decision and its downstream execution event are written by
@@ -767,9 +866,13 @@ Write sites:
   decision, alongside `slack.notify_dealer_signal()`; then a `record_floor_broker_event()` call
   at each of that function's `slack.notify_floor_broker_result()` sites (BUY skipped for no
   budget, `/execute` error, `/execute` success).
-- `src/floor_broker/main.py`'s two background poll loops (`poll_bracket_fills`,
+- `src/floor_broker/main.py`'s background poll loops (`poll_bracket_fills`,
   `poll_pending_fills`) — a `record_floor_broker_event()` call alongside each of their
-  `slack.notify_floor_broker_result()` sites (fill, no-fill, synthetic crypto stop).
+  `slack.notify_floor_broker_result()` sites (fill, no-fill, synthetic crypto/option stop).
+- `src/floor_broker/main.py::poll_pending_option_fills()` — `record_options_trade_opened()` on a
+  confirmed option BUY fill, `record_options_trade_updated()` on a partial, and
+  `record_options_trade_closed()` when a SELL fill (or `check_option_stops` exit) is observed;
+  plus an `option_<status>` `floor_broker_events` row at each Slack notice.
 - `src/floor_broker/main.py::poll_pending_fills()` — additionally calls
   `record_position_opened()`/`record_position_closed()` on every BUY/SELL fill respectively,
   keeping `position_opens` in sync. `src/floor_broker/execution.py::reconcile_tracked_state_once()`
@@ -813,7 +916,10 @@ trade attribution without adding a separate trade-ledger table yet.
    gates, and POSTs to Floor Broker only when the action is not HOLD and no local BUY gate
    skipped it.
 4. Floor Broker fetches a live quote, runs the position/order safety check, and submits a
-   bracket order (stocks) or notional market order (crypto) to Alpaca's paper account.
+   bracket order (stocks) or notional market order (crypto) to Alpaca's paper account. When
+   `options_trading.enabled`, a stock signal instead goes through MCP contract selection and is
+   submitted as an option market order on account 2 (`/execute-option`), with synthetic
+   SL/TP/DTE-force-close enforced by Floor Broker's own poll loop.
 5. Floor Broker's `{"status": "submitted"|"skipped"|"error"}` response is logged by Dealer and
    not persisted further — the eventual fill (`"executed"`, with `fill_price`) is reported later,
    asynchronously, via its own Slack post from `poll_pending_fills()` (ROADMAP P0.14).
@@ -859,6 +965,14 @@ trade attribution without adding a separate trade-ledger table yet.
 | `strategy` | `win_rate_throttle.enabled`, `win_rate_throttle_scope`, `min_win_rate`, `win_rate_min_sample` | Dealer-side TP/SL outcome throttle. `scope: symbol` counts only same-symbol automatic exits; `scope: global` counts all recent automatic exits. The throttle only evaluates after `win_rate_min_sample` classified exits |
 | `strategy` | `dealer_memory.enabled`, `symbol_memory_days`, `symbol_memory_limit` | controls same-symbol history added to the Dealer LLM prompt. This context is advisory and fails open on DB read errors |
 | `strategy` | `max_bid_ask_spread_pct` | Floor Broker stock BUY gate; when set, a BUY is skipped if `(ask - bid) / ask` exceeds this cap or the bid/ask quote is invalid |
+| `strategy` | `risk_per_trade_usd` | also the per-order budget for options — `qty = risk_per_trade_usd // (premium * 100)` contracts (see `call_floor_broker_option`) |
+| `options_trading` | `enabled` | top-level feature gate (currently **true**). When true, every **stock** Dealer signal is routed through MCP contract selection → an option order on account 2 instead of an equity bracket order; crypto is unaffected. `check_option_stops()` still protects already-open contracts even after this is flipped off. Config-only, no redeploy |
+| `options_trading` | `dte_min`, `dte_max` | days-to-expiration window the contract selector must pick within (14–45), re-validated in `call_floor_broker_option` |
+| `options_trading` | `dte_force_close` | `check_option_stops()` force-closes a position once DTE drops to/below this (3), regardless of P&L |
+| `options_trading` | `target_delta_min`, `target_delta_max` | `abs(delta)` window for the selected contract (0.30–0.60), re-validated in `call_floor_broker_option` |
+| `options_trading` | `min_open_interest`, `min_volume` | liquidity floor passed to the contract-selector prompt (100 / 10) |
+| `options_trading` | `options_slP`, `options_tpP` | synthetic stop-loss / take-profit as a fraction of entry premium (0.50 / 1.75), enforced by `check_option_stops()` since Alpaca has no option brackets |
+| `options_trading` | `max_notional_usd` | hard cap on one option order's notional (`qty * live_ask * 100`), re-quoted against the market inside `buy_option()` — not the LLM-claimed premium (2000) |
 | `eod_flatten` | `enabled` | feature gate for `poll_eod_flatten()` (`src/floor_broker/main.py`) — when false (default), `check_eod_flatten()` short-circuits before touching the clock or Alpaca positions; opt-in "day trading mode" that closes every open stock position near market close instead of holding overnight |
 | `eod_flatten` | `minutes_before_close` | how close (by Alpaca's live clock) to market close before `check_eod_flatten()` starts selling open stock positions (default 10) — crypto is 24/7 and untouched |
 | `eod_flatten` | `conditional` | when true, `check_eod_flatten()` only flattens everything if the aggregate unrealized P&L across open stock positions is >= 0; when negative, positions are held overnight instead except any past `max_days_held_loss`. When false (default), always flattens everything, same as pre-`conditional` behavior |
@@ -867,6 +981,7 @@ trade attribution without adding a separate trade-ledger table yet.
 | `power_schedule` | `minutes_after_close` | scale `dealer`/`floor-broker` to 0 replicas this many minutes after today's official market close (default 60) |
 | `power_schedule` | `minutes_before_open` | scale back to 1 replica this many minutes before the next trading day's official open (default 60) |
 | `power_schedule` | `flatten_crypto_before_powerdown` | when true (default), force-sells every open crypto position and verifies it's flat before scaling `floor-broker` down — crypto's stop-loss/take-profit is only enforced by that pod's own poll loop, so an open position would otherwise be unprotected while it's scaled to 0 |
+| `power_schedule` | `flatten_options_before_powerdown` | when true, `POST /flatten-options` and wait for flat before scaling `floor-broker` down. Default **false** — unlike crypto, options don't trade overnight and are already `dte_force_close`-bounded, so an unattended overnight hold is acceptable |
 | `power_schedule` | `manage_ollama_model` | when true (default), stops `llm.model` in Ollama (`keep_alive: 0`) right after `dealer` scales to 0, and preloads it (`keep_alive: -1`) right after `floor-broker` is confirmed ready on power-up, before `dealer` scales back to 1 — avoids leaving the GPU pinned in its max-power P0 state overnight; failures are logged/Slack-notified but never block power-down/power-up |
 | `earnings_blackout` | `enabled` | feature gate for the earnings-date filter in `discover_candidates` (`src/analyst/graph.py`) — `true` as of 2026-08-05; when false, the stock screener list is unfiltered by earnings dates and Finnhub is never called; requires `FINNHUB_API_KEY` (verified working 2026-08-05) |
 | `earnings_blackout` | `days_before` | drop a screener candidate if it's reporting earnings within this many calendar days from today (default 2) — anticipation/IV-crush risk pre-report |
@@ -899,6 +1014,13 @@ trade attribution without adding a separate trade-ledger table yet.
   (or an open order) already exists for that symbol.
 - **Built-in per-trade loss cap** — every stock BUY is a bracket order with a stop-loss and
   take-profit leg; there is no unprotected stock position by construction.
+- **Option positions use synthetic stops** — Alpaca has no server-side bracket order for options,
+  so an open contract is protected instead by `check_option_stops()`, polled every 30 s inside
+  `poll_bracket_fills()`: it force-closes on `dte <= options_trading.dte_force_close` (checked
+  first, regardless of P&L), `mid <= entry_premium * options_slP`, or `mid >= entry_premium *
+  options_tpP`. This runs unconditionally even after `options_trading.enabled` is flipped off, so
+  already-open contracts stay protected. Unlike a bracket leg, there's a poll-interval gap between
+  the level being breached and the close order being submitted.
 - **Open-bell buffer** — Dealer waits 15 minutes after market open before trading, to avoid
   open-bell volatility.
 - **No overlapping Analyst runs** (`concurrencyPolicy: Forbid`) and **no racing Dealer pods**

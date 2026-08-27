@@ -309,9 +309,52 @@ self-extend into 2027, a persistent memory note (next-refresh reminder, due ~202
 recorded to re-run the sourcing process rather than having the live app scrape government
 calendar pages at runtime — see `docs/ROADMAP.md` P1.13.
 
+## 2026-08-14 — Options trading via MCP contract selection
+
+A new instrument path at the **Dealer** layer (not the Analyst — the Analyst still screens and
+picks the same stock/crypto universe). When `options_trading.enabled` is on, every **stock**
+Dealer signal is expressed as a long option instead of an equity bracket order:
+
+- **Direction** — `right = "call" if action == "BUY" else "put"`. A bearish SELL becomes a long
+  put, never a short option; there is no naked/short-premium path anywhere in the system.
+- **Contract selection** (`select_option_contract`, `src/dealer/graph.py`) — a LangGraph node
+  that runs a tool-calling loop (≤6 rounds) over the same `cfg.llm` model, with Alpaca's options
+  data exposed as MCP tools (`alpaca-mcp-server` via `langchain-mcp-adapters`, read-only
+  `assets,options-data,account` toolsets). The LLM is told the DTE window
+  (`options_trading.dte_min`–`dte_max`), the target `abs(delta)` window
+  (`target_delta_min`–`target_delta_max`), and liquidity floors
+  (`min_open_interest`/`min_volume`), and returns one concrete `OptionContractPick`.
+- **Re-validation + sizing** (`call_floor_broker_option`) — the same macro-blackout /
+  symbol-stop-cooldown / win-rate-throttle gates as the equity path, plus a re-check that the
+  picked contract's DTE and delta are still in-window and that `strategy.risk_per_trade_usd` is
+  configured. Size is `qty = int(risk_per_trade_usd // (premium * 100))` contracts; `qty == 0`
+  skips.
+- **Execution** — Floor Broker `POST /execute-option` → `buy_option()` on a **second paper
+  account** (`alpaca.account2`, `trading_client2`). It re-quotes the live ask and rejects if
+  `qty * live_ask * 100` exceeds `options_trading.max_notional_usd`. Single-leg market order,
+  `TimeInForce.DAY`.
+- **Protection** — Alpaca has no server-side option brackets, so `check_option_stops()` (polled
+  every 30 s inside `poll_bracket_fills()`) enforces synthetic exits: `dte <=
+  options_trading.dte_force_close` (checked first, regardless of P&L), `mid <= entry_premium *
+  options_slP`, or `mid >= entry_premium * options_tpP`. Runs unconditionally — an already-open
+  contract stays protected even after `options_trading.enabled` is flipped back off.
+- **Ledger** — one row per position in the new `options_trades` table (`src/common/db.py`),
+  inserted on the confirmed BUY fill and updated in place with `closed_at`/`exit_reason`/
+  `exit_premium`.
+
+The `account2` split is credential-only: `config.yaml`'s `alpaca.account2.key_env`/`secret_env`
+choose which paper key pair options orders use, switchable within the normal 60 s config refresh.
+Today both accounts point at the same funded paper account
+(`ALPACA_PAPER_API_KEY`/`_SECRET`); `ALPACA_PAPER_API_KEY2`/`_SECRET2` are pre-wired as the
+switch target for when a second funded account exists.
+
+Shipped enabled (`options_trading.enabled: true`, `config.yaml`). See `docs/ROADMAP.md` P1.16 and
+`docs/architecture.md` (Dealer graph, "Options trading — MCP-backed contract selection", Floor
+Broker order logic) for implementation details.
+
 ---
 *This file is a live scratchpad for the strategy conversation, updated as the discussion
-progresses. Reflected in `docs/ROADMAP.md` (P0.4/P0.6/P1.8/P1.10/P1.11/P1.13) and
+progresses. Reflected in `docs/ROADMAP.md` (P0.4/P0.6/P1.8/P1.10/P1.11/P1.13/P1.16) and
 `docs/architecture.md` (Floor Broker section — daily halt, crypto synthetic stop-loss/take-profit,
-end-of-day flatten; Analyst/Dealer sections and Risk controls — earnings/macro blackout) as of
-2026-08-05.*
+end-of-day flatten; Analyst/Dealer sections and Risk controls — earnings/macro blackout; Dealer
+graph + Options trading section — MCP contract selection) as of 2026-08-14.*
