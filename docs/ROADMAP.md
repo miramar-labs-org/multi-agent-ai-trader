@@ -1105,7 +1105,8 @@ the same way call entries are.
 `_select_option_contract_async()`, a LangChain tool-calling loop (`_MAX_TOOL_CALL_ROUNDS = 6`)
 over the same `cfg.llm` model with Alpaca's options data bound as MCP tools via
 `langchain-mcp-adapters` + `alpaca-mcp-server` (`src/dealer/mcp_options.py`,
-`ALPACA_TOOLSETS=assets,options-data,account`, all read-only, run against **account 2**). The
+`ALPACA_TOOLSETS=assets,options-data,account`, all read-only, resolving the one live account's
+credentials). The
 prompt carries the `dte_min`–`dte_max`, `target_delta_min`–`target_delta_max`, and
 `min_open_interest`/`min_volume` windows; output schema `OptionContractPick`
 (`src/dealer/schema.py`). HOLD or sub-`strategy.min_confidence` signals produce no pick.
@@ -1115,7 +1116,8 @@ symbol-stop-cooldown / win-rate-throttle gates, re-checks the picked contract's 
 `abs(delta)` are still in-window, requires `strategy.risk_per_trade_usd` to be set, sizes
 `qty = int(risk_per_trade_usd // (premium * 100))` (skip reasons `dte_out_of_range`,
 `delta_out_of_range`, `risk_per_trade_usd_not_configured`, `qty_zero`), then
-`POST /execute-option` → `execution.buy_option()` on `trading_client2`. `buy_option()` re-quotes
+`POST /execute-option` → `execution.buy_option()` on `trading_client` (the one live account, so
+option BUYs share the daily-P&L halt and position cap with stocks/crypto). `buy_option()` re-quotes
 the live ask, rejects with `reason="notional_cap_exceeded"` if
 `qty * live_ask * 100 > options_trading.max_notional_usd` (outer ceiling
 `MAX_OPTION_NOTIONAL = $100k`), and submits a single-leg `MarketOrderRequest` (`TimeInForce.DAY`),
@@ -1131,12 +1133,13 @@ first, regardless of P&L), `mid <= entry_premium * options_slP`, or
 `mid >= entry_premium * options_tpP`. `/flatten-options` → `flatten_all_options()` is wired into
 the power scheduler behind `power_schedule.flatten_options_before_powerdown` (default false).
 
-**Account split.** `src/common/alpaca_client.py` now exposes `account1` (stocks/crypto) and
-`account2` (options); `config.yaml`'s `alpaca.account1`/`account2` `key_env`/`secret_env` name
-which secret env var each reads, re-resolved on the normal 60 s config refresh. Today both point
-at `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET` (one funded paper account);
-`ALPACA_PAPER_API_KEY2`/`ALPACA_PAPER_API_SECRET2` are pre-wired as the switch target and are now
-required entries in the `mlabs-api-keys` secret.
+**One live account.** As originally shipped this used a dedicated options account (`account2`);
+that split was removed shortly after (see the follow-up note below). `src/common/alpaca_client.py`
+now exposes a single set of clients resolving `config.yaml`'s `alpaca.live.key_env`/`secret_env`
+(default `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET`), re-resolved on the normal 60 s config
+refresh. Every order — stocks, crypto, options — routes there.
+`ALPACA_PAPER_API_KEY2`/`ALPACA_PAPER_API_SECRET2` are pre-wired as the switch target for the
+competition's $100k Level-3 account.
 
 **Persistence.** New `options_trades` table (`src/common/db.py`), one row per option position:
 `record_options_trade_opened()` on the confirmed BUY fill, `record_options_trade_updated()` /
@@ -1161,10 +1164,16 @@ live: `44d87e9`. Tests: `tests/dealer/test_mcp_options.py`, `tests/dealer/test_d
 `tests/power_scheduler/test_power_scheduler_main.py`.
 
 **Known gaps (not blockers).** The backtesting harness has no options support. Options are
-buy-only single legs — no spreads, no premium selling. The Analyst's mid-day position-P&L note
-still reads account 1 only (the EOD Report and README P/L badges now aggregate both accounts via
-`alpaca_client.distinct_trading_clients()` — one client while the accounts share credentials, two
-once split, so no double-counting).
+buy-only single legs — no spreads, no premium selling.
+
+**Follow-up — unified onto one account (2026-08-26).** The dedicated options account was removed:
+stocks, crypto and options now all trade on the one `alpaca.live` paper account. `trading_client2`
+/ `option_data_client2` / `account_env_names()` / `distinct_trading_clients()` and the commit
+`01e1dd2` multi-account EOD/badge aggregation are gone; `live_account_env_names()` replaces the
+per-account resolver. Consequence: option BUYs obey the shared `strategy.daily_loss_limit_usd` /
+`daily_profit_target_usd` halt and `strategy.max_concurrent_positions` cap. All reporting reads
+the one live account — no aggregation to under-report. Moving the whole floor to a different
+account (e.g. the competition's $100k account) is a 2-line `config.yaml` edit, no redeploy.
 
 ---
 

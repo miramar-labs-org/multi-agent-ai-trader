@@ -46,6 +46,13 @@ jobs:
         env:
           ALPACA_PAPER_API_KEY: ${{ secrets.ALPACA_PAPER_API_KEY }}
           ALPACA_PAPER_API_SECRET: ${{ secrets.ALPACA_PAPER_API_SECRET }}
+          # Both known paper-account key pairs are exported so this job reads whichever one
+          # `alpaca.live` in config.yaml currently names -- the default pair above, or this
+          # competition ($100k Level-3) pair. src.common.pl_badges reads the single live
+          # account; the unused pair is simply ignored. (k8s/update-secrets.sh mirrors both
+          # pairs into the GHA secrets.)
+          ALPACA_PAPER_API_KEY2: ${{ secrets.ALPACA_PAPER_API_KEY2 }}
+          ALPACA_PAPER_API_SECRET2: ${{ secrets.ALPACA_PAPER_API_SECRET2 }}
         run: .venv-ci/bin/python -m src.pl_badges.main
 
       - name: Commit refreshed badges

@@ -322,8 +322,8 @@ Dealer, bound to Alpaca's options tools via MCP:
 
 - `src/dealer/mcp_options.py` launches the `alpaca-mcp-server` package (`langchain-mcp-adapters`)
   with `ALPACA_TOOLSETS=assets,options-data,account` — **read-only**; the Dealer never places
-  orders over MCP. It runs against **account 2** (`ALPACA_PAPER_API_KEY2` /
-  `ALPACA_PAPER_API_SECRET2`, see `alpaca_client.py`'s `option_data_client2`).
+  orders over MCP. It resolves the same live-account credentials as everything else
+  (`alpaca_client.live_account_env_names()`, i.e. `config.yaml`'s `alpaca.live` pair).
 - The LLM is given the underlying, desired `right`, and the config windows
   (`dte_min`/`dte_max`, `target_delta_min`/`target_delta_max`, `min_open_interest`, `min_volume`),
   calls the MCP tools to pull the option chain, quotes, and Greeks, then returns a structured
@@ -367,9 +367,9 @@ calls an LLM.
 |---|---|
 | `GET /healthz` | `{"status": "ok"}` — backs the Deployment's readiness/liveness probes |
 | `POST /execute` | body: `{symbol, exchange, action: BUY\|SELL, budget, slP, tpP}` → dispatches to `execution.buy()`/`execution.sell()` |
-| `POST /execute-option` | body: `{contract_symbol, qty, premium, right, strike, expiration, delta, reasoning, symbol, cycle_id}` → `execution.buy_option()` (account 2). Only called when `options_trading.enabled`; see [Options trading](#options-trading--mcp-backed-contract-selection) |
+| `POST /execute-option` | body: `{contract_symbol, qty, premium, right, strike, expiration, delta, reasoning, symbol, cycle_id}` → `execution.buy_option()`. Only called when `options_trading.enabled`; see [Options trading](#options-trading--mcp-backed-contract-selection) |
 | `POST /flatten-crypto` | force-sells every open crypto position; called by Power Scheduler before it scales this pod to 0 (`power_schedule.flatten_crypto_before_powerdown`, default true) |
-| `POST /flatten-options` | force-sells every open option position (account 2); called by Power Scheduler before scale-to-0 when `power_schedule.flatten_options_before_powerdown` (default **false** — options are already DTE-force-closed well before expiry, so an overnight hold is acceptable) |
+| `POST /flatten-options` | force-sells every open option position; called by Power Scheduler before scale-to-0 when `power_schedule.flatten_options_before_powerdown` (default **false** — options are already DTE-force-closed well before expiry, so an overnight hold is acceptable) |
 
 Alpaca `APIError`s are caught and returned as `{"status": "error", "detail": ...}` (HTTP 200)
 rather than raised; unexpected exceptions become a 500.
@@ -427,8 +427,10 @@ pollers below send directly.
   path: if Alpaca rejects with error code `40310000` (conflicting orders blocking the sell),
   it cancels the blocking orders (ignoring 404s), *re-fetches* the now-current open quantity
   (it can change once blockers clear), and resubmits.
-- **`buy_option()`** — the options entry path, on `trading_client2` (account 2). Runs the same
-  buy-preflight and `max_concurrent_positions` skips as `buy()`, then **re-quotes the contract's
+- **`buy_option()`** — the options entry path, on `trading_client` (the one live account, same as
+  stocks/crypto). Runs the same buy-preflight and `max_concurrent_positions` skips as `buy()` —
+  option BUYs share the live account's daily-P&L halt and open-position cap, no options carve-out
+  — then **re-quotes the contract's
   live ask** (`get_current_option_ask_price`) and rejects it if `qty * live_ask * 100` exceeds
   `options_trading.max_notional_usd` (`reason="notional_cap_exceeded"`) — the cap is enforced
   against the market, not the LLM's claimed premium. A plain `MarketOrderRequest`
@@ -437,7 +439,7 @@ pollers below send directly.
   DB row are written **only on a confirmed fill**, by `check_pending_option_fills()` (below).
   `app.py`'s `ExecuteOptionRequest` also enforces an outer non-configurable `MAX_OPTION_NOTIONAL`
   ($100k) sanity ceiling on the raw request.
-- **`sell_option()`** — closes an option position on account 2. Submit-only, like `sell()`: it
+- **`sell_option()`** — closes an option position on the same live account. Submit-only, like `sell()`: it
   does not clear `_option_positions` or close the DB row synchronously — `check_pending_option_fills()`
   does that once the SELL's own fill (or terminal non-fill) is observed. Also cancels a still-unfilled
   BUY order for the same contract before selling. Called by `check_option_stops()` (synthetic
@@ -484,7 +486,8 @@ Alpaca) are four of them; the three fill-watchers are:
   vs. `"no_fill"`). The same loop also drains `execution.check_crypto_stops()` and
   `execution.check_option_stops()` (below) — no separate thread for either.
 - **`poll_pending_option_fills()`** — every 30s calls `execution.check_pending_option_fills()`,
-  the account-2 (`trading_client2`) equivalent of `poll_pending_fills()`. This is the **only**
+  the option-contract equivalent of `poll_pending_fills()` (separate because options are tracked
+  by OCC symbol with a synthetic exit mechanism, not by asset account). This is the **only**
   place `_option_positions` and the `options_trades` row are written for a BUY, and the only place
   they are cleared for a SELL — both keyed to a confirmed fill, with partial-fill and
   restart-recovery handling (Tasks 27/28). A zero-fill terminal order writes no position and no DB
@@ -596,8 +599,8 @@ never double-sells.
 
 **Option synthetic stop-loss / take-profit / DTE-force-close (`options_trading.options_slP`/
 `options_tpP`/`dte_force_close`).** Alpaca has no server-side brackets for options either, so
-`execution.check_option_stops()` fills the same gap for account-2 option positions, also polled
-from `poll_bracket_fills()` on the 30s cadence. For each tracked contract in `_option_positions`
+`execution.check_option_stops()` fills the same gap for option positions on the live account, also
+polled from `poll_bracket_fills()` on the 30s cadence. For each tracked contract in `_option_positions`
 it fetches the current mid (`get_current_option_mid_price`) and closes via
 `sell_option(contract_symbol, reason=...)` when **any** of: `dte <= dte_force_close` (checked
 first, regardless of P&L), `mid <= entry_premium * options_slP`, or `mid >= entry_premium *
@@ -636,15 +639,14 @@ Alpaca.
    always visibly reported, not silent.
 3. If today is a trading day but the official close+30min has not passed yet, exits silently so
    an earlier check slot does not post prematurely.
-4. `src.common.eod.fetch_combined_account_summary()` — equity, cash, buying power, and
-   `last_equity` (prior close) to compute the day's P&L, summed across every distinct funded
-   account (`alpaca_client.distinct_trading_clients()` — one client while account 1/2 share
-   credentials, two once split, so the shared account is never double-counted).
-5. `src.common.eod.fetch_all_positions()` — current open positions and their unrealized P&L,
-   across every distinct account (so account 2's option positions are included).
-6. `src.common.eod.fetch_all_fills(today)` — a raw REST call under the hood (no dedicated
+4. `trading_client.get_account()` — equity, cash, buying power, and `last_equity` (prior close)
+   for the live paper account, to compute the day's P&L. Stocks, crypto and options all trade on
+   this one account, so a single read covers the whole floor.
+5. `trading_client.get_all_positions()` — current open positions and their unrealized P&L
+   (equity, crypto and option contracts alike).
+6. `src.common.eod.fetch_fills(today)` — a raw REST call under the hood (no dedicated
    `alpaca-py` method exists for `/account/activities`) for every fill executed that day, across
-   all assets and every distinct account.
+   all assets.
 7. `slack.notify_eod_report(...)` formats and posts all of the above as one message, then records
    the best-effort run marker to prevent later check slots from duplicating it.
 
@@ -759,10 +761,16 @@ same `is_stock_market_open()` calendar check `eod_report.main()` uses.
 ## Shared code (`src/common/`)
 
 - **`alpaca_client.py`** — one shared `TradingClient(..., paper=True)` (hardcoded — this is
-  paper-trading only, no code path to live trading without a source change), plus
-  `StockHistoricalDataClient`/`CryptoHistoricalDataClient` for market data, and
-  `get_current_ask_price`/`get_current_bid_price` helpers used by Floor Broker for order sizing.
-  Credentials come from `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET` env vars.
+  paper-trading only, no code path to live trading without a source change) that places **every**
+  order (stocks, crypto, options), plus `StockHistoricalDataClient`/`CryptoHistoricalDataClient`/
+  `OptionHistoricalDataClient` for market data, and `get_current_ask_price`/`get_current_bid_price`
+  (+ the `get_current_option_*` variants) helpers used by Floor Broker for order sizing. Every
+  client is a `_LazyAlpacaClient` that resolves its credentials from whichever env-var pair
+  `live_account_env_names()` currently names — `config.yaml`'s `alpaca.live.key_env`/`secret_env`,
+  defaulting to `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET`. Because config is polled every
+  60s and the lazy client rebuilds when the resolved names change, pointing the whole floor at a
+  different paper account (e.g. the competition's $100k Level-3 account) is a `config.yaml` edit
+  alone, no redeploy (the target account's creds must already be present as env vars).
 - **`config.py`** — `load_config()` fetches `config.yaml` fresh from
   `raw.githubusercontent.com/miramar-labs-org/multi-agent-ai-trader/main/config.yaml`
   (unauthenticated — the repo is public) instead of reading a local file, so every service
@@ -804,16 +812,13 @@ same `is_stock_market_open()` calendar check `eod_report.main()` uses.
 - **`db.py`** — Postgres persistence for Analyst picks, Dealer decisions, and Floor Broker
   execution events, added in v0.6.0. See [Persistence](#persistence) for the schema and write
   contract.
-- **`eod.py`** — `fetch_fills(date, only_crypto=None, client=None)` / `summarize_positions(positions,
+- **`eod.py`** — `fetch_fills(date, only_crypto=None)` / `summarize_positions(positions,
   only_crypto=None)` shape Alpaca's raw position/activity objects into the plain dicts
-  `slack.notify_eod_report`/`notify_crypto_eod_report` expect. Shared by the stock EOD Report (no
-  filter — every asset) and the Analyst's crypto EOD node (`only_crypto=True`) so the fetch/shape
-  logic isn't duplicated. The stock EOD Report goes through the `fetch_all_fills` /
-  `fetch_all_positions` / `fetch_combined_account_summary` wrappers, which run the same fetch
-  against each client from `alpaca_client.distinct_trading_clients()` and concatenate/sum — one
-  client while account 1 and account 2 share an API key (today's default), two once config splits
-  them, so option activity on account 2 lands in the recap without double-counting the shared
-  account. The two functions filter differently because Alpaca's own API is
+  `slack.notify_eod_report`/`notify_crypto_eod_report` expect. Both read the one live account via
+  the shared `trading_client`. Shared by the stock EOD Report (no filter — every asset, so option
+  activity lands in the recap automatically) and the Analyst's crypto EOD node
+  (`only_crypto=True`) so the fetch/shape logic isn't duplicated. The two functions filter
+  differently because Alpaca's own API is
   internally inconsistent: `fetch_fills` filters on `"/" in symbol` since `/account/activities`
   fill records are always slash-formatted (e.g. `"BTC/USD"`), but `summarize_positions` filters on
   `p.asset_class == AssetClass.CRYPTO` since live `Position.symbol` for crypto has **no** slash
@@ -927,7 +932,7 @@ trade attribution without adding a separate trade-ledger table yet.
 4. Floor Broker fetches a live quote, runs the position/order safety check, and submits a
    bracket order (stocks) or notional market order (crypto) to Alpaca's paper account. When
    `options_trading.enabled`, a stock signal instead goes through MCP contract selection and is
-   submitted as an option market order on account 2 (`/execute-option`), with synthetic
+   submitted as an option market order on the same live account (`/execute-option`), with synthetic
    SL/TP/DTE-force-close enforced by Floor Broker's own poll loop.
 5. Floor Broker's `{"status": "submitted"|"skipped"|"error"}` response is logged by Dealer and
    not persisted further — the eventual fill (`"executed"`, with `fill_price`) is reported later,
@@ -975,7 +980,7 @@ trade attribution without adding a separate trade-ledger table yet.
 | `strategy` | `dealer_memory.enabled`, `symbol_memory_days`, `symbol_memory_limit` | controls same-symbol history added to the Dealer LLM prompt. This context is advisory and fails open on DB read errors |
 | `strategy` | `max_bid_ask_spread_pct` | Floor Broker stock BUY gate; when set, a BUY is skipped if `(ask - bid) / ask` exceeds this cap or the bid/ask quote is invalid |
 | `strategy` | `risk_per_trade_usd` | also the per-order budget for options — `qty = risk_per_trade_usd // (premium * 100)` contracts (see `call_floor_broker_option`) |
-| `options_trading` | `enabled` | top-level feature gate (currently **true**). When true, every **stock** Dealer signal is routed through MCP contract selection → an option order on account 2 instead of an equity bracket order; crypto is unaffected. `check_option_stops()` still protects already-open contracts even after this is flipped off. Config-only, no redeploy |
+| `options_trading` | `enabled` | top-level feature gate (currently **true**). When true, every **stock** Dealer signal is routed through MCP contract selection → an option order on the live account instead of an equity bracket order; crypto is unaffected. `check_option_stops()` still protects already-open contracts even after this is flipped off. Config-only, no redeploy |
 | `options_trading` | `dte_min`, `dte_max` | days-to-expiration window the contract selector must pick within (14–45), re-validated in `call_floor_broker_option` |
 | `options_trading` | `dte_force_close` | `check_option_stops()` force-closes a position once DTE drops to/below this (3), regardless of P&L |
 | `options_trading` | `target_delta_min`, `target_delta_max` | `abs(delta)` window for the selected contract (0.30–0.60), re-validated in `call_floor_broker_option` |
@@ -1136,9 +1141,13 @@ has no ServiceAccount/k8s API access at all.
 
 `pl-badges.yaml` (see [P/L badges](#p-l-badges-src-pl_badges)) runs outside the cluster on a GHA
 self-hosted runner, not as a k8s workload, so it can't read `mlabs-api-keys` — it needs its own
-copy of `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET` as GitHub Actions repo secrets
-(`secrets.ALPACA_PAPER_API_KEY`/`secrets.ALPACA_PAPER_API_SECRET`), same pattern as
-`MIRAMAR_ORG_GHCR_PAT` for `build-push.yaml`/`deploy.yaml`.
+copy of the Alpaca keys as GitHub Actions repo secrets, same pattern as `MIRAMAR_ORG_GHCR_PAT`
+for `build-push.yaml`/`deploy.yaml`. `k8s/update-secrets.sh` keeps these in sync: its
+`GHA_SECRET_KEYS` list (`ALPACA_PAPER_API_KEY`/`_SECRET` and `ALPACA_PAPER_API_KEY2`/`_SECRET2`)
+is mirrored to matching repo secrets via `gh secret set` on every run. Both pairs are mirrored so
+the badge job keeps working whichever one `alpaca.live` currently names — the default pair, or
+the competition's $100k Level-3 pair; `src.common.pl_badges` only ever reads the one live account,
+and the unused pair is ignored.
 
 ## `notebook.ipynb`
 

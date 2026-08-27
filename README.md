@@ -32,8 +32,9 @@ trading loop (stocks, crypto, and options) against Alpaca's **paper** trading ac
 
 When `options_trading.enabled` is on, every stock Dealer signal is instead expressed as a long
 option (call for BUY, put for SELL) — the Dealer picks a concrete contract via an MCP
-tool-calling loop against Alpaca's options data and Floor Broker submits it on a **second paper
-account** (`alpaca.account2`). Crypto is unaffected. See
+tool-calling loop against Alpaca's options data and Floor Broker submits it on the same single
+**live paper account** every other order routes to (`alpaca.live` in `config.yaml`). Crypto is
+unaffected. See
 [docs/architecture.md](docs/architecture.md#options-trading--mcp-backed-contract-selection).
 - **EOD Report** — a `CronJob` that runs once a day after market close, and posts an account
   balance + trade summary to Slack. It makes no trading decisions — pure reporting.
@@ -61,7 +62,7 @@ accounts/API keys, put them in one k8s Secret, then run the two GHA deploy workf
 | Key | Where to get it | Required? |
 |---|---|---|
 | `ALPACA_PAPER_API_KEY` / `ALPACA_PAPER_API_SECRET` | [Alpaca](https://alpaca.markets/) — generate a **paper trading** key pair from the dashboard | Required — every component needs this |
-| `ALPACA_PAPER_API_KEY2` / `ALPACA_PAPER_API_SECRET2` | [Alpaca](https://alpaca.markets/) — a second paper key pair, used for options orders (`alpaca.account2`) | Required — set to the same values as `ALPACA_PAPER_API_KEY`/`_SECRET` if you only have one funded paper account (the current default) |
+| `ALPACA_PAPER_API_KEY2` / `ALPACA_PAPER_API_SECRET2` | [Alpaca](https://alpaca.markets/) — a second paper key pair, kept ready as the runtime switch target for the competition's $100k Level-3 account | Optional — only needed to point `alpaca.live` at a second account without a redeploy; leave unset (or mirror the first pair) otherwise |
 | `TAAPI_API_KEY` | [TAAPI.io](https://taapi.io/) — free plan works (1 request/15s, see `config.yaml`'s `taapi.min_request_interval_secs`) | Required — Dealer's technical indicators |
 | `LANGCHAIN_API_KEY` | [smith.langchain.com](https://smith.langchain.com/) | Optional — only if `config.yaml`'s `langsmith.enabled: true` |
 | `SLACK_WEBHOOK_URL2` | An [incoming webhook](https://api.slack.com/messaging/webhooks) for whatever channel you want notifications in | Optional — only if `config.yaml`'s `slack.enabled: true` |
@@ -215,8 +216,8 @@ server-side option brackets, open contracts are protected by a synthetic stop-lo
 
 | API | Used by | Purpose |
 |---|---|---|
-| [Alpaca Trading API](https://docs.alpaca.markets/) | Floor Broker | The only component that places/cancels orders — bracket orders for stocks, notional market orders for crypto, single-leg option market orders for options. Paper accounts only; which paper key pair `account1` (stocks/crypto) and `account2` (options) each use is set in `config.yaml`'s `alpaca:` section (`src/common/alpaca_client.py`), switchable at runtime. |
-| [Alpaca Options Data API](https://docs.alpaca.markets/) | Dealer | `select_option_contract`'s MCP tool-calling loop (`alpaca-mcp-server` via `langchain-mcp-adapters`, read-only `assets,options-data,account` toolsets) — the option chain, greeks, and quotes the Dealer LLM uses to pick a contract. Runs on `account2`. |
+| [Alpaca Trading API](https://docs.alpaca.markets/) | Floor Broker | The only component that places/cancels orders — bracket orders for stocks, notional market orders for crypto, single-leg option market orders for options. Paper accounts only; every order routes to the one "live" paper account named by `config.yaml`'s `alpaca.live` (`src/common/alpaca_client.py`), switchable at runtime. |
+| [Alpaca Options Data API](https://docs.alpaca.markets/) | Dealer | `select_option_contract`'s MCP tool-calling loop (`alpaca-mcp-server` via `langchain-mcp-adapters`, read-only `assets,options-data,account` toolsets) — the option chain, greeks, and quotes the Dealer LLM uses to pick a contract. Uses the same `alpaca.live` credentials. |
 | [Alpaca Market Data / Screener / News API](https://docs.alpaca.markets/) | Analyst, Dealer | Screener `most-actives`/`movers` endpoints and News API for Analyst's daily candidate research; live bid/ask quotes for Floor Broker's order sizing. |
 | [TAAPI.io](https://taapi.io/) | Analyst, Dealer | Technical indicators (RSI, MACD, VWAP, Bollinger Bands, SMA, EMA) — Analyst for its top candidates by move size (`fetch_indicators`, capped by `analyst.indicator_fetch_limit`), Dealer for every watchlist symbol each poll. A third-party service, unrelated to any Miramar platform component. |
 | Yahoo Finance RSS | Analyst | Supplementary headline research alongside Alpaca's News API. |

@@ -329,10 +329,12 @@ Dealer signal is expressed as a long option instead of an equity bracket order:
   picked contract's DTE and delta are still in-window and that `strategy.risk_per_trade_usd` is
   configured. Size is `qty = int(risk_per_trade_usd // (premium * 100))` contracts; `qty == 0`
   skips.
-- **Execution** — Floor Broker `POST /execute-option` → `buy_option()` on a **second paper
-  account** (`alpaca.account2`, `trading_client2`). It re-quotes the live ask and rejects if
-  `qty * live_ask * 100` exceeds `options_trading.max_notional_usd`. Single-leg market order,
-  `TimeInForce.DAY`.
+- **Execution** — Floor Broker `POST /execute-option` → `buy_option()` on the **same single live
+  paper account** every other order routes to (`alpaca.live`, `trading_client`). It re-quotes the
+  live ask and rejects if `qty * live_ask * 100` exceeds `options_trading.max_notional_usd`.
+  Single-leg market order, `TimeInForce.DAY`. Because it shares the account, an option BUY also
+  obeys the shared `strategy.daily_loss_limit_usd` / `daily_profit_target_usd` halt and the shared
+  `strategy.max_concurrent_positions` cap — no options carve-out.
 - **Protection** — Alpaca has no server-side option brackets, so `check_option_stops()` (polled
   every 30 s inside `poll_bracket_fills()`) enforces synthetic exits: `dte <=
   options_trading.dte_force_close` (checked first, regardless of P&L), `mid <= entry_premium *
@@ -342,11 +344,11 @@ Dealer signal is expressed as a long option instead of an equity bracket order:
   inserted on the confirmed BUY fill and updated in place with `closed_at`/`exit_reason`/
   `exit_premium`.
 
-The `account2` split is credential-only: `config.yaml`'s `alpaca.account2.key_env`/`secret_env`
-choose which paper key pair options orders use, switchable within the normal 60 s config refresh.
-Today both accounts point at the same funded paper account
-(`ALPACA_PAPER_API_KEY`/`_SECRET`); `ALPACA_PAPER_API_KEY2`/`_SECRET2` are pre-wired as the
-switch target for when a second funded account exists.
+There is no per-asset-class account split: `config.yaml`'s `alpaca.live.key_env`/`secret_env`
+choose the one paper key pair the **whole floor** uses, switchable within the normal 60 s config
+refresh. Today that's the base funded account (`ALPACA_PAPER_API_KEY`/`_SECRET`);
+`ALPACA_PAPER_API_KEY2`/`_SECRET2` are pre-wired as the switch target for the competition's $100k
+Level-3 account.
 
 Shipped enabled (`options_trading.enabled: true`, `config.yaml`). See `docs/ROADMAP.md` P1.16 and
 `docs/architecture.md` (Dealer graph, "Options trading — MCP-backed contract selection", Floor
