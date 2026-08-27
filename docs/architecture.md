@@ -336,8 +336,15 @@ Dealer, bound to Alpaca's options tools via MCP:
   loop stops requesting tools past ~12k estimated tokens, old tool-message bodies are neutralized
   before any call that would exceed a 24k hard cap, and each Ollama call has a
   `llm.request_timeout_s` ceiling with no retries. If structured output still fails,
-  `_fallback_pick` deterministically picks from the rows already seen (delta + DTE + quote gates)
-  instead of returning nothing.
+  `_fallback_pick` deterministically picks from the rows already seen (delta + DTE + quote gates,
+  plus `min_open_interest` / `min_volume` for rows where Alpaca actually returned those fields)
+  instead of returning nothing. A hallucinated or failing tool call inside the loop is logged and
+  skipped rather than aborting the whole selector.
+- The structured `OptionContractPick` is **validated before use** (`_structured_pick_rejection`):
+  its `right` must match the intended direction (BUY → call, SELL → put) and its `contract_symbol`
+  must be one actually seen in a chain response. A schema-valid but wrong-direction or hallucinated
+  pick is rejected and `_fallback_pick` runs instead — the fallback is direction-safe and only
+  chooses from observed rows.
 
 **`call_floor_broker_option`** re-validates the pick server-side before executing — it does not
 trust the LLM's copy of the constraints:
