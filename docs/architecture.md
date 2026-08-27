@@ -350,6 +350,16 @@ Dealer, bound to Alpaca's options tools via MCP:
   must be one actually seen in a chain response. A schema-valid but wrong-direction or hallucinated
   pick is rejected and `_fallback_pick` runs instead — the fallback is direction-safe and only
   chooses from observed rows.
+- A pick that passes that check is then **reconciled** (`_reconcile_structured_pick`): its `strike`,
+  `expiration`, `right`, `delta`, and `premium` are overwritten with the values observed for that
+  contract in the chain (OCC symbol for strike/expiration/right, the row's Greeks for `delta`, the
+  quote mid for `premium`) — the same data `_fallback_pick` trusts. Only the model's `reasoning`
+  survives. This stops a schema-valid pick that names a real, seen contract but attaches a
+  fabricated low `premium` (→ oversized `qty` in `call_floor_broker_option`) or an in-window
+  `delta` from driving execution on model-supplied numbers, and it catches a call-labelled pick
+  whose seen OCC symbol is actually a put (which `_structured_pick_rejection`, comparing only the
+  model's self-reported `right`, would allow). If the matched row has no usable direction, delta,
+  or quote, reconciliation returns nothing and `_fallback_pick` runs.
 
 **`call_floor_broker_option`** re-validates the pick server-side before executing — it does not
 trust the LLM's copy of the constraints:
