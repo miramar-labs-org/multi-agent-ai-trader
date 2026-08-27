@@ -1,4 +1,6 @@
-from datetime import datetime, timedelta
+import asyncio
+import json
+from datetime import date, datetime, timedelta
 
 import pytz
 from omegaconf import OmegaConf
@@ -284,6 +286,261 @@ def test_select_option_contract_async_passes_api_key_and_needs_no_openai_env(mon
 
     assert pick["option_pick"]["contract_symbol"] == "AAPL250117C00200000"
     assert captured.get("api_key")
+
+
+def _async_options_cfg(**ot_overrides):
+    ot = {
+        "enabled": True,
+        "dte_min": 14,
+        "dte_max": 45,
+        "target_delta_min": 0.30,
+        "target_delta_max": 0.60,
+        "min_open_interest": 100,
+        "min_volume": 10,
+    }
+    ot.update(ot_overrides)
+    return OmegaConf.create(
+        {
+            "llm": {"base_url": "http://llm.test/v1", "model": "m", "temperature": 0.0},
+            "options_trading": ot,
+        }
+    )
+
+
+def _async_options_state():
+    return {
+        **_state("rsi: 71.2"),
+        "symbol": "AAPL",
+        "exchange": "stocks",
+        "signal": {"action": "BUY", "confidence": 0.9, "reasoning": "breakout"},
+    }
+
+
+def _run_async_select(monkeypatch, tool, bound_cls, structured_cls, captured, cfg=None):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    async def _fake_tools():
+        return [tool] if tool is not None else []
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def bind_tools(self, tools):
+            return bound_cls()
+
+        def with_structured_output(self, schema):
+            return structured_cls()
+
+    monkeypatch.setattr(graph, "get_options_tools", _fake_tools)
+    monkeypatch.setattr(graph, "ChatOpenAI", FakeChatOpenAI)
+    state = _async_options_state()
+    return asyncio.run(
+        graph._select_option_contract_async(state, cfg or _async_options_cfg(), state["signal"])
+    )
+
+
+def test_select_option_contract_async_compacts_results_and_steers_filtered_chain(monkeypatch):
+    captured = {}
+    big_chain = json.dumps(
+        {
+            "snapshots": {
+                f"AAPL250620C{int((100 + i) * 1000):08d}": {
+                    "latestQuote": {"bp": 1.0, "ap": 1.2},
+                    "greeks": {"delta": round(0.01 * i, 2)},
+                }
+                for i in range(1, 120)
+            }
+        }
+    )
+
+    class _Tool:
+        name = "get_option_chain"
+
+        async def ainvoke(self, args):
+            captured["tool_args"] = args
+            return big_chain
+
+    class _Bound:
+        def __init__(self):
+            self._calls = 0
+
+        def invoke(self, messages):
+            captured["last_messages"] = messages
+            self._calls += 1
+            if self._calls == 1:
+                return type(
+                    "R",
+                    (),
+                    {"tool_calls": [{"name": "get_option_chain", "args": {"underlying_symbol": "AAPL"}, "id": "c1"}]},
+                )()
+            return type("R", (), {"tool_calls": []})()
+
+    class _Structured:
+        def invoke(self, messages):
+            captured["final_messages"] = messages
+            return graph.OptionContractPick(
+                contract_symbol="AAPL250620C00145000",
+                strike=145.0,
+                expiration="2025-06-20",
+                right="call",
+                delta=0.45,
+                premium=1.1,
+                reasoning="mid-delta",
+            )
+
+    pick = _run_async_select(monkeypatch, _Tool(), _Bound, _Structured, captured)
+
+    assert pick.contract_symbol == "AAPL250620C00145000"
+    human = captured["last_messages"][1].content
+    assert "expiration_date_gte" in human
+    assert "Days-to-expiration window: 14-45" not in human
+    tool_msgs = [m for m in captured["final_messages"] if isinstance(m, graph.ToolMessage)]
+    assert tool_msgs and len(str(tool_msgs[0].content)) < len(big_chain) // 2
+
+
+def test_trim_history_noop_under_cap():
+    msgs = [
+        graph.SystemMessage(content="s"),
+        graph.HumanMessage(content="h"),
+        graph.ToolMessage(content="t", tool_call_id="x"),
+    ]
+    assert graph._trim_history(msgs, hard_cap=1000) == msgs
+
+
+def test_trim_history_neutralizes_old_tool_messages_over_cap():
+    msgs = [
+        graph.SystemMessage(content="s"),
+        graph.HumanMessage(content="h"),
+        graph.ToolMessage(content="A" * 80000, tool_call_id="c1"),
+        graph.ToolMessage(content="B" * 400, tool_call_id="c2"),
+    ]
+    out = graph._trim_history(msgs, hard_cap=1000)
+    assert graph.estimate_tokens(out) <= 1000
+    assert "budget" in str(out[2].content).lower()
+    assert out[2].tool_call_id == "c1"
+    assert str(out[3].content) == "B" * 400  # newest kept intact
+
+
+def test_select_option_contract_async_stops_looping_at_token_budget(monkeypatch):
+    captured = {}
+    # each tool result compacts to ~6000 chars; 4 calls/round -> ~6k tokens/round,
+    # so the ~12k-token budget trips after round 2 (well before the 6-round cap)
+    blob = "Z" * 12000
+
+    class _Tool:
+        name = "get_option_chain"
+
+        async def ainvoke(self, args):
+            return blob
+
+    class _Bound:
+        def __init__(self):
+            self.n = 0
+
+        def invoke(self, messages):
+            self.n += 1
+            captured["rounds"] = self.n
+            return type(
+                "R",
+                (),
+                {"tool_calls": [{"name": "get_option_chain", "args": {}, "id": f"c{self.n}-{k}"} for k in range(4)]},
+            )()
+
+    class _Structured:
+        def invoke(self, messages):
+            return graph.OptionContractPick(
+                contract_symbol="AAPL250620C00145000",
+                strike=145.0,
+                expiration="2025-06-20",
+                right="call",
+                delta=0.45,
+                premium=1.1,
+                reasoning="x",
+            )
+
+    _run_async_select(monkeypatch, _Tool(), _Bound, _Structured, captured)
+
+    assert captured["rounds"] < graph._MAX_TOOL_CALL_ROUNDS  # broke early on the token budget
+
+
+def _row(sym, delta, exp, bid=1.0, ask=1.2, right="call"):
+    return {
+        "symbol": sym,
+        "strike": 100.0,
+        "expiration": exp,
+        "right": right,
+        "delta": delta,
+        "gamma": None,
+        "theta": None,
+        "vega": None,
+        "iv": None,
+        "bid": bid,
+        "ask": ask,
+        "oi": 500,
+        "volume": 50,
+    }
+
+
+def test_fallback_pick_selects_closest_to_target_delta_passing_gates():
+    today = date(2025, 6, 1)
+    ok_exp = "2025-06-20"  # 19 DTE, inside 14-45
+    rows = [
+        _row("A", 0.35, ok_exp),
+        _row("B", 0.45, ok_exp),  # closest to mid 0.45
+        _row("C", 0.58, ok_exp),
+        _row("D", 0.45, "2025-06-05"),  # 4 DTE -- outside window
+        _row("E", 0.10, ok_exp),  # outside delta window
+    ]
+    cfg = OmegaConf.create(
+        {"options_trading": {"dte_min": 14, "dte_max": 45, "target_delta_min": 0.30, "target_delta_max": 0.60}}
+    )
+    pick = graph._fallback_pick(rows, "call", cfg, delta_mid=0.45, today=today)
+    assert pick.contract_symbol == "B"
+    assert pick.premium == 1.1
+    assert "fallback" in pick.reasoning.lower()
+
+
+def test_fallback_pick_returns_none_when_nothing_qualifies():
+    today = date(2025, 6, 1)
+    cfg = OmegaConf.create(
+        {"options_trading": {"dte_min": 14, "dte_max": 45, "target_delta_min": 0.30, "target_delta_max": 0.60}}
+    )
+    rows = [_row("A", 0.05, "2025-06-20"), _row("B", 0.45, "2025-06-20", bid=0, ask=0)]
+    assert graph._fallback_pick(rows, "call", cfg, 0.45, today) is None
+
+
+def test_select_option_contract_async_uses_fallback_when_structured_output_raises(monkeypatch):
+    captured = {}
+    ok_exp = (datetime.now(pytz.timezone("US/Eastern")).date() + timedelta(days=25)).isoformat()
+    occ = f"AAPL{ok_exp.replace('-', '')[2:]}C00145000"
+    chain = json.dumps({"snapshots": {occ: {"latestQuote": {"bp": 1.0, "ap": 1.2}, "greeks": {"delta": 0.46}}}})
+
+    class _Tool:
+        name = "get_option_chain"
+
+        async def ainvoke(self, args):
+            return chain
+
+    class _Bound:
+        def __init__(self):
+            self.n = 0
+
+        def invoke(self, messages):
+            self.n += 1
+            if self.n == 1:
+                return type("R", (), {"tool_calls": [{"name": "get_option_chain", "args": {}, "id": "c"}]})()
+            return type("R", (), {"tool_calls": []})()
+
+    class _Structured:
+        def invoke(self, messages):
+            raise ValueError("model returned 1 token, cannot parse OptionContractPick")
+
+    pick = _run_async_select(monkeypatch, _Tool(), _Bound, _Structured, captured)
+
+    assert pick is not None
+    assert pick.right == "call"
+    assert "fallback" in pick.reasoning.lower()
 
 
 def _option_cfg(**overrides):

@@ -15,11 +15,14 @@ from src.common.logging import get_logger
 from src.common.indicators import fetch_indicators_bulk
 from src.dealer.features import compute_derived_features, format_features_text
 from src.dealer.mcp_options import get_options_tools
+from src.dealer.option_chain import compact_tool_result, estimate_tokens, parse_option_chain
 from src.dealer.schema import OptionContractPick, Signal
 
 log = get_logger("DEALER")
 
 _MAX_TOOL_CALL_ROUNDS = 6
+_OPTION_PROMPT_TOKEN_BUDGET = 12_000  # stop the tool-calling loop once history passes this
+_OPTION_PROMPT_TOKEN_HARD_CAP = 24_000  # never invoke the LLM above this -- neutralize old tool msgs first
 
 
 class DealerState(TypedDict):
@@ -415,6 +418,65 @@ def select_option_contract(state: DealerState, cfg) -> DealerState:
     return {**state, "option_pick": pick.model_dump() if pick else None}
 
 
+def _trim_history(messages: list, hard_cap: int) -> list:
+    """Keep every message (no orphaned tool results) but blank the content of the oldest large
+    ToolMessages until estimate_tokens(messages) <= hard_cap. No-op when already under."""
+    if estimate_tokens(messages) <= hard_cap:
+        return messages
+    trimmed = list(messages)
+    for i, m in enumerate(trimmed[:-1]):  # never touch the most recent message
+        if isinstance(m, ToolMessage) and len(str(m.content)) > 200:
+            trimmed[i] = ToolMessage(
+                content="[older tool result dropped to stay within the context budget]",
+                tool_call_id=m.tool_call_id,
+            )
+            if estimate_tokens(trimmed) <= hard_cap:
+                break
+    return trimmed
+
+
+def _fallback_pick(rows: list[dict], right: str, cfg, delta_mid: float, today) -> OptionContractPick | None:
+    """Deterministic pick when the structured LLM call fails: the contract whose |delta| is closest
+    to the target-delta midpoint, among those matching right / delta window / DTE window with a
+    usable quote. Keeps options trading working when qwen3.6 flakes; the Floor Broker's risk gates
+    still run on the result."""
+    ot = cfg.options_trading
+    best = None
+    for r in rows:
+        if r.get("right") != right or r.get("delta") is None or not r.get("expiration"):
+            continue
+        d = abs(r["delta"])
+        if not (ot.target_delta_min <= d <= ot.target_delta_max):
+            continue
+        try:
+            dte = (datetime.strptime(r["expiration"], "%Y-%m-%d").date() - today).days
+        except ValueError:
+            continue
+        if not (ot.dte_min <= dte <= ot.dte_max):
+            continue
+        bid, ask = r.get("bid"), r.get("ask")
+        if not bid or not ask or ask <= 0:
+            continue
+        mid = round((bid + ask) / 2, 2)
+        if mid <= 0:
+            continue
+        key = (abs(d - delta_mid), ask - bid)
+        if best is None or key < best[0]:
+            best = (key, r, d, mid)
+    if best is None:
+        return None
+    _, r, d, mid = best
+    return OptionContractPick(
+        contract_symbol=r["symbol"],
+        strike=float(r["strike"]),
+        expiration=r["expiration"],
+        right=right,
+        delta=d,
+        premium=mid,
+        reasoning="deterministic fallback: structured LLM pick unavailable",
+    )
+
+
 async def _select_option_contract_async(state: DealerState, cfg, signal: dict) -> OptionContractPick | None:
     tools = await get_options_tools()
     tools_by_name = {t.name: t for t in tools}
@@ -432,31 +494,43 @@ async def _select_option_contract_async(state: DealerState, cfg, signal: dict) -
     agent_llm = llm.bind_tools(tools)
     right = "call" if signal["action"] == "BUY" else "put"
 
+    et = pytz.timezone("US/Eastern")
+    today = datetime.now(et).date()
+    exp_gte = (today + timedelta(days=cfg.options_trading.dte_min)).isoformat()
+    exp_lte = (today + timedelta(days=cfg.options_trading.dte_max)).isoformat()
+    delta_mid = (cfg.options_trading.target_delta_min + cfg.options_trading.target_delta_max) / 2
+
     messages = [
         SystemMessage(
             content=(
                 "You are an options contract selector for a paper-trading account. Use the "
                 "provided Alpaca tools to look up the option chain, quotes, and Greeks for the "
                 "given underlying symbol, then pick exactly one contract that fits the stated "
-                "constraints."
+                "constraints. ALWAYS call get_option_chain with type set to the desired right, "
+                "expiration_date_gte and expiration_date_lte set to the given bounds, and limit "
+                "set to 50 or fewer. Never request the full chain."
             )
         ),
         HumanMessage(
             content=(
                 f"Underlying: {state['symbol']}\n"
                 f"Desired right: {right}\n"
-                f"Days-to-expiration window: {cfg.options_trading.dte_min}-{cfg.options_trading.dte_max}\n"
-                f"Target delta window: {cfg.options_trading.target_delta_min}-{cfg.options_trading.target_delta_max}\n"
+                f"Expiration window: {exp_gte} to {exp_lte} "
+                f"(pass as expiration_date_gte / expiration_date_lte to get_option_chain)\n"
+                f"Target |delta| window: {cfg.options_trading.target_delta_min}"
+                f"-{cfg.options_trading.target_delta_max}\n"
                 f"Minimum open interest: {cfg.options_trading.min_open_interest}\n"
                 f"Minimum volume: {cfg.options_trading.min_volume}\n"
                 f"Dealer reasoning for the underlying signal: {signal['reasoning']}\n\n"
-                "Call tools as needed to find chain/quote/Greeks data, then respond with your "
-                "final pick."
+                "Call get_option_chain (filtered as instructed), inspect quotes/Greeks, then "
+                "respond with your final pick."
             )
         ),
     ]
 
+    seen_rows: list[dict] = []
     for _ in range(_MAX_TOOL_CALL_ROUNDS):
+        messages = _trim_history(messages, _OPTION_PROMPT_TOKEN_HARD_CAP)
         response = agent_llm.invoke(messages)
         messages.append(response)
         if not response.tool_calls:
@@ -464,10 +538,27 @@ async def _select_option_contract_async(state: DealerState, cfg, signal: dict) -
         for call in response.tool_calls:
             tool = tools_by_name[call["name"]]
             result = await tool.ainvoke(call["args"])
-            messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
+            raw = str(result)
+            seen_rows.extend(parse_option_chain(raw))
+            messages.append(
+                ToolMessage(
+                    content=compact_tool_result(call["name"], raw, target_delta_mid=delta_mid),
+                    tool_call_id=call["id"],
+                )
+            )
+        if estimate_tokens(messages) > _OPTION_PROMPT_TOKEN_BUDGET:
+            log(f"⚠️ option selection for {state['symbol']}: token budget reached, forcing final pick")
+            break
 
+    messages = _trim_history(messages, _OPTION_PROMPT_TOKEN_HARD_CAP)
     structured_llm = llm.with_structured_output(OptionContractPick)
-    return structured_llm.invoke(messages)
+    try:
+        pick = structured_llm.invoke(messages)
+        if pick:
+            return pick
+    except Exception as exc:  # noqa: BLE001 - any parse/transport failure falls back deterministically
+        log(f"⚠️ option selection for {state['symbol']}: structured pick failed ({exc}); using fallback")
+    return _fallback_pick(seen_rows, right, cfg, delta_mid, today)
 
 
 def _route_after_llm_call(state: DealerState, cfg) -> str:
