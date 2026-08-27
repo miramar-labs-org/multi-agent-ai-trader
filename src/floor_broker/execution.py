@@ -22,7 +22,6 @@ from src.common.alpaca_client import (
     get_current_option_ask_price,
     get_current_option_mid_price,
     trading_client,
-    trading_client2,
 )
 from src.common.config import load_config
 from src.common.logging import get_logger
@@ -36,9 +35,9 @@ ORDER_NOT_FOUND_CODE = 40410000  # Alpaca's code for "no order exists with that 
 
 _TERMINAL_NO_FILL = {OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED}
 
-# Options-only (account 2) terminal/non-terminal classification for check_pending_option_fills().
-# Deliberately NOT shared with _TERMINAL_NO_FILL (account 1's check_pending_fills() uses that one
-# and is out of scope for the options mechanism). Everything NOT in this set is terminal for
+# Options terminal/non-terminal classification for check_pending_option_fills(). Deliberately NOT
+# shared with _TERMINAL_NO_FILL (the stock/crypto check_pending_fills() uses that one and is out
+# of scope for the options mechanism). Everything NOT in this set is terminal for
 # options pending-fill purposes -- fix-loop round 2, finding 1 (remaining half): the prior
 # `!= PARTIALLY_FILLED` check correctly handled the with-fill branch but the no-fill branch's
 # `in _TERMINAL_NO_FILL` only caught CANCELED/EXPIRED/REJECTED, leaking any other zero-fill
@@ -110,10 +109,11 @@ _option_positions: dict[str, dict] = {}
 # Tracks every option BUY order buy_option() itself submitted, keyed by order id, so
 # check_pending_option_fills() can later confirm the fill and only then commit the position into
 # _option_positions and record it to the DB -- mirrors _pending_fills/check_pending_fills() for the
-# stock/crypto path, except this one polls trading_client2 (account 2, options-only) since option
-# orders never touch trading_client (account 1) and so cannot share that dict or poller. In-memory
-# only, same restart caveat as _pending_fills: an option BUY that fills in the gap between the pod
-# dying and reconstruct_tracked_state() running still produces no Slack notice for that fill.
+# stock/crypto path. It's a separate dict/poller because option fills carry the OCC contract symbol
+# and feed the synthetic option-exit mechanism, not because they're on a different account (every
+# order is on the one live account). In-memory only, same restart caveat as _pending_fills: an
+# option BUY that fills in the gap between the pod dying and reconstruct_tracked_state() running
+# still produces no Slack notice for that fill.
 _pending_option_fills: dict[str, dict] = {}
 
 # False from process start until reconcile_tracked_state_once() has succeeded at least once.
@@ -317,9 +317,10 @@ def check_pending_fills() -> list[dict]:
 def check_pending_option_fills() -> list[dict]:
     """Polls every pending option order for its own fill -- both BUY orders buy_option() itself
     submitted and, since external review finding 1, SELL orders sell_option() submitted -- mirroring
-    check_pending_fills() but against trading_client2 (account 2, options-only) -- option orders never
-    touch trading_client (account 1), so the two mechanisms cannot share one dict or one poller.
-    Entries are distinguished by ctx["action"] ("BUY" or "SELL"), each handled by its own branch below.
+    check_pending_fills(). It's a separate dict/poller because option fills carry the OCC contract
+    symbol and feed the synthetic option-exit mechanism, not because they're on a different account
+    (every order is on the one live account). Entries are distinguished by ctx["action"] ("BUY" or
+    "SELL"), each handled by its own branch below.
 
     BUY branch: _option_positions and the options_trades DB row are only written here, on a confirmed
     fill, using the real fill_price -- never in buy_option() itself, which only knows the pre-trade
@@ -367,7 +368,7 @@ def check_pending_option_fills() -> list[dict]:
     events = []
     for order_id, ctx in _pending_option_fills_snapshot():
         try:
-            order = trading_client2.get_order_by_id(order_id)
+            order = trading_client.get_order_by_id(order_id)
         except APIError as exc:
             if _is_order_not_found(exc):
                 log(f"⚠️  pending option order {order_id} ({ctx['contract_symbol']}) no longer exists on Alpaca -- dropping")
@@ -708,7 +709,7 @@ def flatten_all_options(reason: str = "power_down_flatten") -> list[dict]:
     short instead of closing it (sell_option() itself refuses this too, as defense in depth)."""
     positions = [
         p
-        for p in trading_client2.get_all_positions()
+        for p in trading_client.get_all_positions()
         if p.asset_class == AssetClass.US_OPTION and getattr(p, "side", PositionSide.LONG) == PositionSide.LONG
     ]
 
@@ -893,6 +894,11 @@ def reconcile_tracked_state_once() -> bool:
     restored_pending = 0
     restored_brackets = 0
     for order in open_orders:
+        # Option orders live on this same account now but are reconstructed separately below
+        # (into _pending_option_fills, keyed by OCC symbol) -- keep them out of the stock/crypto
+        # _pending_fills / _tracked_brackets rebuild.
+        if order.asset_class == AssetClass.US_OPTION:
+            continue
         symbol = canonical_crypto_symbol(order.symbol) if "/" in order.symbol or is_usd_crypto_symbol(order.symbol) else order.symbol
         legs = order.legs or []
         if legs:
@@ -916,24 +922,34 @@ def reconcile_tracked_state_once() -> bool:
     # this process has never observed a BUY fill for (e.g. one that predates this feature, or was
     # opened in a gap while the pod was down). Best-effort: a failure here must not block order
     # reconciliation, which is why it's wrapped separately from the get_orders() call above.
+    # One get_all_positions() call for the whole floor -- stocks, crypto and options all live on
+    # the same account now, so a single fetch feeds the crypto-stop rebuild, the position_opens
+    # backfill and the option-positions rebuild below.
     try:
-        positions = trading_client.get_all_positions()
+        all_positions = trading_client.get_all_positions()
+    except APIError as exc:
+        all_positions = None
+        log(f"💥  failed to fetch open positions from Alpaca while reconciling tracked state: {exc}")
+
+    if all_positions is not None:
         try:
-            crypto_stops_restored = _rebuild_crypto_stops_from_positions(positions, load_config())
+            crypto_stops_restored = _rebuild_crypto_stops_from_positions(all_positions, load_config())
         except Exception as exc:
             crypto_stops_restored = 0
             log(f"💥  failed to reconstruct crypto stops while reconciling tracked state: {exc}")
-        for position in positions:
+        for position in all_positions:
+            # Option contracts are tracked in _option_positions (OCC symbols), not position_opens --
+            # keep them out of the equity/crypto backfill so db.record_position_opened() never sees
+            # an OCC symbol.
+            if position.asset_class == AssetClass.US_OPTION:
+                continue
             symbol = canonical_crypto_symbol(position.symbol) if _is_crypto_position(position) else position.symbol
             db.record_position_opened(symbol)
         if crypto_stops_restored:
             log(f"🔄  reconstructed {crypto_stops_restored} crypto synthetic stop/target(s) from open positions")
-    except APIError as exc:
-        log(f"💥  failed to fetch open positions from Alpaca while backfilling position_opens: {exc}")
 
-    try:
-        option_positions = [p for p in trading_client2.get_all_positions() if p.asset_class == AssetClass.US_OPTION]
         try:
+            option_positions = [p for p in all_positions if p.asset_class == AssetClass.US_OPTION]
             open_trades = db.fetch_open_options_trades()
             options_restored = _rebuild_option_positions_from_positions(option_positions, open_trades)
         except Exception as exc:
@@ -941,16 +957,19 @@ def reconcile_tracked_state_once() -> bool:
             log(f"💥  failed to reconstruct option positions while reconciling tracked state: {exc}")
         if options_restored:
             log(f"🔄  reconstructed {options_restored} option position(s) from Alpaca + options_trades")
-    except APIError as exc:
-        log(f"💥  failed to fetch open option positions from Alpaca while reconciling tracked state: {exc}")
 
     try:
         # No side filter here (unlike the pre-fix version, which only fetched BUY) -- a Floor Broker
         # restart between sell_option() submitting a SELL and that SELL's fill would otherwise leave
         # the SELL permanently unobserved: nothing else ever re-registers it, so options_trades would
         # stay open forever even after Alpaca fills or cancels it (external review finding 1,
-        # 2026-08-26).
-        open_option_orders = trading_client2.get_orders(GetOrdersRequest(status="open"))
+        # 2026-08-26). Filter to US_OPTION -- this account also carries stock/crypto orders, which the
+        # nested get_orders() call above already reconstructs.
+        open_option_orders = [
+            o
+            for o in trading_client.get_orders(GetOrdersRequest(status="open"))
+            if o.asset_class == AssetClass.US_OPTION
+        ]
 
         # Independent of the option-positions-rebuild block above -- that block's own `open_trades`
         # is assigned inside a nested try and may be unbound if either its outer or inner try raised
@@ -1040,10 +1059,9 @@ def reconstruct_tracked_state(
     )
 
 
-def _fetch_open_position(symbol: str, client=None):
-    client = client or trading_client
+def _fetch_open_position(symbol: str):
     try:
-        return client.get_open_position(alpaca_order_symbol(symbol))
+        return trading_client.get_open_position(alpaca_order_symbol(symbol))
     except APIError:
         return None
 
@@ -1142,8 +1160,7 @@ def bracket_buy_with_SLTP(
     )
 
 
-def _buy_preflight_skip(symbol: str, cfg, client=None) -> dict | None:
-    client = client or trading_client
+def _buy_preflight_skip(symbol: str, cfg) -> dict | None:
     if not is_state_reconciled():
         log(f"🛑  BUY {symbol} rejected -- tracked state not yet reconciled with Alpaca")
         return {
@@ -1156,7 +1173,7 @@ def _buy_preflight_skip(symbol: str, cfg, client=None) -> dict | None:
         log(f"🛑  BUY kill switch active -- skipping BUY {symbol}")
         return {"status": "skipped", "reason": "buy_kill_switch_active", "detail": "BUY kill switch is active"}
 
-    account = client.get_account()
+    account = trading_client.get_account()
     daily_pnl = float(account.equity) - float(account.last_equity)
     if daily_pnl >= cfg.strategy.daily_profit_target_usd:
         log(f"🛑  daily profit target reached (${daily_pnl:.2f}) -- skipping BUY {symbol}")
@@ -1218,16 +1235,16 @@ def _risk_based_budget_cap(slP: float, cfg) -> float | None:
     return risk_usd / (1 - slP)
 
 
-def _max_concurrent_positions_skip(symbol: str, cfg, client=None) -> dict | None:
+def _max_concurrent_positions_skip(symbol: str, cfg) -> dict | None:
     """Refuses a new BUY once the number of currently-open positions is at/above
     strategy.max_concurrent_positions -- topping up a symbol that's already open doesn't add a
     new position, so it's exempt (checked via _fetch_open_position, same as
-    _remaining_budget_or_skip's own top-up check)."""
-    client = client or trading_client
-    if _fetch_open_position(symbol, client=client) is not None:
+    _remaining_budget_or_skip's own top-up check). Stocks, crypto and options all share this cap
+    now -- one account, one open-position count."""
+    if _fetch_open_position(symbol) is not None:
         return None
 
-    open_count = len(client.get_all_positions())
+    open_count = len(trading_client.get_all_positions())
     limit = cfg.strategy.max_concurrent_positions
     if open_count >= limit:
         log(f"🛑  max concurrent positions reached ({open_count}/{limit}) -- skipping new BUY {symbol}")
@@ -1508,11 +1525,11 @@ def buy_option(
 ) -> dict:
     cfg = load_config()  # fresh (within its own refresh window) so a live strategy change never needs a restart
 
-    skip = _buy_preflight_skip(contract_symbol, cfg, client=trading_client2)
+    skip = _buy_preflight_skip(contract_symbol, cfg)
     if skip is not None:
         return skip
 
-    skip = _max_concurrent_positions_skip(contract_symbol, cfg, client=trading_client2)
+    skip = _max_concurrent_positions_skip(contract_symbol, cfg)
     if skip is not None:
         return skip
 
@@ -1541,7 +1558,7 @@ def buy_option(
 
     req = MarketOrderRequest(symbol=contract_symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
     try:
-        order = trading_client2.submit_order(req)
+        order = trading_client.submit_order(req)
     except APIError as exc:
         log(f"💥  option buy order failed for {contract_symbol}: {exc}")
         return {"status": "error", "detail": str(exc)}
@@ -1605,7 +1622,7 @@ def sell_option(contract_symbol: str, reason: str = "dealer_signal") -> dict:
     canceled_buy_order_ids = []
     for buy_order_id in stale_buy_order_ids:
         try:
-            trading_client2.cancel_order_by_id(buy_order_id)
+            trading_client.cancel_order_by_id(buy_order_id)
             log(f"🛑  canceled stale pending option BUY {buy_order_id} for {contract_symbol} ahead of its SELL")
             canceled_buy_order_ids.append(buy_order_id)
         except APIError as exc:
@@ -1615,7 +1632,7 @@ def sell_option(contract_symbol: str, reason: str = "dealer_signal") -> dict:
             )
 
     try:
-        position = trading_client2.get_open_position(contract_symbol)
+        position = trading_client.get_open_position(contract_symbol)
     except APIError as exc:
         if _is_position_not_found_error(exc):
             log(f"⚠️  no open option position of {contract_symbol} to sell -- dropping tracking")
@@ -1637,7 +1654,7 @@ def sell_option(contract_symbol: str, reason: str = "dealer_signal") -> dict:
 
     req = MarketOrderRequest(symbol=contract_symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
     try:
-        order = trading_client2.submit_order(req)
+        order = trading_client.submit_order(req)
     except APIError as exc:
         log(f"💥  option sell order failed for {contract_symbol}: {exc}")
         return {"status": "error", "detail": str(exc)}

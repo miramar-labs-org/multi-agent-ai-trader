@@ -2,7 +2,7 @@ from datetime import date
 
 from alpaca.trading.requests import GetPortfolioHistoryRequest
 
-from src.common.alpaca_client import distinct_trading_clients
+from src.common.alpaca_client import trading_client
 
 
 def fetch_pl_summary(today: date, history_pl: dict[str, float] | None = None) -> dict:
@@ -25,27 +25,16 @@ def fetch_pl_summary(today: date, history_pl: dict[str, float] | None = None) ->
     `today` must be the caller's US/Eastern trading-day date (see pl_badges/main.py's
     _now_eastern()), not computed locally via date.today() here -- doing that previously
     double-counted today's own persisted history entry whenever this ran after the system/UTC
-    clock had already rolled to the next calendar day but it was still "today" in US/Eastern.
-
-    All three figures are summed across every distinct funded Alpaca account
-    (distinct_trading_clients()) so option P&L on account 2 is included once the accounts are
-    split; while they share credentials this is just the one account, unchanged. The base_value
-    YTD anchor is only used when *every* account reports one -- otherwise the whole computation
-    falls back to the persisted-history sum, since a partial base_value total would be wrong."""
-    clients = distinct_trading_clients()
-    accounts = [c.get_account() for c in clients]
-    equity = round(sum(float(a.equity) for a in accounts), 2)
-    today_pl = round(sum(float(a.equity) - float(a.last_equity) for a in accounts), 2)
+    clock had already rolled to the next calendar day but it was still "today" in US/Eastern."""
+    account = trading_client.get_account()
+    equity = float(account.equity)
+    today_pl = round(equity - float(account.last_equity), 2)
 
     year_start = date(today.year, 1, 1)
-    histories = [
-        c.get_portfolio_history(GetPortfolioHistoryRequest(start=year_start, timeframe="1D"))
-        for c in clients
-    ]
+    history = trading_client.get_portfolio_history(GetPortfolioHistoryRequest(start=year_start, timeframe="1D"))
 
-    if all(h.base_value is not None for h in histories):
-        base_total = sum(float(h.base_value) for h in histories)
-        ytd_pl = round(equity - base_total, 2)
+    if history.base_value is not None:
+        ytd_pl = round(equity - float(history.base_value), 2)
     else:
         today_key = today.isoformat()
         this_year = str(today.year)

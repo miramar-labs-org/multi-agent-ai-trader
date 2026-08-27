@@ -527,7 +527,7 @@ def call_floor_broker_option(state: DealerState, cfg) -> DealerState:
     if state["budget"] <= 0:
         # A held-only position (merge_held_positions()) carries budget=0 -- see call_floor_broker's
         # identical guard. Options never merge held-only positions today (merge_held_positions only
-        # reads account 1's stock/crypto positions), but every option_pick is a brand-new entry
+        # reads stock/crypto positions), but every option_pick is a brand-new entry
         # regardless of BUY/SELL (unlike stocks, where SELL means close) -- so this guard applies
         # unconditionally, without the action == "BUY" restriction call_floor_broker uses.
         log(f"⚠️  no authorized budget for {state['symbol']} option entry -- skipping")

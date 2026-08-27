@@ -143,8 +143,9 @@ def poll_pending_fills():
 
 def poll_pending_option_fills():
     """Runs for the lifetime of the process, watching for the fill of option BUY orders
-    buy_option() itself submitted -- mirrors poll_pending_fills() but against account 2
-    (trading_client2), via execution.check_pending_option_fills(). _option_positions and the
+    buy_option() itself submitted -- mirrors poll_pending_fills() but tracks option contracts
+    separately (by OCC symbol / synthetic exit mechanism), via
+    execution.check_pending_option_fills(). _option_positions and the
     options_trades DB row are only written on a confirmed fill (see check_pending_option_fills()'s
     docstring); an order that never fills produces no phantom tracked state or DB row."""
     while True:

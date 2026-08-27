@@ -97,12 +97,12 @@ def test_wait_until_crypto_flat_returns_false_after_timeout_when_still_open(monk
 
 
 def test_wait_until_options_flat_returns_true_immediately_when_no_option_positions(monkeypatch):
-    monkeypatch.setattr(main.trading_client2, "get_all_positions", lambda: [])
+    monkeypatch.setattr(main.trading_client, "get_all_positions", lambda: [])
     assert main._wait_until_options_flat(timeout_s=5) is True
 
 
 def test_wait_until_options_flat_returns_false_after_timeout_when_still_open(monkeypatch):
-    monkeypatch.setattr(main.trading_client2, "get_all_positions", lambda: [FakePosition(AssetClass.US_OPTION)])
+    monkeypatch.setattr(main.trading_client, "get_all_positions", lambda: [FakePosition(AssetClass.US_OPTION)])
     assert main._wait_until_options_flat(timeout_s=0) is False
 
 
@@ -111,7 +111,7 @@ def test_wait_until_options_flat_returns_true_when_only_short_position_open(monk
     before this) deliberately leaves shorts alone, since selling one would open MORE short rather
     than closing it. Mirrors the LONG-only filter in execution.py's flatten_all_options()."""
     monkeypatch.setattr(
-        main.trading_client2, "get_all_positions", lambda: [FakePosition(AssetClass.US_OPTION, side=PositionSide.SHORT)]
+        main.trading_client, "get_all_positions", lambda: [FakePosition(AssetClass.US_OPTION, side=PositionSide.SHORT)]
     )
     assert main._wait_until_options_flat(timeout_s=5) is True
 

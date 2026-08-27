@@ -1,4 +1,17 @@
+import pytest
+
 from src.analyst import sources
+
+
+@pytest.fixture(autouse=True)
+def _stub_live_account_env_names(monkeypatch):
+    """`_alpaca_headers()` -> `live_account_env_names()` -> `load_config()` would otherwise fetch
+    config.yaml from GitHub. Several tests here monkeypatch the shared `requests` module for the
+    screener API, which also intercepts that config fetch -- pin header resolution to the default
+    key pair so it never depends on the network."""
+    monkeypatch.setattr(
+        sources, "live_account_env_names", lambda: ("ALPACA_PAPER_API_KEY", "ALPACA_PAPER_API_SECRET")
+    )
 
 
 class FakeResponse:
