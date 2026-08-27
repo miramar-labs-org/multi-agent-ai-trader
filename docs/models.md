@@ -215,6 +215,47 @@ confirm `/api/ps` shows only the new model (or nothing), then
 `POST /api/generate {"model": "<new>", "keep_alive": -1}`. `power_scheduler`
 now enforces this each power-up regardless.
 
+## Incident (2026-08-27): options MCP loop drove a silent GB10 hard-hang
+
+The live option-contract-selection path (`_select_option_contract_async`,
+`src/dealer/graph.py`) runs an agentic Alpaca-MCP tool-calling loop against
+`qwen3.6:35b-a3b`. `get_option_chain` with no filters returns the full raw
+Alpaca options-snapshot JSON for a symbol; that whole blob was appended to the
+message history verbatim every round, so the prompt grew without bound
+(observed: 258,075 then 376,452 tokens; Ollama logged
+`WARN truncating input prompt limit=131074 prompt=376452`). `qwen3.6:35b-a3b`
+is a hybrid SWA/MoE model with no KV-cache prefix reuse, so every call
+reprocessed the entire prompt. Under that sustained maxed-GPU prompt-cache
+thrash the DGX hard-hung with no kernel panic, OOM-kill, Xid, thermal trip, or
+kdump -- journald just stopped. Distinct from the 2026-08-27 model-swap OOM
+above (that one left NVRM OOM traces; this one left nothing).
+
+Contributing factor: `OLLAMA_CONTEXT_LENGTH` was unset, so Ollama used its
+VRAM-based default of 262,144 (256K) tokens -- a context window large enough to
+let the runaway prompt keep growing instead of erroring early.
+
+**Fix (this repo):**
+- Tool results are compacted before entering history -- option chains are parsed,
+  ranked by proximity to the target delta, and rendered as <=40 one-line rows
+  (`compact_tool_result`, `src/dealer/option_chain.py`); non-chain results are
+  truncated to 6000 chars.
+- The tool-calling loop is token-bounded: it stops requesting tools once history
+  passes ~12k estimated tokens, and `_trim_history` neutralizes old `ToolMessage`
+  bodies before any LLM call that would exceed a 24k hard cap. Round cap stays 6.
+- The system/human prompts now instruct the model to always pass
+  `type` + `expiration_date_gte/lte` + a small `limit` to `get_option_chain`,
+  never the full chain, with the DTE window pre-computed as ISO dates.
+- Both Ollama `ChatOpenAI` clients get `timeout=llm.request_timeout_s` (default
+  120s) and `max_retries=0`, so a hung generation fails fast instead of stacking
+  behind the 10-minute poll cycle.
+- If structured output still fails, `_fallback_pick` deterministically chooses a
+  contract from the rows already seen (delta + DTE + live quote gates).
+
+**Fix (platform):** `dgx/ollama/deploy_ollama.sh` now writes a systemd drop-in
+pinning `OLLAMA_CONTEXT_LENGTH=32768` (overridable via the `Ollama Deploy`
+workflow's `context_length` input), so a single call can never ask Ollama to
+hold a 256K-token prompt again.
+
 ## Sources
 
 - [Atlas: Open-source inference engine for DGX Spark](https://forums.developer.nvidia.com/t/atlas-open-source-inference-engine-for-dgx-spark-2minute-cold-start-100-tok-s-on-qwen3-6-35b-fp8-13-supported-models/369263)
