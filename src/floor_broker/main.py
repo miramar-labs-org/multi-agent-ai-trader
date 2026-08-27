@@ -79,6 +79,7 @@ def poll_bracket_fills():
                     "SELL",
                     event["sell_result"]["status"],
                     f"synthetic {event['reason']} triggered @ {event['premium']}: {event['sell_result']['detail']}",
+                    asset_class="option",
                     reason=event["reason"],
                 )
                 db.record_floor_broker_event(
@@ -160,6 +161,7 @@ def poll_pending_option_fills():
                         action,
                         "executed",
                         f"option {action.lower()} order filled: {event['order_id']}",
+                        asset_class="option",
                         reason=reason,
                         fill_price=event["fill_price"],
                     )
@@ -177,6 +179,7 @@ def poll_pending_option_fills():
                         action,
                         "no_fill",
                         f"option order {event['order_status']}, never filled: {event['order_id']}",
+                        asset_class="option",
                         reason=reason,
                     )
                     db.record_floor_broker_event(

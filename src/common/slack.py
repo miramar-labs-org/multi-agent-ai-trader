@@ -6,10 +6,26 @@ import requests
 
 from src.common.config import load_config
 from src.common.logging import get_logger
+from src.common.symbols import is_usd_crypto_symbol
 
 log = get_logger("SLACK")
 
 _WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL2")
+
+_ASSET_ICONS = {"stock": "🏛️", "crypto": "🪙", "option": "📜"}
+
+
+def _asset_icon(symbol: str, asset_class: str | None) -> str:
+    """Asset-class marker to prefix `symbol` with in a per-trade Slack line.
+
+    `asset_class` is authoritative when given ("stock" | "crypto" | "option").
+    When None -- the stock/crypto trade path, which never deals in options --
+    stock-vs-crypto is inferred from the symbol. Inference falls back to "stock"
+    for an unknown crypto base until symbols.py's first Alpaca refresh lands.
+    """
+    if asset_class is None:
+        asset_class = "crypto" if is_usd_crypto_symbol(symbol) else "stock"
+    return _ASSET_ICONS.get(asset_class, "")
 
 
 def _timestamp() -> str:
@@ -68,9 +84,11 @@ def notify_morning_report(
     _post("\n".join(lines))
 
 
-def notify_dealer_signal(symbol: str, action: str, reasoning: str) -> None:
+def notify_dealer_signal(symbol: str, action: str, reasoning: str, *, asset_class: str | None = None) -> None:
     emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪"}.get(action, "")
-    _post(f"{emoji} *Dealer* — *{action}* {symbol} _{_timestamp()}_\n> {reasoning}")
+    icon = _asset_icon(symbol, asset_class)
+    prefix = f"{icon} " if icon else ""
+    _post(f"{emoji} *Dealer* — *{action}* {prefix}{symbol} _{_timestamp()}_\n> {reasoning}")
 
 
 def notify_floor_broker_result(
@@ -79,13 +97,16 @@ def notify_floor_broker_result(
     status: str,
     detail: str,
     *,
+    asset_class: str | None = None,
     reason: str | None = None,
     fill_price: float | None = None,
     sl_price: float | None = None,
     tp_price: float | None = None,
 ) -> None:
     emoji = {"executed": "✅", "submitted": "📨", "skipped": "⚠️"}.get(status, "❌")
-    lines = [f"{emoji} *Floor Broker* — {action} {symbol}: `{status}` — {detail} _{_timestamp()}_"]
+    icon = _asset_icon(symbol, asset_class)
+    prefix = f"{icon} " if icon else ""
+    lines = [f"{emoji} *Floor Broker* — {action} {prefix}{symbol}: `{status}` — {detail} _{_timestamp()}_"]
 
     details = []
     if reason is not None:
