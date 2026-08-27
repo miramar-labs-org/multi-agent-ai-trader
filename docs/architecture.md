@@ -158,8 +158,13 @@ llm = ChatOpenAI(
     api_key="not-needed",
     model=cfg.llm.model,
     temperature=cfg.llm.temperature,
+    timeout=_llm_timeout(cfg),   # cfg.llm.request_timeout_s (default 120) — per-request wall-clock ceiling
+    max_retries=0,               # a hung generation must fail fast, not retry into the same slow Ollama host
 ).with_structured_output(PortfolioSelection)
 ```
+The `timeout` / `max_retries=0` pair mirrors the Dealer's `llm_call` (see the GB10 silent-hang
+incident): the Analyst CronJob shares the DGX Ollama host, so a hung structured-output call must
+fail on a wall-clock ceiling rather than pin the pod and an Ollama slot indefinitely.
 The system prompt instructs the model to pick at most `max_universe_size` (10) symbols from
 the candidates/research, each with a `budget` (default `default_budget`=5000), an
 `indicators` list (default `[rsi, macd, vwap, bbands, sma, ema]`), and a rationale. Output is
@@ -803,9 +808,12 @@ same `is_stock_market_open()` calendar check `eod_report.main()` uses.
   no bundled fallback config genuinely cannot run without one. Long-running processes (Dealer's
   poll loop, Floor Broker's HTTP handlers, Slack's `_post()`) call `load_config()` fresh at each
   point of use rather than caching the returned object themselves — see `src/dealer/main.py`'s
-  per-iteration reload, `src/dealer/graph.py`'s per-node-invocation reload, and
-  `src/floor_broker/execution.py::buy()`'s per-call reload. One-shot processes (Analyst, EOD
-  Report, Backtest) call it once per invocation, which is already as fresh as this can make them.
+  per-iteration reload, `src/dealer/graph.py`'s and `src/analyst/graph.py`'s per-node-invocation
+  reload, and `src/floor_broker/execution.py::buy()`'s per-call reload. One-shot processes (Analyst,
+  EOD Report, Backtest) call it once per invocation, which is already as fresh as this can make
+  them — the Analyst graph still reloads per node (rather than closing over one object captured in
+  `build_graph()`) so it matches the Dealer pattern and a long midday run would honor a mid-run
+  config change.
 - **`portfolio_state.py`** — `read_portfolio()`/`write_portfolio()` against the k8s
   `portfolio` ConfigMap via the `kubernetes` Python client. This is the entire
   Analyst↔Dealer interface. `merge_held_positions()` additionally folds any Alpaca position

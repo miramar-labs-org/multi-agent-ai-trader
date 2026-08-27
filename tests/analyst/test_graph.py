@@ -819,6 +819,65 @@ def test_llm_select_prompt_includes_pnl_text(monkeypatch):
     assert "- MGN: qty 3, avg entry $45.00, current $50.00, unrealized +$15.00 (+11.11%)" in user_content
 
 
+def test_llm_select_sets_request_timeout_and_no_retries(monkeypatch):
+    """The Analyst shares the DGX Ollama host with the Dealer; a hung structured-output call must
+    fail on a per-request wall-clock ceiling and not retry into it -- same as the Dealer's
+    llm_call (see the GB10 silent-hang incident)."""
+    captured = {}
+
+    def _capture_chat_openai(**kwargs):
+        captured.update(kwargs)
+        return FakeLLM({})
+
+    monkeypatch.setattr(graph, "ChatOpenAI", _capture_chat_openai)
+    cfg = OmegaConf.create(
+        {
+            "analyst": {
+                "max_universe_size": 10,
+                "default_budget": 5000,
+                "indicator_fetch_limit": 15,
+                "track_record_days": 5,
+            },
+            "llm": {"base_url": "http://x", "model": "m", "temperature": 0.1, "request_timeout_s": 90},
+        }
+    )
+    state = {
+        "raw_candidates": [{"symbol": "MGN", "market": "stocks"}],
+        "research_text": "",
+        "indicator_text": "",
+        "track_record_text": "",
+        "pnl_text": "",
+        "selection": None,
+    }
+
+    graph.llm_select(state, cfg)
+
+    assert captured["timeout"] == 90.0
+    assert captured["max_retries"] == 0
+
+
+def test_analyst_llm_timeout_defaults_to_120_when_unset():
+    cfg = OmegaConf.create({"llm": {"base_url": "http://x", "model": "m", "temperature": 0.1}})
+    assert graph._llm_timeout(cfg) == 120.0
+
+
+def test_build_graph_does_not_capture_config_at_build_time(monkeypatch):
+    """Every node must read config per-invocation (like the Dealer/Floor Broker hot paths), so a
+    mid-run config change to analyst.news / analyst.indicators / etc. is honored rather than
+    frozen at build_graph() time."""
+    calls = []
+
+    def _tracked_load_config():
+        calls.append(1)
+        return OmegaConf.create({})
+
+    monkeypatch.setattr(graph, "load_config", _tracked_load_config)
+
+    graph.build_graph()
+
+    assert calls == []
+
+
 def _track_record_cfg(track_record_days, enable_track_record=True):
     return OmegaConf.create(
         {"analyst": {"track_record_days": track_record_days, "track_record": {"enabled": enable_track_record}}}

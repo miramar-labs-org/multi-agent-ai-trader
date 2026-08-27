@@ -311,12 +311,21 @@ def fetch_position_pnl(state: AnalystState, cfg) -> AnalystState:
     return {**state, "pnl_text": "\n".join(lines)}
 
 
+def _llm_timeout(cfg) -> float:
+    """Per-request wall-clock ceiling for the Analyst's Ollama call. It shares the DGX Ollama host
+    with the Dealer, so a hung generation must fail fast rather than pin the CronJob pod (and an
+    Ollama slot) indefinitely. Mirrors src/dealer/graph.py's _llm_timeout."""
+    return float(cfg.llm.get("request_timeout_s", 120))
+
+
 def llm_select(state: AnalystState, cfg) -> AnalystState:
     llm = ChatOpenAI(
         base_url=cfg.llm.base_url,
         api_key="not-needed",
         model=cfg.llm.model,
         temperature=cfg.llm.temperature,
+        timeout=_llm_timeout(cfg),
+        max_retries=0,
     ).with_structured_output(PortfolioSelection)
 
     system_prompt = (
@@ -451,18 +460,19 @@ def crypto_eod_report(state: AnalystState, cfg) -> AnalystState:
 
 
 def build_graph():
-    cfg = load_config()
-
+    # Each lambda calls load_config() fresh at invocation time (once per node per graph run) so a
+    # config-only change (disabling analyst.news, analyst.indicators, analyst.track_record, ...) is
+    # honored within load_config()'s refresh window, matching the Dealer / Floor Broker hot paths.
     graph = StateGraph(AnalystState)
-    graph.add_node("discover_candidates", lambda state: discover_candidates(state, cfg))
-    graph.add_node("fetch_research", lambda state: fetch_research(state, cfg))
-    graph.add_node("fetch_indicators", lambda state: fetch_indicators(state, cfg))
-    graph.add_node("fetch_track_record", lambda state: fetch_track_record(state, cfg))
-    graph.add_node("fetch_position_pnl", lambda state: fetch_position_pnl(state, cfg))
-    graph.add_node("llm_select", lambda state: llm_select(state, cfg))
-    graph.add_node("validate_selection", lambda state: validate_selection(state, cfg))
-    graph.add_node("write_portfolio", lambda state: write_portfolio(state, cfg))
-    graph.add_node("crypto_eod_report", lambda state: crypto_eod_report(state, cfg))
+    graph.add_node("discover_candidates", lambda state: discover_candidates(state, load_config()))
+    graph.add_node("fetch_research", lambda state: fetch_research(state, load_config()))
+    graph.add_node("fetch_indicators", lambda state: fetch_indicators(state, load_config()))
+    graph.add_node("fetch_track_record", lambda state: fetch_track_record(state, load_config()))
+    graph.add_node("fetch_position_pnl", lambda state: fetch_position_pnl(state, load_config()))
+    graph.add_node("llm_select", lambda state: llm_select(state, load_config()))
+    graph.add_node("validate_selection", lambda state: validate_selection(state, load_config()))
+    graph.add_node("write_portfolio", lambda state: write_portfolio(state, load_config()))
+    graph.add_node("crypto_eod_report", lambda state: crypto_eod_report(state, load_config()))
 
     graph.set_entry_point("discover_candidates")
     graph.add_edge("discover_candidates", "fetch_research")
