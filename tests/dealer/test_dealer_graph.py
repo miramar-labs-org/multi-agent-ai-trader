@@ -220,6 +220,72 @@ def test_select_option_contract_returns_pick_dict(monkeypatch):
     assert result["option_pick"]["right"] == "call"
 
 
+def test_select_option_contract_async_passes_api_key_and_needs_no_openai_env(monkeypatch):
+    """Regression: _select_option_contract_async built ChatOpenAI without api_key, so it fell back
+    to demanding OPENAI_API_KEY from the env and every real contract selection died with "Missing
+    credentials" before a single tool call. It must pass the same "not-needed" sentinel llm_call()
+    uses -- the local model router does no auth -- and work with OPENAI_API_KEY absent."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    captured = {}
+
+    async def _fake_get_options_tools():
+        return []
+
+    class _Resp:
+        tool_calls = []
+
+    class _Bound:
+        def invoke(self, messages):
+            return _Resp()
+
+    class _Structured:
+        def invoke(self, messages):
+            return graph.OptionContractPick(
+                contract_symbol="AAPL250117C00200000",
+                strike=200.0,
+                expiration="2025-01-17",
+                right="call",
+                delta=0.45,
+                premium=3.20,
+                reasoning="within window",
+            )
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def bind_tools(self, tools):
+            return _Bound()
+
+        def with_structured_output(self, schema):
+            return _Structured()
+
+    monkeypatch.setattr(graph, "get_options_tools", _fake_get_options_tools)
+    monkeypatch.setattr(graph, "ChatOpenAI", FakeChatOpenAI)
+
+    cfg = OmegaConf.create(
+        {
+            "llm": {"base_url": "http://llm.test/v1", "model": "test-model", "temperature": 0.0},
+            "strategy": {"min_confidence": 0.6},
+            "options_trading": {
+                "enabled": True,
+                "dte_min": 14,
+                "dte_max": 45,
+                "target_delta_min": 0.30,
+                "target_delta_max": 0.60,
+                "min_open_interest": 100,
+                "min_volume": 10,
+            },
+        }
+    )
+    state = {**_state("rsi: 71.2"), "signal": {"action": "BUY", "confidence": 0.9, "reasoning": "r"}}
+
+    pick = graph.select_option_contract(state, cfg)
+
+    assert pick["option_pick"]["contract_symbol"] == "AAPL250117C00200000"
+    assert captured.get("api_key")
+
+
 def _option_cfg(**overrides):
     base = {
         "floor_broker": {"base_url": "http://floor-broker.test:8000"},
