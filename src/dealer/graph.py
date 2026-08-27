@@ -1,6 +1,6 @@
 import asyncio
 from datetime import datetime, timedelta
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 import pytz
 import requests
@@ -36,6 +36,10 @@ class DealerState(TypedDict):
     ohlcv_features_text: str
     signal: dict | None
     option_pick: dict | None
+    # Set by select_option_contract() when it declines to pick a contract for a reason the next
+    # node should report verbatim (currently {"reason": "low_confidence", "detail": ...}). Absent
+    # for a genuine selection failure, which call_floor_broker_option() reports as no_option_pick.
+    option_skip: NotRequired[dict | None]
     execution_result: dict | None
 
 
@@ -408,8 +412,25 @@ def select_option_contract(state: DealerState, cfg) -> DealerState:
         return {**state, "option_pick": None}
 
     signal = state["signal"]
-    if signal["action"] == "HOLD" or signal.get("confidence", 1.0) < cfg.strategy.min_confidence:
+    if signal["action"] == "HOLD":
+        # Defense in depth -- _route_after_llm_call() already sends HOLD to the stock path.
         return {**state, "option_pick": None}
+
+    confidence = signal.get("confidence", 1.0)
+    if confidence < cfg.strategy.min_confidence:
+        # Stash the real reason: call_floor_broker_option() would otherwise report a bare
+        # no_option_pick, losing the low-confidence explanation the stock path records.
+        return {
+            **state,
+            "option_pick": None,
+            "option_skip": {
+                "reason": "low_confidence",
+                "detail": (
+                    f"{signal['action']} confidence {confidence:.2f} below minimum "
+                    f"{cfg.strategy.min_confidence}"
+                ),
+            },
+        }
 
     try:
         pick = asyncio.run(_select_option_contract_async(state, cfg, signal))
@@ -649,7 +670,14 @@ def _reconcile_structured_pick(
 
 
 def _route_after_llm_call(state: DealerState, cfg) -> str:
-    if state["exchange"] == "stocks" and cfg.get("options_trading", {}).get("enabled", False):
+    # A HOLD has no contract to pick -- routing it through the option branch only no-ops in
+    # select_option_contract() and then mislabels the Dealer Slack line as an option signal for a
+    # non-trade. The stock path's HOLD skip is identical regardless of asset class, so send it there.
+    if (
+        state["exchange"] == "stocks"
+        and cfg.get("options_trading", {}).get("enabled", False)
+        and (state.get("signal") or {}).get("action") != "HOLD"
+    ):
         return "select_option_contract"
     return "call_floor_broker"
 
@@ -696,6 +724,20 @@ def call_floor_broker_option(state: DealerState, cfg) -> DealerState:
     )
 
     if not option_pick:
+        skip = state.get("option_skip")
+        if skip and skip.get("reason") == "low_confidence":
+            # Mirror the stock path's low-confidence bookkeeping: one auditable floor_broker_event
+            # "skip" row and a matching execution_result reason. No extra Slack line -- the dealer
+            # signal above already announced the sub-threshold call.
+            db.record_floor_broker_event(state["symbol"], "skip", skip["detail"])
+            return {
+                **state,
+                "execution_result": {
+                    "status": "skipped",
+                    "reason": "low_confidence",
+                    "detail": skip["detail"],
+                },
+            }
         return {**state, "execution_result": {"status": "skipped", "reason": "no_option_pick", "detail": "no option contract was selected"}}
 
     blackout_label = _macro_blackout_active(cfg)

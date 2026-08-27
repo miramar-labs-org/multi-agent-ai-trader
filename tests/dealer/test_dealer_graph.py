@@ -196,6 +196,27 @@ def test_select_option_contract_is_noop_on_hold(monkeypatch):
     result = graph.select_option_contract(state, cfg)
 
     assert result["option_pick"] is None
+    assert result.get("option_skip") is None  # HOLD is routed away before this node; no skip reason
+
+
+def test_select_option_contract_records_low_confidence_skip_reason(monkeypatch):
+    """A sub-min_confidence BUY/SELL still reaches this node (only HOLD is routed away). The node
+    must stash the real reason so call_floor_broker_option() can report low_confidence instead of a
+    bare no_option_pick -- matching what the stock path records."""
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("a low-confidence signal must not trigger option contract search")
+
+    monkeypatch.setattr(graph, "_select_option_contract_async", _fail_if_called)
+    cfg = OmegaConf.create(
+        {"options_trading": {"enabled": True}, "strategy": {"min_confidence": 0.6}}
+    )
+    state = {**_state("rsi: 71.2"), "signal": {"action": "BUY", "confidence": 0.4, "reasoning": "r"}}
+
+    result = graph.select_option_contract(state, cfg)
+
+    assert result["option_pick"] is None
+    assert result["option_skip"]["reason"] == "low_confidence"
+    assert result["option_skip"]["detail"] == "BUY confidence 0.40 below minimum 0.6"
 
 
 def test_select_option_contract_returns_pick_dict(monkeypatch):
@@ -1105,6 +1126,37 @@ def _fail_if_exposure_checked(cfg, sym):
     raise AssertionError("exposure check must be skipped when there is no option_pick")
 
 
+def test_call_floor_broker_option_reports_low_confidence_skip(monkeypatch):
+    """When select_option_contract() declined for low confidence, this node records a single
+    auditable floor_broker_event "skip" row and a low_confidence execution_result -- mirroring the
+    stock path's bookkeeping -- but emits no extra Floor Broker Slack line (the dealer signal above
+    already announced the sub-threshold call)."""
+    signals, events = [], []
+    monkeypatch.setattr(graph.slack, "notify_dealer_signal", lambda *a, **k: signals.append(a))
+    monkeypatch.setattr(graph.db, "record_dealer_decision", lambda *a, **k: None)
+    monkeypatch.setattr(graph.db, "record_floor_broker_event", lambda *a, **k: events.append(a))
+    monkeypatch.setattr(graph, "_option_contract_already_exposed", _fail_if_exposure_checked)
+
+    def _no_slack(*a, **k):
+        raise AssertionError("a low-confidence option skip must not post a Floor Broker line")
+
+    monkeypatch.setattr(graph.slack, "notify_floor_broker_result", _no_slack)
+
+    state = {
+        **_state("rsi: 71.2"),
+        "signal": {"action": "BUY", "confidence": 0.4, "reasoning": "r"},
+        "option_pick": None,
+        "option_skip": {"reason": "low_confidence", "detail": "BUY confidence 0.40 below minimum 0.6"},
+    }
+    result = graph.call_floor_broker_option(state, _option_cfg())
+
+    assert result["execution_result"]["status"] == "skipped"
+    assert result["execution_result"]["reason"] == "low_confidence"
+    assert result["execution_result"]["detail"] == "BUY confidence 0.40 below minimum 0.6"
+    assert signals == [("CRV/USD", "BUY", "r")]
+    assert events == [("CRV/USD", "skip", "BUY confidence 0.40 below minimum 0.6")]
+
+
 def test_option_contract_already_exposed_returns_false_on_request_exception(monkeypatch, real_option_exposure):
     def _get_boom(url, timeout):
         raise graph.requests.RequestException("connection refused")
@@ -1306,12 +1358,14 @@ def test_call_floor_broker_option_skips_when_risk_per_trade_usd_not_configured(m
 
 def test_route_after_llm_call_selects_option_branch_when_enabled():
     cfg = OmegaConf.create({"options_trading": {"enabled": True}})
-    assert graph._route_after_llm_call({"exchange": "stocks"}, cfg) == "select_option_contract"
+    state = {"exchange": "stocks", "signal": {"action": "BUY"}}
+    assert graph._route_after_llm_call(state, cfg) == "select_option_contract"
 
 
 def test_route_after_llm_call_selects_stock_branch_when_disabled():
     cfg = OmegaConf.create({"options_trading": {"enabled": False}})
-    assert graph._route_after_llm_call({"exchange": "stocks"}, cfg) == "call_floor_broker"
+    state = {"exchange": "stocks", "signal": {"action": "BUY"}}
+    assert graph._route_after_llm_call(state, cfg) == "call_floor_broker"
 
 
 def test_route_after_llm_call_stays_on_stock_branch_for_crypto_even_when_enabled():
@@ -1320,4 +1374,15 @@ def test_route_after_llm_call_stays_on_stock_branch_for_crypto_even_when_enabled
     unreachable in the planned go-live config -- this is a defense-in-depth check on the routing
     function itself."""
     cfg = OmegaConf.create({"options_trading": {"enabled": True}})
-    assert graph._route_after_llm_call({"exchange": "binance"}, cfg) == "call_floor_broker"
+    state = {"exchange": "binance", "signal": {"action": "BUY"}}
+    assert graph._route_after_llm_call(state, cfg) == "call_floor_broker"
+
+
+def test_route_after_llm_call_sends_hold_to_stock_branch_even_with_options_enabled():
+    """A HOLD carries no contract to pick. Routing it through the option branch only produces a
+    no-op in select_option_contract() and then an option-tagged Dealer Slack line for a non-trade.
+    The stock path's HOLD skip semantics are identical regardless of asset class, so HOLD must go
+    straight there."""
+    cfg = OmegaConf.create({"options_trading": {"enabled": True}})
+    state = {"exchange": "stocks", "signal": {"action": "HOLD"}}
+    assert graph._route_after_llm_call(state, cfg) == "call_floor_broker"

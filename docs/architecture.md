@@ -244,8 +244,8 @@ distinguishable from Slack alone.
 | `skip_missing_indicators` | terminal fallback when `fetch_indicators` comes back empty (TAAPI 200 with no data — typically too few historical bars for a thinly-traded pair): records a `HOLD` decision and skips the cycle rather than sending an empty indicator block to the LLM (which otherwise improvises a "please provide indicators" HOLD) |
 | `fetch_market_data` | gated by `ohlcv_enrichment.enabled` — for stock entries only (`exchange == "stocks"`), fetches Alpaca OHLCV bars at the configured timeframes (`5m`, `1h`, `1d` by default) via `src.common.bars.fetch_multi_timeframe_bars`, computes derived market-structure features (`src.dealer.features`), and formats a compact prompt block. Crypto entries skip this node cleanly and keep the indicator-only path |
 | `llm_call` | the decision LLM call — see below. It receives TAAPI indicators first, optional OHLCV-derived context second, and, when `strategy.dealer_memory.enabled` is true, recent same-symbol Dealer decisions and Floor Broker events from Postgres as the final prompt context |
-| `select_option_contract` | **only reached when `options_trading.enabled` and `exchange == "stocks"`** — an MCP-backed tool-calling agent that turns the underlying signal into one option contract. See [Options trading](#options-trading--mcp-backed-contract-selection) below |
-| `call_floor_broker` | HTTP `POST /execute` to Floor Broker if action != HOLD; a BUY is additionally refused locally (never forwarded) by macro blackout, same-symbol stop cooldown, win-rate throttle, confidence, or authorized-budget gates — see [Risk controls](#risk-controls-and-failure-handling). Reached for crypto always, and for stocks only when options trading is off |
+| `select_option_contract` | **only reached when `options_trading.enabled`, `exchange == "stocks"`, and `action != HOLD`** — an MCP-backed tool-calling agent that turns the underlying signal into one option contract. See [Options trading](#options-trading--mcp-backed-contract-selection) below |
+| `call_floor_broker` | HTTP `POST /execute` to Floor Broker if action != HOLD; a BUY is additionally refused locally (never forwarded) by macro blackout, same-symbol stop cooldown, win-rate throttle, confidence, or authorized-budget gates — see [Risk controls](#risk-controls-and-failure-handling). Reached for crypto always, and for stocks either when options trading is off or the signal is HOLD |
 | `call_floor_broker_option` | HTTP `POST /execute-option` to Floor Broker with the selected contract. Applies the same macro-blackout / symbol-stop-cooldown / win-rate-throttle / budget gates as `call_floor_broker`, plus a re-validation of the LLM's pick against the config DTE and delta windows, then sizes the order (`risk_per_trade_usd // (premium * 100)` contracts) |
 
 ```mermaid
@@ -254,7 +254,7 @@ flowchart TD
     B -- no --> E[skip_missing_indicators]
     B -- yes --> C[fetch_market_data]
     C --> D[llm_call]
-    D --> H{stocks + options_trading.enabled?}
+    D --> H{stocks + options_trading.enabled + action != HOLD?}
     H -- no --> F[call_floor_broker]
     H -- yes --> I[select_option_contract]
     I --> J[call_floor_broker_option]
@@ -314,12 +314,22 @@ original 4 positional arguments, so those optional fields simply render as absen
 ### Options trading — MCP-backed contract selection
 
 Gated by `options_trading.enabled` (`config.yaml`, currently **on**). When enabled, the Dealer's
-graph routes **every stock signal** — not crypto — through `select_option_contract` →
+graph routes stock **BUY/SELL signals** — not crypto — through `select_option_contract` →
 `call_floor_broker_option` instead of `call_floor_broker`; the plain equity bracket-order path is
-only used for stocks when this flag is off. The Dealer's own `Signal` LLM call is unchanged: it
-still decides BUY/SELL/HOLD on the *underlying*, and that direction maps to
-`right = "call" if action == "BUY" else "put"` (a bearish SELL becomes a long put, never a short
-position). `HOLD`, or confidence below `strategy.min_confidence`, produces no contract.
+used for stocks when this flag is off, and for **stock HOLD signals always** — `_route_after_llm_call`
+sends HOLD straight to `call_floor_broker` so it gets the same `{"status": "skipped", "detail": "HOLD"}`
+skip and stock-tagged Dealer Slack line it would with options off, rather than a no-op trip through
+the option branch. The Dealer's own `Signal` LLM call is unchanged: it still decides BUY/SELL/HOLD on
+the *underlying*, and that direction maps to `right = "call" if action == "BUY" else "put"` (a bearish
+SELL becomes a long put, never a short position).
+
+A BUY/SELL whose confidence is below `strategy.min_confidence` still reaches `select_option_contract`
+(only HOLD is routed away): it returns no contract and stashes `option_skip = {"reason":
+"low_confidence", "detail": ...}` in state, so `call_floor_broker_option` records a `low_confidence`
+`floor_broker_event` "skip" row and `execution_result` reason — matching the stock path — instead of
+a bare `no_option_pick`. It emits no extra Floor Broker Slack line; the Dealer signal already
+announced the sub-threshold call. A genuine selection failure (chain fetch/parse error, no row in
+the windows) has no `option_skip` and is still reported as `no_option_pick`.
 
 **Contract selector** (`_select_option_contract_async`, `src/dealer/graph.py`) — a LangChain
 tool-calling loop (≤ `_MAX_TOOL_CALL_ROUNDS` = 6 rounds) using the same `cfg.llm` model as the
@@ -372,7 +382,9 @@ trust the LLM's copy of the constraints:
   would otherwise be re-picked identically and re-announced every ~10-minute poll cycle for the
   life of the position. A failed/non-200 exposure check just proceeds; `buy_option()` enforces the
   same rule authoritatively. A failed *selection* (no `option_pick`) skips this check and still
-  emits the dealer signal.
+  emits the dealer signal, then reports its reason: `low_confidence` (with a `floor_broker_event`
+  "skip" row, from `state["option_skip"]` set by `select_option_contract`) when confidence was
+  below `strategy.min_confidence`, otherwise `no_option_pick` for a genuine chain-selection failure.
 - All the same entry gates as `call_floor_broker` apply, and unconditionally (unlike the stock
   path where they only guard `action == "BUY"`): macro blackout, same-symbol stop cooldown,
   win-rate throttle, `budget > 0`. Every option entry — call *or* put — is a brand-new position;
