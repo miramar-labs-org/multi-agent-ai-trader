@@ -5,8 +5,12 @@ import pytz
 import requests
 
 from src.common import db, slack
-from src.common.alpaca_client import trading_client
-from src.common.eod import fetch_fills, summarize_positions
+from src.common.eod import (
+    fetch_all_fills,
+    fetch_all_positions,
+    fetch_combined_account_summary,
+    summarize_positions,
+)
 from src.common.logging import get_logger
 from src.common.market_calendar import get_stock_market_close
 
@@ -68,20 +72,14 @@ def main():
         return
 
     try:
-        account = trading_client.get_account()
-        positions = trading_client.get_all_positions()
-        fills = fetch_fills(today.isoformat())
+        account_summary = fetch_combined_account_summary()
+        positions = fetch_all_positions()
+        fills = fetch_all_fills(today.isoformat())
     except Exception as exc:
         log(f"💥 EOD report failed: {exc}")
         slack.notify_error("EOD", str(exc))
         raise
 
-    account_summary = {
-        "equity": float(account.equity),
-        "last_equity": float(account.last_equity),
-        "cash": float(account.cash),
-        "buying_power": float(account.buying_power),
-    }
     position_summaries = summarize_positions(positions)
 
     slack.notify_eod_report(today.isoformat(), account_summary, fills, position_summaries)

@@ -636,11 +636,15 @@ Alpaca.
    always visibly reported, not silent.
 3. If today is a trading day but the official close+30min has not passed yet, exits silently so
    an earlier check slot does not post prematurely.
-4. `trading_client.get_account()` — equity, cash, buying power, and `last_equity` (prior close)
-   to compute the day's P&L.
-5. `trading_client.get_all_positions()` — current open positions and their unrealized P&L.
-6. `src.common.eod.fetch_fills(today)` — a raw REST call under the hood (no dedicated `alpaca-py`
-   method exists for `/account/activities`) for every fill executed that day, across all assets.
+4. `src.common.eod.fetch_combined_account_summary()` — equity, cash, buying power, and
+   `last_equity` (prior close) to compute the day's P&L, summed across every distinct funded
+   account (`alpaca_client.distinct_trading_clients()` — one client while account 1/2 share
+   credentials, two once split, so the shared account is never double-counted).
+5. `src.common.eod.fetch_all_positions()` — current open positions and their unrealized P&L,
+   across every distinct account (so account 2's option positions are included).
+6. `src.common.eod.fetch_all_fills(today)` — a raw REST call under the hood (no dedicated
+   `alpaca-py` method exists for `/account/activities`) for every fill executed that day, across
+   all assets and every distinct account.
 7. `slack.notify_eod_report(...)` formats and posts all of the above as one message, then records
    the best-effort run marker to prevent later check slots from duplicating it.
 
@@ -800,11 +804,16 @@ same `is_stock_market_open()` calendar check `eod_report.main()` uses.
 - **`db.py`** — Postgres persistence for Analyst picks, Dealer decisions, and Floor Broker
   execution events, added in v0.6.0. See [Persistence](#persistence) for the schema and write
   contract.
-- **`eod.py`** — `fetch_fills(date, only_crypto=None)` / `summarize_positions(positions,
+- **`eod.py`** — `fetch_fills(date, only_crypto=None, client=None)` / `summarize_positions(positions,
   only_crypto=None)` shape Alpaca's raw position/activity objects into the plain dicts
   `slack.notify_eod_report`/`notify_crypto_eod_report` expect. Shared by the stock EOD Report (no
   filter — every asset) and the Analyst's crypto EOD node (`only_crypto=True`) so the fetch/shape
-  logic isn't duplicated. The two functions filter differently because Alpaca's own API is
+  logic isn't duplicated. The stock EOD Report goes through the `fetch_all_fills` /
+  `fetch_all_positions` / `fetch_combined_account_summary` wrappers, which run the same fetch
+  against each client from `alpaca_client.distinct_trading_clients()` and concatenate/sum — one
+  client while account 1 and account 2 share an API key (today's default), two once config splits
+  them, so option activity on account 2 lands in the recap without double-counting the shared
+  account. The two functions filter differently because Alpaca's own API is
   internally inconsistent: `fetch_fills` filters on `"/" in symbol` since `/account/activities`
   fill records are always slash-formatted (e.g. `"BTC/USD"`), but `summarize_positions` filters on
   `p.asset_class == AssetClass.CRYPTO` since live `Position.symbol` for crypto has **no** slash

@@ -305,5 +305,6 @@ its output reliably machine-usable.
   multi-leg structures, and nothing that sells premium. The Analyst is also not options-aware: it
   still screens and picks the same stock universe, and the options layer just re-expresses those
   picks as long contracts.
-- The end-of-day Slack recap and the README P/L badges read the stock/crypto account only, so
-  options profit and loss on the second account is not yet reflected there.
+- The end-of-day Slack recap and the README P/L badges now aggregate both Alpaca accounts, so
+  option P&L on the second account is reflected there. The Analyst's own mid-day position-P&L
+  note still reads the stock/crypto account only.

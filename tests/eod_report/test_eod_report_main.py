@@ -101,8 +101,7 @@ def test_market_closed_posts_notification_and_skips_report(monkeypatch):
 
 def test_open_market_sends_full_eod_report(monkeypatch):
     fake_client = FakeTradingClient(activities=[])
-    monkeypatch.setattr(main, "trading_client", fake_client)
-    monkeypatch.setattr(eod, "trading_client", fake_client)
+    monkeypatch.setattr(eod, "distinct_trading_clients", lambda: [fake_client])
     monkeypatch.setattr(main, "_trigger_pl_badges_workflow", lambda: None)
     close = _close_at(16)
     _set_now(monkeypatch, close + timedelta(minutes=30))
@@ -147,8 +146,7 @@ def test_open_market_skips_until_thirty_minutes_after_close(monkeypatch):
 
 def test_eod_report_sends_at_early_close_plus_thirty(monkeypatch):
     fake_client = FakeTradingClient(activities=[])
-    monkeypatch.setattr(main, "trading_client", fake_client)
-    monkeypatch.setattr(eod, "trading_client", fake_client)
+    monkeypatch.setattr(eod, "distinct_trading_clients", lambda: [fake_client])
     monkeypatch.setattr(main, "_trigger_pl_badges_workflow", lambda: None)
     close = _close_at(13)
     _set_now(monkeypatch, close + timedelta(minutes=30))
@@ -187,7 +185,7 @@ def test_alpaca_failure_notifies_error_and_reraises(monkeypatch):
             raise RuntimeError("alpaca unavailable")
 
     fake_client = FailingTradingClient()
-    monkeypatch.setattr(main, "trading_client", fake_client)
+    monkeypatch.setattr(eod, "distinct_trading_clients", lambda: [fake_client])
     monkeypatch.setattr(
         main,
         "_trigger_pl_badges_workflow",
@@ -212,8 +210,7 @@ def test_alpaca_failure_notifies_error_and_reraises(monkeypatch):
 
 def test_successful_eod_dispatches_pl_badges_workflow(monkeypatch):
     fake_client = FakeTradingClient(activities=[])
-    monkeypatch.setattr(main, "trading_client", fake_client)
-    monkeypatch.setattr(eod, "trading_client", fake_client)
+    monkeypatch.setattr(eod, "distinct_trading_clients", lambda: [fake_client])
     monkeypatch.setenv("GITHUB_WORKFLOW_TOKEN", "token-123")
     monkeypatch.setenv("GITHUB_REPOSITORY", "miramar-labs-org/multi-agent-ai-trader")
     close = _close_at(16)

@@ -1160,10 +1160,11 @@ live: `44d87e9`. Tests: `tests/dealer/test_mcp_options.py`, `tests/dealer/test_d
 `test_app.py` / `test_floor_broker_main.py`, `tests/common/test_db.py`,
 `tests/power_scheduler/test_power_scheduler_main.py`.
 
-**Known gaps (not blockers).** The EOD Report (`src/common/eod.py`) and README P/L badges
-(`src/pl_badges/`) read account 1 only, so option P&L on account 2 isn't yet reflected there. The
-backtesting harness has no options support. Options are buy-only single legs — no spreads, no
-premium selling.
+**Known gaps (not blockers).** The backtesting harness has no options support. Options are
+buy-only single legs — no spreads, no premium selling. The Analyst's mid-day position-P&L note
+still reads account 1 only (the EOD Report and README P/L badges now aggregate both accounts via
+`alpaca_client.distinct_trading_clients()` — one client while the accounts share credentials, two
+once split, so no double-counting).
 
 ---
 

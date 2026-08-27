@@ -28,7 +28,7 @@ class FakeTradingClient:
 
 def test_fetch_pl_summary_computes_today_and_ytd_pl(monkeypatch):
     fake_client = FakeTradingClient(equity="1050.00", last_equity="1000.00", base_value="900.00")
-    monkeypatch.setattr(pl_badges, "trading_client", fake_client)
+    monkeypatch.setattr(pl_badges, "distinct_trading_clients", lambda: [fake_client])
 
     summary = pl_badges.fetch_pl_summary(date(2026, 8, 13))
 
@@ -37,7 +37,7 @@ def test_fetch_pl_summary_computes_today_and_ytd_pl(monkeypatch):
 
 def test_fetch_pl_summary_handles_negative_pl(monkeypatch):
     fake_client = FakeTradingClient(equity="900.00", last_equity="1000.00", base_value="1200.00")
-    monkeypatch.setattr(pl_badges, "trading_client", fake_client)
+    monkeypatch.setattr(pl_badges, "distinct_trading_clients", lambda: [fake_client])
 
     summary = pl_badges.fetch_pl_summary(date(2026, 8, 13))
 
@@ -46,7 +46,7 @@ def test_fetch_pl_summary_handles_negative_pl(monkeypatch):
 
 def test_fetch_pl_summary_falls_back_to_today_pl_when_base_value_is_none_and_no_history(monkeypatch):
     fake_client = FakeTradingClient(equity="999166.40", last_equity="1000000.00", base_value=None)
-    monkeypatch.setattr(pl_badges, "trading_client", fake_client)
+    monkeypatch.setattr(pl_badges, "distinct_trading_clients", lambda: [fake_client])
 
     summary = pl_badges.fetch_pl_summary(date(2026, 8, 13))
 
@@ -55,7 +55,7 @@ def test_fetch_pl_summary_falls_back_to_today_pl_when_base_value_is_none_and_no_
 
 def test_fetch_pl_summary_accumulates_ytd_from_persisted_history_when_base_value_is_none(monkeypatch):
     fake_client = FakeTradingClient(equity="999166.40", last_equity="1000000.00", base_value=None)
-    monkeypatch.setattr(pl_badges, "trading_client", fake_client)
+    monkeypatch.setattr(pl_badges, "distinct_trading_clients", lambda: [fake_client])
 
     summary = pl_badges.fetch_pl_summary(date(2026, 8, 13), history_pl={"2026-08-05": -100.0, "2026-08-06": 50.0})
 
@@ -67,7 +67,7 @@ def test_fetch_pl_summary_excludes_todays_own_persisted_entry_from_the_ytd_sum(m
     """A second same-day run (e.g. EOD Report's backup dispatch) must not double-count today's
     own P&L using a stale value already persisted by an earlier run today."""
     fake_client = FakeTradingClient(equity="999166.40", last_equity="1000000.00", base_value=None)
-    monkeypatch.setattr(pl_badges, "trading_client", fake_client)
+    monkeypatch.setattr(pl_badges, "distinct_trading_clients", lambda: [fake_client])
     today = date(2026, 8, 13)
 
     summary = pl_badges.fetch_pl_summary(today, history_pl={today.isoformat(): -999.0, "2026-01-02": 10.0})
@@ -78,7 +78,7 @@ def test_fetch_pl_summary_excludes_todays_own_persisted_entry_from_the_ytd_sum(m
 
 def test_fetch_pl_summary_ignores_persisted_entries_from_a_prior_year(monkeypatch):
     fake_client = FakeTradingClient(equity="999166.40", last_equity="1000000.00", base_value=None)
-    monkeypatch.setattr(pl_badges, "trading_client", fake_client)
+    monkeypatch.setattr(pl_badges, "distinct_trading_clients", lambda: [fake_client])
 
     summary = pl_badges.fetch_pl_summary(date(2026, 8, 13), history_pl={"2025-12-31": 5000.0})
 
@@ -96,7 +96,7 @@ def test_fetch_pl_summary_does_not_double_count_todays_entry_across_the_utc_midn
     takes `today` as a caller-supplied Eastern date instead of resolving it locally, so this
     exclusion can no longer disagree with the history's own keys."""
     fake_client = FakeTradingClient(equity="1084.35", last_equity="929.58", base_value=None)
-    monkeypatch.setattr(pl_badges, "trading_client", fake_client)
+    monkeypatch.setattr(pl_badges, "distinct_trading_clients", lambda: [fake_client])
     today = date(2026, 8, 13)
 
     summary = pl_badges.fetch_pl_summary(
@@ -106,6 +106,32 @@ def test_fetch_pl_summary_does_not_double_count_todays_entry_across_the_utc_midn
 
     assert summary["today_pl"] == 154.77
     assert summary["ytd_pl"] == 84.35
+
+
+def test_fetch_pl_summary_sums_equity_and_pl_across_distinct_accounts(monkeypatch):
+    """Once account 2 (options) is split onto its own paper account, distinct_trading_clients()
+    yields two clients and the badges must reflect the combined book -- equity, today's P&L
+    (each account's own equity - last_equity), and the base_value YTD anchor all summed."""
+    stocks = FakeTradingClient(equity="1050.00", last_equity="1000.00", base_value="900.00")
+    options = FakeTradingClient(equity="220.00", last_equity="200.00", base_value="150.00")
+    monkeypatch.setattr(pl_badges, "distinct_trading_clients", lambda: [stocks, options])
+
+    summary = pl_badges.fetch_pl_summary(date(2026, 8, 13))
+
+    assert summary == {"equity": 1270.0, "today_pl": 70.0, "ytd_pl": 220.0}
+
+
+def test_fetch_pl_summary_falls_back_to_history_when_any_account_lacks_base_value(monkeypatch):
+    """A partial base_value sum would understate YTD, so a single None anchor forces the whole
+    computation onto the persisted-history fallback (prior days + combined today's P&L)."""
+    stocks = FakeTradingClient(equity="1050.00", last_equity="1000.00", base_value="900.00")
+    options = FakeTradingClient(equity="220.00", last_equity="200.00", base_value=None)
+    monkeypatch.setattr(pl_badges, "distinct_trading_clients", lambda: [stocks, options])
+
+    summary = pl_badges.fetch_pl_summary(date(2026, 8, 13), history_pl={"2026-08-05": 30.0})
+
+    assert summary["today_pl"] == 70.0
+    assert summary["ytd_pl"] == 100.0
 
 
 def test_build_badge_payload_formats_positive_value_as_brightgreen():

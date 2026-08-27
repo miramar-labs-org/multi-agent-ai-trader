@@ -292,9 +292,12 @@ official market close and sends exactly once when close+30min has passed, so nor
 report at 16:30 ET and 13:00 early closes report at 13:30 ET. Closed days post a "market was
 closed" notice rather than silently doing nothing. No dependency on the `portfolio` ConfigMap or
 on Dealer/Floor Broker — it reads Alpaca's account/positions/fills directly and formats a Slack
-summary via `src/common/eod.py`'s `fetch_fills()`/`summarize_positions()`. `eod.py` imports only
-`trading_client` (account 1), so option P&L on account 2 is not yet included in the recap or the
-README P/L badges (`src/pl_badges/`) — an open gap now that options trading is live.
+summary via `src/common/eod.py`'s `fetch_all_fills()`/`fetch_all_positions()`/
+`fetch_combined_account_summary()` — each iterating `alpaca_client.distinct_trading_clients()`, so
+the recap and the README P/L badges (`src/pl_badges/`, same helper) aggregate account 2's option
+P&L. `distinct_trading_clients()` returns one client while account 1 and account 2 resolve to the
+same API key (today's default) and two once config points account 2 at a separate key pair, so
+the shared account is never double-counted.
 
 ## Shared code (`src/common/`)
 
@@ -306,7 +309,10 @@ README P/L badges (`src/pl_badges/`) — an open gap now that options trading is
   options). `config.yaml`'s `alpaca.account1`/`account2` `key_env`/`secret_env` name which secret
   env var each account reads, re-resolved on the normal 60 s config refresh — today both point at
   `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET`, with `..._KEY2`/`..._SECRET2` pre-wired as
-  the switch target for a future second funded account.
+  the switch target for a future second funded account. `distinct_trading_clients()` returns
+  `[trading_client]` while both accounts resolve to the same API key and `[trading_client,
+  trading_client2]` once they diverge — the EOD Report and P/L badges iterate it to aggregate
+  option P&L without double-counting the shared account.
 - `portfolio_state.py` — the `portfolio` ConfigMap I/O (above), plus `merge_held_positions()`,
   which folds any pre-existing Alpaca position not already in the watchlist into it on every
   Dealer poll, tagged `budget=0.0, is_held_only=True` so a large held position can't silently

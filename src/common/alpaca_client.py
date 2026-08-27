@@ -79,6 +79,26 @@ option_data_client2 = _LazyAlpacaClient(
 )
 
 
+def distinct_trading_clients() -> list:
+    """The trading clients for each *distinct* funded Alpaca account.
+
+    Returns just ``[trading_client]`` while account1 and account2 resolve to the same API key --
+    the current single-paper-account default (see README's accounts table) -- and
+    ``[trading_client, trading_client2]`` once config.yaml points ``alpaca.account2`` at a
+    genuinely separate key pair (the pre-wired ``ALPACA_PAPER_API_KEY2`` path).
+
+    The EOD report and the README P/L badges iterate this so option activity on account2 is
+    reflected there once the accounts are split, without double-counting the shared account today.
+    Resolution mirrors account_env_names / _LazyAlpacaClient: compare the configured env var
+    *names* first, then their runtime *values*, so pointing account2 at a distinct name that
+    happens to hold the same credentials still collapses to one client."""
+    key1_env, _ = account_env_names("account1", "ALPACA_PAPER_API_KEY", "ALPACA_PAPER_API_SECRET")
+    key2_env, _ = account_env_names("account2", "ALPACA_PAPER_API_KEY", "ALPACA_PAPER_API_SECRET")
+    if key1_env == key2_env or os.getenv(key1_env) == os.getenv(key2_env):
+        return [trading_client]
+    return [trading_client, trading_client2]
+
+
 def get_current_ask_price(symbol: str) -> float:
     if "/" in symbol or is_usd_crypto_symbol(symbol):
         symbol = canonical_crypto_symbol(symbol)
