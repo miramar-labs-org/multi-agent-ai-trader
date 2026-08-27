@@ -181,12 +181,12 @@ flowchart TD
         direction TB
         D1[fetch_indicators] --> D1b[fetch_market_data]
         D1b --> D2[llm_call]
-        D2 --> D3{stock + options_trading.enabled?}
+        D2 --> D3{"stock + options_trading.enabled?"}
         D3 -->|no| D6{call_floor_broker}
-        D6 -->|HOLD| D4[skipped — no order]
-        D6 -->|BUY / SELL| D5[POST /execute]
+        D6 -->|HOLD| D4["skipped — no order"]
+        D6 -->|BUY / SELL| D5["POST /execute"]
         D3 -->|yes| D7[select_option_contract] --> D8[call_floor_broker_option]
-        D8 --> D9[POST /execute-option]
+        D8 --> D9["POST /execute-option"]
     end
 
     A8 -.->|portfolio ConfigMap| D1
