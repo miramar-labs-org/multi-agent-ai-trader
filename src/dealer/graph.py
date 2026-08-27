@@ -662,6 +662,27 @@ def call_floor_broker_option(state: DealerState, cfg) -> DealerState:
     select_option_contract() maps a bearish SELL signal to buying a put (right = "call" if
     action == "BUY" else "put"), and that put purchase is exactly as much a new entry as a call
     purchase is -- it must not bypass macro blackout / symbol-stop cooldown / win-rate throttle."""
+    option_pick = state.get("option_pick")
+    action = state["signal"]["action"]
+
+    # Duplicate-exposure check runs first, before the dealer-signal Slack line and the
+    # dealer_decision row. _fallback_pick is deterministic, so a contract already held (or with a
+    # BUY in flight) gets re-picked identically every ~10-minute poll cycle for the life of the
+    # position; announcing/recording that each time is pure noise. Skip it quietly -- a single
+    # floor_broker_event keeps the skip auditable. A failed selection (option_pick is None) still
+    # falls through to the dealer signal below.
+    if option_pick and _option_contract_already_exposed(cfg, option_pick["contract_symbol"]):
+        detail = f"{option_pick['contract_symbol']} is already held or has a BUY order in flight"
+        db.record_floor_broker_event(state["symbol"], "skip", detail)
+        return {
+            **state,
+            "execution_result": {
+                "status": "skipped",
+                "reason": "duplicate_option_position",
+                "detail": detail,
+            },
+        }
+
     slack.notify_dealer_signal(
         state["symbol"], state["signal"]["action"], state["signal"]["reasoning"], asset_class="option"
     )
@@ -674,11 +695,8 @@ def call_floor_broker_option(state: DealerState, cfg) -> DealerState:
         cycle_id=state.get("cycle_id"),
     )
 
-    option_pick = state.get("option_pick")
     if not option_pick:
         return {**state, "execution_result": {"status": "skipped", "reason": "no_option_pick", "detail": "no option contract was selected"}}
-
-    action = state["signal"]["action"]
 
     blackout_label = _macro_blackout_active(cfg)
     if blackout_label:
@@ -770,15 +788,6 @@ def call_floor_broker_option(state: DealerState, cfg) -> DealerState:
         graph_slack_and_record(state, action, result)
         return {**state, "execution_result": result}
 
-    if _option_contract_already_exposed(cfg, option_pick["contract_symbol"]):
-        result = {
-            "status": "skipped",
-            "reason": "duplicate_option_position",
-            "detail": f"{option_pick['contract_symbol']} is already held or has a BUY order in flight",
-        }
-        graph_slack_and_record(state, action, result)
-        return {**state, "execution_result": result}
-
     payload = {
         "contract_symbol": option_pick["contract_symbol"],
         "side": "BUY",
@@ -816,10 +825,10 @@ def call_floor_broker_option(state: DealerState, cfg) -> DealerState:
 
 def _option_contract_already_exposed(cfg, contract_symbol: str) -> bool:
     """Best-effort pre-check against the Floor Broker's current option exposure so the Dealer skips
-    a contract it already holds (or has a pending BUY for) before spending an /execute-option round
-    trip on it -- _fallback_pick is deterministic, so a slow-filling BUY otherwise gets re-picked
-    and re-submitted identically every cycle. buy_option() enforces this authoritatively; any
-    transient failure here just falls through to that."""
+    a contract it already holds (or has a pending BUY for) before it announces the signal or spends
+    an /execute-option round trip -- _fallback_pick is deterministic, so a slow-filling BUY
+    otherwise gets re-picked and re-submitted identically every cycle. buy_option() enforces this
+    authoritatively; any transient failure here just falls through to that."""
     try:
         resp = requests.get(f"{cfg.floor_broker.base_url}/option-exposure", timeout=10)
         if resp.status_code != 200:

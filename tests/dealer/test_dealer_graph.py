@@ -1061,51 +1061,70 @@ def test_call_floor_broker_option_records_dealer_decision(monkeypatch):
     assert recorded["slack"] == ("CRV/USD", "BUY", "delta/DTE window")
 
 
-def test_call_floor_broker_option_skips_when_contract_already_exposed(monkeypatch):
-    monkeypatch.setattr(graph.slack, "notify_floor_broker_result", lambda *a, **k: None)
-    monkeypatch.setattr(graph.db, "record_floor_broker_event", lambda *a, **k: None)
-    monkeypatch.setattr(graph.db, "record_dealer_decision", lambda *a, **k: None)
+def test_call_floor_broker_option_skips_quietly_when_contract_already_exposed(monkeypatch):
+    """An already-held / in-flight contract re-triggers every poll cycle. The skip must land before
+    the dealer-signal Slack line and the dealer_decision row -- only a single floor_broker_event
+    'skip' row is written, for the audit trail."""
+    events = []
+    monkeypatch.setattr(graph.db, "record_floor_broker_event", lambda *a, **k: events.append(a))
+    monkeypatch.setattr(graph, "_option_contract_already_exposed", lambda cfg, sym: True)
 
-    class _ExposureResp:
-        status_code = 200
+    def _must_not_fire(*a, **k):
+        raise AssertionError("an already-held contract must not announce a signal or POST an order")
 
-        def json(self):
-            return {"contracts": ["AAPL250117C00200000"]}
-
-    monkeypatch.setattr(graph.requests, "get", lambda url, timeout: _ExposureResp())
-
-    def _post_must_not_be_called(*a, **k):
-        raise AssertionError("must not POST /execute-option for a contract already held / in flight")
-
-    monkeypatch.setattr(graph.requests, "post", _post_must_not_be_called)
+    monkeypatch.setattr(graph.slack, "notify_dealer_signal", _must_not_fire)
+    monkeypatch.setattr(graph.slack, "notify_floor_broker_result", _must_not_fire)
+    monkeypatch.setattr(graph.db, "record_dealer_decision", _must_not_fire)
+    monkeypatch.setattr(graph.requests, "post", _must_not_fire)
 
     result = graph.call_floor_broker_option(_option_pick_state(), _option_cfg())
 
     assert result["execution_result"]["status"] == "skipped"
     assert result["execution_result"]["reason"] == "duplicate_option_position"
+    assert events == [
+        ("CRV/USD", "skip", "AAPL250117C00200000 is already held or has a BUY order in flight")
+    ]
 
 
-def test_call_floor_broker_option_proceeds_when_exposure_check_fails(monkeypatch):
-    monkeypatch.setattr(graph.slack, "notify_floor_broker_result", lambda *a, **k: None)
-    monkeypatch.setattr(graph.db, "record_floor_broker_event", lambda *a, **k: None)
+def test_call_floor_broker_option_still_signals_when_selection_failed(monkeypatch):
+    """A failed selection (option_pick is None) skips the exposure check -- which needs a contract
+    symbol -- but must still emit the dealer signal so a failed pick is visible."""
+    signals = []
+    monkeypatch.setattr(graph.slack, "notify_dealer_signal", lambda *a, **k: signals.append(a))
     monkeypatch.setattr(graph.db, "record_dealer_decision", lambda *a, **k: None)
+    monkeypatch.setattr(graph, "_option_contract_already_exposed", _fail_if_exposure_checked)
 
+    state = {**_state("rsi: 71.2"), "signal": {"action": "BUY", "confidence": 0.9, "reasoning": "r"}, "option_pick": None}
+    result = graph.call_floor_broker_option(state, _option_cfg())
+
+    assert result["execution_result"]["reason"] == "no_option_pick"
+    assert signals == [("CRV/USD", "BUY", "r")]
+
+
+def _fail_if_exposure_checked(cfg, sym):
+    raise AssertionError("exposure check must be skipped when there is no option_pick")
+
+
+def test_option_contract_already_exposed_returns_false_on_request_exception(monkeypatch, real_option_exposure):
     def _get_boom(url, timeout):
         raise graph.requests.RequestException("connection refused")
 
     monkeypatch.setattr(graph.requests, "get", _get_boom)
 
-    class FakeResponse:
+    assert graph._option_contract_already_exposed(_option_cfg(), "AAPL250117C00200000") is False
+
+
+def test_option_contract_already_exposed_true_when_contract_in_exposure(monkeypatch, real_option_exposure):
+    class _ExposureResp:
         status_code = 200
 
         def json(self):
-            return {"status": "submitted", "detail": "option buy order submitted: order-9"}
+            return {"contracts": ["AAPL250117C00200000", "MSFT250117P00300000"]}
 
-    monkeypatch.setattr(graph.requests, "post", lambda url, json, timeout: FakeResponse())
+    monkeypatch.setattr(graph.requests, "get", lambda url, timeout: _ExposureResp())
 
-    result = graph.call_floor_broker_option(_option_pick_state(), _option_cfg())
-
-    assert result["execution_result"]["status"] == "submitted"
+    assert graph._option_contract_already_exposed(_option_cfg(), "AAPL250117C00200000") is True
+    assert graph._option_contract_already_exposed(_option_cfg(), "TSLA250117C00100000") is False
 
 
 def _base_option_gate_cfg(**strategy_overrides):

@@ -364,6 +364,15 @@ Dealer, bound to Alpaca's options tools via MCP:
 **`call_floor_broker_option`** re-validates the pick server-side before executing — it does not
 trust the LLM's copy of the constraints:
 
+- **Duplicate guard runs first — before the dealer-signal Slack line and the `dealer_decision`
+  row.** A best-effort `GET /option-exposure` on the Floor Broker returns every contract already
+  held or with a BUY order in flight; if the pick is one of them the Dealer skips silently
+  (`status="skipped", reason="duplicate_option_position"`, one `floor_broker_event` "skip" row for
+  the audit trail, no Slack). `_fallback_pick` is deterministic, so a held or slow-filling contract
+  would otherwise be re-picked identically and re-announced every ~10-minute poll cycle for the
+  life of the position. A failed/non-200 exposure check just proceeds; `buy_option()` enforces the
+  same rule authoritatively. A failed *selection* (no `option_pick`) skips this check and still
+  emits the dealer signal.
 - All the same entry gates as `call_floor_broker` apply, and unconditionally (unlike the stock
   path where they only guard `action == "BUY"`): macro blackout, same-symbol stop cooldown,
   win-rate throttle, `budget > 0`. Every option entry — call *or* put — is a brand-new position;
@@ -374,12 +383,6 @@ trust the LLM's copy of the constraints:
   `risk_per_trade_usd_not_configured`.
 - Sizing: `qty = int(risk_per_trade_usd // (premium * 100))`; `qty < 1` →
   `status="skipped", reason="qty_zero"`.
-- Duplicate guard: after sizing, a best-effort `GET /option-exposure` on the Floor Broker returns
-  every contract already held or with a BUY order in flight. If the pick is one of them the Dealer
-  skips (`status="skipped", reason="duplicate_option_position"`) rather than spending a Slack line
-  and an `/execute-option` round trip — `_fallback_pick` is deterministic, so a slow-filling BUY
-  would otherwise be re-picked identically every cycle. A failed/non-200 exposure check just
-  proceeds; `buy_option()` enforces the same rule authoritatively.
 - On success it POSTs `POST /execute-option` to Floor Broker (payload includes `contract_symbol`,
   `qty`, `right`, `strike`, `expiration`, `delta`, `premium`, `reasoning`, `cycle_id`).
 
