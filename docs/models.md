@@ -151,6 +151,45 @@ reach `finish_reason: "tool_calls"` reliably, which is the only capability this 
 worst case is ~6× the single-call latency, still far under the 600s poll interval. No `max_tokens`
 cap here either.
 
+## Decision update (2026-08-27): reverted to qwen3.6:35b-a3b
+
+Switched `config.yaml`'s `llm.model` back from `nemotron-3-super:latest` to
+`qwen3.6:35b-a3b` after the options path went live in prod and exposed two
+costs of the 123.6B model that the 2026-08-11 single-call test hadn't:
+
+- **Latency under real load.** The 39.2s / 517-token figure above was an
+  isolated `Signal` call. In production, `llm_call` on the full
+  indicator + multi-timeframe-OHLCV prompt was taking 10+ minutes per symbol,
+  and a single live `_select_option_contract_async` run (the 6-round MCP
+  tool-calling loop, each round preceded by a full 2000-3500-token reasoning
+  dump) ran 15+ minutes without returning a pick. The "~6x single-call
+  latency, still far under 600s" assumption in the 2026-08-14 note did not
+  hold once each round carried the real message history.
+- **Memory headroom.** `nemotron-3-super` sits at 94GB VRAM / 100% GPU on a
+  box reporting ~1GB free / ~10GB available. That margin OOM-killed the
+  512Mi dealer pod's in-cluster verification runs and leaves nothing for KV
+  cache growth or the other DGX services sharing the unified pool.
+
+`qwen3.6:35b-a3b` (MoE, 35B total / **3B active**, already pulled, 23GB
+Q4_K_M) was the 2026-08-01 decision and was only displaced by the
+"NVIDIA validated this architecture for DGX Spark" argument -- a
+hardware-compatibility point, never an accuracy one. It already reached
+`finish_reason: "tool_calls"` with schema-valid `Signal` payloads in the
+2026-08-11 verification. The 3B active-param count is the key lever: it
+decodes several times faster than a dense 30B and frees ~70GB.
+
+Thinking is still emitted by this model; the same "no tight `max_tokens`
+cap" rule from the 2026-08-01 verification applies. If latency is still
+higher than wanted, the next levers (not taken here) are suppressing the
+reasoning trace on the structured-output calls
+(`chat_template_kwargs={"enable_thinking": False}`) and lowering
+`_MAX_TOOL_CALL_ROUNDS` from 6.
+
+The Ollama side of the switch (evict `nemotron-3-super`, preload
+`qwen3.6:35b-a3b` with `keep_alive: -1`) is handled by `power_scheduler`'s
+`manage_ollama_model` path on the next power cycle, and manually at
+switch time.
+
 ## Sources
 
 - [Atlas: Open-source inference engine for DGX Spark](https://forums.developer.nvidia.com/t/atlas-open-source-inference-engine-for-dgx-spark-2minute-cold-start-100-tok-s-on-qwen3-6-35b-fp8-13-supported-models/369263)
