@@ -419,7 +419,16 @@ async def _select_option_contract_async(state: DealerState, cfg, signal: dict) -
     tools = await get_options_tools()
     tools_by_name = {t.name: t for t in tools}
 
-    llm = ChatOpenAI(base_url=cfg.llm.base_url, model=cfg.llm.model, temperature=cfg.llm.temperature)
+    # api_key is required by ChatOpenAI's client init but unused -- the local model router at
+    # cfg.llm.base_url does no auth. Without it ChatOpenAI falls back to demanding OPENAI_API_KEY
+    # from the env and every contract selection dies before a tool call (same "not-needed"
+    # sentinel as llm_call()).
+    llm = ChatOpenAI(
+        base_url=cfg.llm.base_url,
+        api_key="not-needed",
+        model=cfg.llm.model,
+        temperature=cfg.llm.temperature,
+    )
     agent_llm = llm.bind_tools(tools)
     right = "call" if signal["action"] == "BUY" else "put"
 
