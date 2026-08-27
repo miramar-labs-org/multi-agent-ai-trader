@@ -359,6 +359,12 @@ trust the LLM's copy of the constraints:
   `risk_per_trade_usd_not_configured`.
 - Sizing: `qty = int(risk_per_trade_usd // (premium * 100))`; `qty < 1` →
   `status="skipped", reason="qty_zero"`.
+- Duplicate guard: after sizing, a best-effort `GET /option-exposure` on the Floor Broker returns
+  every contract already held or with a BUY order in flight. If the pick is one of them the Dealer
+  skips (`status="skipped", reason="duplicate_option_position"`) rather than spending a Slack line
+  and an `/execute-option` round trip — `_fallback_pick` is deterministic, so a slow-filling BUY
+  would otherwise be re-picked identically every cycle. A failed/non-200 exposure check just
+  proceeds; `buy_option()` enforces the same rule authoritatively.
 - On success it POSTs `POST /execute-option` to Floor Broker (payload includes `contract_symbol`,
   `qty`, `right`, `strike`, `expiration`, `delta`, `premium`, `reasoning`, `cycle_id`).
 
@@ -382,7 +388,8 @@ calls an LLM.
 |---|---|
 | `GET /healthz` | `{"status": "ok"}` — backs the Deployment's readiness/liveness probes |
 | `POST /execute` | body: `{symbol, exchange, action: BUY\|SELL, budget, slP, tpP}` → dispatches to `execution.buy()`/`execution.sell()` |
-| `POST /execute-option` | body: `{contract_symbol, qty, premium, right, strike, expiration, delta, reasoning, symbol, cycle_id}` → `execution.buy_option()`. Only called when `options_trading.enabled`; see [Options trading](#options-trading--mcp-backed-contract-selection) |
+| `POST /execute-option` | body: `{contract_symbol, qty, premium, right, strike, expiration, delta, reasoning, symbol, cycle_id}` → `execution.buy_option()`. Only called when `options_trading.enabled`; see [Options trading](#options-trading--mcp-backed-contract-selection). `buy_option()` refuses a second BUY for a contract already held or with a BUY in flight (`_duplicate_option_buy_skip` — options have no top-up concept, and a doubled BUY corrupts the OCC-keyed `_option_positions` tracking) |
+| `GET /option-exposure` | `{contracts: [...]}` — every option contract this process holds or has a BUY order in flight for (`_option_positions` ∪ pending BUYs). The Dealer checks this before a new option entry to skip a duplicate early |
 | `POST /flatten-crypto` | force-sells every open crypto position; called by Power Scheduler before it scales this pod to 0 (`power_schedule.flatten_crypto_before_powerdown`, default true) |
 | `POST /flatten-options` | force-sells every open option position; called by Power Scheduler before scale-to-0 when `power_schedule.flatten_options_before_powerdown` (default **false** — options are already DTE-force-closed well before expiry, so an overnight hold is acceptable) |
 
@@ -444,8 +451,17 @@ pollers below send directly.
   (it can change once blockers clear), and resubmits.
 - **`buy_option()`** — the options entry path, on `trading_client` (the one live account, same as
   stocks/crypto). Runs the same buy-preflight and `max_concurrent_positions` skips as `buy()` —
-  option BUYs share the live account's daily-P&L halt and open-position cap, no options carve-out
-  — then **re-quotes the contract's
+  option BUYs share the live account's daily-P&L halt and open-position cap, no options carve-out.
+  Between those two it runs `_duplicate_option_buy_skip`: options have no top-up concept (every
+  Dealer `option_pick` is a brand-new entry and `_fallback_pick` is deterministic, so a
+  slow-filling BUY gets re-picked identically next cycle), and `_option_positions` is keyed by OCC
+  symbol and overwritten wholesale on each fill, so a doubled BUY both over-positions the account
+  and corrupts the tracked qty/entry premium that synthetic SL/TP/DTE protection sizes off. A BUY
+  already in `_pending_option_fills` for the contract → `reason="option_buy_in_flight"`; the
+  contract already in `_option_positions` or open at Alpaca (`_fetch_open_position`) →
+  `reason="already_holding_contract"`. The reconcile scan (gated by `is_state_reconciled()`, which
+  the buy-preflight enforces) seeds `_pending_option_fills` from every open Alpaca option order, so
+  the in-memory view is authoritative. It then **re-quotes the contract's
   live ask** (`get_current_option_ask_price`) and rejects it if `qty * live_ask * 100` exceeds
   `options_trading.max_notional_usd` (`reason="notional_cap_exceeded"`) — the cap is enforced
   against the market, not the LLM's claimed premium. A plain `MarketOrderRequest`

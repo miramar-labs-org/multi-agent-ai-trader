@@ -124,6 +124,10 @@ class ExecuteOptionResponse(BaseModel):
     order_id: str | None = None
 
 
+class OptionExposureResponse(BaseModel):
+    contracts: list[str] = Field(default_factory=list)
+
+
 class FlattenCryptoResponse(BaseModel):
     status: Literal["ok", "error"]
     events: list[dict] = Field(default_factory=list)
@@ -184,6 +188,14 @@ def execute_option(req: ExecuteOptionRequest):
         log(f"💥  unexpected error on option BUY {req.contract_symbol}: {exc}")
         slack.notify_error("FLOOR", f"unexpected error on option BUY {req.contract_symbol}: {exc}")
         raise
+
+
+@app.get("/option-exposure", response_model=OptionExposureResponse)
+def option_exposure():
+    """Contracts already held or with a BUY order in flight. The Dealer checks this before a new
+    option entry to skip a duplicate before spending a Slack line and an /execute-option round trip;
+    buy_option() enforces the same rule server-side regardless."""
+    return OptionExposureResponse(contracts=execution.option_exposure_contract_symbols())
 
 
 @app.post("/flatten-crypto", response_model=FlattenCryptoResponse)

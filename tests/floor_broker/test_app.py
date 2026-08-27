@@ -353,6 +353,28 @@ def test_execute_option_returns_result_from_buy_option(monkeypatch):
     assert captured["args"][1] == 2
 
 
+def test_option_exposure_returns_contract_symbols_from_execution(monkeypatch):
+    monkeypatch.setattr(
+        app_module.execution,
+        "option_exposure_contract_symbols",
+        lambda: ["AAPL250117C00200000", "MSFT250117C00400000"],
+    )
+
+    response = _client().get("/option-exposure")
+
+    assert response.status_code == 200
+    assert response.json() == {"contracts": ["AAPL250117C00200000", "MSFT250117C00400000"]}
+
+
+def test_option_exposure_empty_when_nothing_held(monkeypatch):
+    monkeypatch.setattr(app_module.execution, "option_exposure_contract_symbols", lambda: [])
+
+    response = _client().get("/option-exposure")
+
+    assert response.status_code == 200
+    assert response.json() == {"contracts": []}
+
+
 def test_execute_option_rejects_non_buy_side():
     response = _client().post(
         "/execute-option",

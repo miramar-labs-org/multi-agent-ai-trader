@@ -895,6 +895,7 @@ def test_call_floor_broker_option_posts_to_execute_option(monkeypatch):
         return FakeResponse()
 
     monkeypatch.setattr(graph.requests, "post", _fake_post)
+    monkeypatch.setattr(graph, "_option_contract_already_exposed", lambda cfg, sym: False)
     cfg = _option_cfg()
     state = {
         **_state("rsi: 71.2"),
@@ -936,6 +937,7 @@ def test_call_floor_broker_option_records_dealer_decision(monkeypatch):
             return {"status": "submitted", "detail": "option buy order submitted: order-1"}
 
     monkeypatch.setattr(graph.requests, "post", lambda url, json, timeout: FakeResponse())
+    monkeypatch.setattr(graph, "_option_contract_already_exposed", lambda cfg, sym: False)
     cfg = _option_cfg()
     state = {
         **_state("rsi: 71.2"),
@@ -958,6 +960,53 @@ def test_call_floor_broker_option_records_dealer_decision(monkeypatch):
     assert kwargs == {"ohlcv_enrichment_active": False, "cycle_id": "cycle-1"}
     # Verify slack notification is called
     assert recorded["slack"] == ("CRV/USD", "BUY", "delta/DTE window")
+
+
+def test_call_floor_broker_option_skips_when_contract_already_exposed(monkeypatch):
+    monkeypatch.setattr(graph.slack, "notify_floor_broker_result", lambda *a, **k: None)
+    monkeypatch.setattr(graph.db, "record_floor_broker_event", lambda *a, **k: None)
+    monkeypatch.setattr(graph.db, "record_dealer_decision", lambda *a, **k: None)
+
+    class _ExposureResp:
+        status_code = 200
+
+        def json(self):
+            return {"contracts": ["AAPL250117C00200000"]}
+
+    monkeypatch.setattr(graph.requests, "get", lambda url, timeout: _ExposureResp())
+
+    def _post_must_not_be_called(*a, **k):
+        raise AssertionError("must not POST /execute-option for a contract already held / in flight")
+
+    monkeypatch.setattr(graph.requests, "post", _post_must_not_be_called)
+
+    result = graph.call_floor_broker_option(_option_pick_state(), _option_cfg())
+
+    assert result["execution_result"]["status"] == "skipped"
+    assert result["execution_result"]["reason"] == "duplicate_option_position"
+
+
+def test_call_floor_broker_option_proceeds_when_exposure_check_fails(monkeypatch):
+    monkeypatch.setattr(graph.slack, "notify_floor_broker_result", lambda *a, **k: None)
+    monkeypatch.setattr(graph.db, "record_floor_broker_event", lambda *a, **k: None)
+    monkeypatch.setattr(graph.db, "record_dealer_decision", lambda *a, **k: None)
+
+    def _get_boom(url, timeout):
+        raise graph.requests.RequestException("connection refused")
+
+    monkeypatch.setattr(graph.requests, "get", _get_boom)
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"status": "submitted", "detail": "option buy order submitted: order-9"}
+
+    monkeypatch.setattr(graph.requests, "post", lambda url, json, timeout: FakeResponse())
+
+    result = graph.call_floor_broker_option(_option_pick_state(), _option_cfg())
+
+    assert result["execution_result"]["status"] == "submitted"
 
 
 def _base_option_gate_cfg(**strategy_overrides):
