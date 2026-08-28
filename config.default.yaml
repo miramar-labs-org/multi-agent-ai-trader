@@ -63,9 +63,14 @@ strategy:
   halt_behavior: block_new_buys   # only this is enforced; flatten_positions is recorded intent only
   crypto_slP: 0.98                # synthetic stop-loss, as a fraction of crypto fill price
   crypto_tpP: 1.03                # synthetic take-profit, as a fraction of crypto fill price
-  position_sizing: flat_budget    # only this is enforced (analyst.default_budget); risk_based is recorded intent only
-  risk_per_trade_usd: null        # recorded intent only -- see position_sizing note above
-  max_concurrent_positions: 10    # recorded intent only -- analyst.max_universe_size already caps concurrent picks
+  position_sizing: flat_budget    # baseline uses the Analyst-authorized budget as-is; "risk_based"
+                                  # is also live (execution.py's _risk_based_budget_cap()) and caps
+                                  # the budget so a stopped-out BUY loses at most risk_per_trade_usd
+  risk_per_trade_usd: null        # per-trade risk cap; null under flat_budget. Consumed by
+                                  # _risk_based_budget_cap() (stocks) and option qty sizing
+                                  # (dealer/graph.py: qty = risk_per_trade_usd // (premium * 100))
+  max_concurrent_positions: 10    # enforced in execution.py's buy() and buy_option() -- new
+                                  # (non-top-up) BUYs are skipped once open positions reach this count
   min_confidence: 0.6             # Dealer BUY confidence gate (src/dealer/graph.py); 0.0 disables it
   min_win_rate: 0.30             # trailing TP/SL win-rate floor below which new BUYs pause
   win_rate_min_sample: 5          # completed exits required before the win-rate throttle evaluates
@@ -127,8 +132,10 @@ macro_blackout:
   dates: []
 
 eod_report:
-  schedule: "30 21 * * *"   # informational copy of the CronJob's own spec.schedule — 21:30 UTC daily, after
-                            # market close; runs every day so closed days get a Slack notice, not silence
+  schedule: "30 13-16 * * *"   # informational copy of the CronJob's own spec.schedule — :30 past each hour
+                               # 13:00-16:00 America/New_York (spec.timeZone), daily; main.py sends once at
+                               # Alpaca's official close+30min, and runs every day so closed days get a
+                               # Slack notice, not silence
 
 analyst:
   schedule: "55 8 * * *"      # informational copy of the CronJob's own spec.schedule — 08:55 America/New_York

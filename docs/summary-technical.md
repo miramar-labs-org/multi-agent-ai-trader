@@ -40,19 +40,24 @@ ConfigMap; the only synchronous network hop is Dealer → Floor Broker.
 
 ```
 src/
-├── analyst/        {graph.py, main.py, schema.py, sources.py}   CronJob
-├── dealer/          {graph.py, main.py, schema.py}                Deployment
+├── analyst/        {graph.py, main.py, schema.py, sources.py}   CronJob (+ analyst-midday CronJob)
+├── dealer/          {graph.py, main.py, schema.py, features.py, mcp_options.py, option_chain.py}   Deployment
 ├── floor_broker/     {app.py, execution.py, main.py}                Deployment + Service
 ├── eod_report/         main.py                                        CronJob
-├── backtest/            offline CLI, not a k8s workload — see backtesting.md
-└── common/                config.py, alpaca_client.py, portfolio_state.py,
+├── power_scheduler/     main.py    scales dealer/floor-broker to 0 off-hours   CronJob
+├── pl_badges/          main.py     shields.io P/L badge JSON, run by a GHA workflow (not k8s)
+├── model_badge/        main.py     README model badge, run by a GHA workflow (not k8s)
+├── backtest/           offline CLI, not a k8s workload — see backtesting.md
+└── common/                config.py, alpaca_client.py, db.py, portfolio_state.py,
                            kill_switch.py, logging.py, slack.py, langsmith.py, eod.py,
-                           market_calendar.py, indicators.py
-k8s/            manifests deploy.yaml applies (2 CronJobs, 2 Deployments, 1 Service, RBAC)
+                           market_calendar.py, indicators.py, bars.py, symbols.py
+k8s/            manifests deploy.yaml applies (4 CronJobs, 2 Deployments, 1 Service, RBAC,
+                2 ConfigMaps) — see k8s/*-k3s.yaml
 config.yaml      single OmegaConf source of truth, loaded via common/config.py::load_config()
 ```
 
-Every `main.py` is its container's entrypoint (`python -m src.<service>.main`). Floor Broker's
+Each k8s workload's `main.py` is its container's entrypoint (`python -m src.<service>.main`);
+`pl_badges`/`model_badge` run the same way from a GHA workflow, not a pod. Floor Broker's
 `app.py` is the only FastAPI/HTTP server in the repo — everything else is a script or CronJob.
 
 ## Analyst — picks the watchlist
@@ -60,8 +65,9 @@ Every `main.py` is its container's entrypoint (`python -m src.<service>.main`). 
 Entrypoint: `python -m src.analyst.main`, `batch/v1 CronJob` `55 8 * * *` (`timeZone:
 America/New_York`), `concurrencyPolicy: Forbid` (no racing runs against the shared ConfigMap).
 
-`src/analyst/graph.py` is a LangGraph state machine (`discover_candidates → fetch_research →
-fetch_indicators → llm_select → validate_selection → write_portfolio → crypto_eod_report`):
+`src/analyst/graph.py` is a 9-node LangGraph state machine (`discover_candidates → fetch_research
+→ fetch_indicators → fetch_track_record → fetch_position_pnl → llm_select → validate_selection →
+write_portfolio → crypto_eod_report`):
 
 - `discover_candidates` — Alpaca screener REST calls (most-actives/movers) merged into a
   symbol→{volume, change_pct} dict, tagged with a `market` field. Gated on
@@ -74,6 +80,11 @@ fetch_indicators → llm_select → validate_selection → write_portfolio → c
 - `fetch_research` — Alpaca News API + Yahoo RSS, plain text, no vector store or RAG.
 - `fetch_indicators` — top-N by `abs(change_pct)` get a real TAAPI `/bulk` fetch
   (`src.common.indicators.fetch_indicators_bulk`, shared with Dealer).
+- `fetch_track_record` — reads recent Analyst picks + their Dealer/Floor Broker outcomes back
+  from Postgres (`src/common/db.py`), feature-gated by `analyst.track_record.enabled`.
+- `fetch_position_pnl` — a live unrealized-P&L snapshot of currently-open positions from Alpaca,
+  feature-gated by `analyst.position_pnl.enabled`. Both feed extra context into the `llm_select`
+  prompt.
 - `llm_select` — the decision call:
   ```python
   llm = ChatOpenAI(base_url=cfg.llm.base_url, api_key="not-needed",
@@ -120,7 +131,8 @@ while True:
 symbol per cycle; a missing-indicator result routes to `skip_missing_indicators` and ends the
 cycle) → `fetch_market_data` (multi-timeframe Alpaca candles + derived features, stock-only) →
 `llm_call` (same `ChatOpenAI(...).with_structured_output()` pattern as Analyst, output schema
-`Signal = {symbol, action: BUY|HOLD|SELL, reasoning, size_hint}` in `src/dealer/schema.py`).
+`Signal = {symbol, action: BUY|HOLD|SELL, reasoning, size_hint, confidence}` in
+`src/dealer/schema.py` — `confidence` (0–1) drives the `strategy.min_confidence` BUY gate).
 After `llm_call` the graph branches: for crypto, or when `options_trading.enabled` is off, it
 goes to `call_floor_broker` (a plain synchronous HTTP POST); for a stock when
 `options_trading.enabled` is on, it goes to `select_option_contract` → `call_floor_broker_option`

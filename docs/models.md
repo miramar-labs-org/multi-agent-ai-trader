@@ -1,9 +1,13 @@
 # Candidate models for local hosting on DGX Spark
 
-Research snapshot (2026-08) into whether a better local model exists than
-Qwen2.5-7B-Instruct for the planned vLLM endpoint (`config.yaml`'s
-`llm.base_url`, see [README.md](../README.md#how-it-decides-trades)). Not
-acted on yet — kept here for when we're ready to pick a serving model.
+Research and decision log (2026-08) for the local model that serves both the
+Analyst and the Dealer LLM calls (`config.yaml`'s `llm.base_url`, see
+[README.md](../README.md#how-it-decides-trades)). It began as a survey of
+whether a better local model exists than the original Qwen2.5-7B-Instruct; the
+dated **Decision** sections below track what was actually picked and re-picked
+since. **Current state: `qwen3.6:35b-a3b` served by Ollama on the DGX** (see
+"Decision update (2026-08-27): reverted to qwen3.6:35b-a3b") — not a custom
+vLLM endpoint.
 
 ## Hardware constraint that shapes every choice below
 

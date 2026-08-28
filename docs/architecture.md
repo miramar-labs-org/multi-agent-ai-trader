@@ -2,7 +2,7 @@
 
 `multi-agent-ai-trader` is a three-agent trading floor — **Analyst**, **Dealer**, **Floor
 Broker** — that trades US equities, crypto, and (when `options_trading.enabled`) single-leg
-options on Alpaca paper accounts, deployed as independent
+options on a single Alpaca paper account, deployed as independent
 Kubernetes workloads on the DGX Spark k3s cluster. It is a re-platforming of an earlier
 single-process script (`gpt-trader.py`) onto three independently-scaled k8s workloads that
 communicate via a shared ConfigMap and plain HTTP, rather than a monolithic loop.
@@ -38,7 +38,7 @@ communicate via a shared ConfigMap and plain HTTP, rather than a monolithic loop
                          └────────────┬─────────────┘
                                       │
                                       ▼
-                        Alpaca paper accounts (1: stocks/crypto, 2: options)
+              one Alpaca paper account (stocks, crypto, and options all route here)
 ```
 
 Analyst and Floor Broker never talk to each other directly. There is no message queue and
@@ -269,7 +269,7 @@ of the indicators below, decide if you should BUY, SELL, or HOLD. size_hint must
 fraction between 0.0 and 1.0 representing the portion of the symbol's budget to deploy on a BUY
 (e.g. 0.5 = half the budget, 1.0 = the full budget) — never a dollar amount or share count."*
 The `Signal` model
-(`src/dealer/schema.py`) is `{symbol, action: BUY|HOLD|SELL, reasoning, size_hint}` —
+(`src/dealer/schema.py`) is `{symbol, action: BUY|HOLD|SELL, reasoning, size_hint, confidence}` —
 `size_hint` (a 0–1 fraction, default 1.0) scales the symbol's configured `budget` on a BUY
 (`budget * size_hint`); it has no effect on SELL, which ignores `budget` entirely
 (`execution.py::sell()` closes the full open position, not a partial amount). Two cases are
@@ -280,7 +280,11 @@ reason="no_authorized_budget"`), and a BUY whose `size_hint` scales the budget t
 would otherwise fail request validation rather than get a graceful business-logic skip). A
 budget scaled to a small but nonzero amount is still forwarded as-is — Floor Broker's own
 minimum-notional/insufficient-qty checks (`execution.py`) already handle that gracefully with
-their own reason codes, so Dealer doesn't need a second floor.
+their own reason codes, so Dealer doesn't need a second floor. `confidence` (a 0–1 fraction,
+default 1.0 — how strongly the indicators agree) drives the `strategy.min_confidence` gate: a
+BUY below the threshold is skipped locally (`reason="low_confidence"`) before Floor Broker is
+called (the option path applies the same check to a bearish put as well — see
+`call_floor_broker_option` below).
 
 When `strategy.dealer_memory.enabled` is true, a same-symbol memory block is added to the user
 prompt. It is intentionally advisory: the LLM sees recent `BUY`/`HOLD`/`SELL` reasoning plus
