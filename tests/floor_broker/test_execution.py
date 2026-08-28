@@ -2229,9 +2229,11 @@ def test_reconcile_tracked_state_once_does_not_rebuild_crypto_stop_for_pending_b
     assert execution._crypto_stops == {}
 
 
-def test_reconcile_tracked_state_once_backfill_failure_does_not_block_reconciliation(monkeypatch):
-    """A failure fetching positions for the backfill must not undo an otherwise-successful order
-    reconciliation -- the two are independent concerns."""
+def test_reconcile_tracked_state_once_returns_false_when_get_all_positions_fails(monkeypatch):
+    """A failed position read is fatal: marking state reconciled after only a partial Alpaca read
+    would leave existing option positions unrebuilt (check_option_stops() protects nothing), skip
+    the crypto-stop rebuild and position_opens backfill, re-enable BUYs via _buy_preflight_skip(),
+    and stop poll_reconciliation() from retrying (it loops only while unreconciled)."""
 
     class FailingPositionsClient(FakeReconstructTradingClient):
         def get_all_positions(self):
@@ -2241,8 +2243,8 @@ def test_reconcile_tracked_state_once_backfill_failure_does_not_block_reconcilia
     monkeypatch.setattr(execution, "_state_reconciled", False)
     monkeypatch.setattr(db, "fetch_open_options_trades", lambda: [])
 
-    assert execution.reconcile_tracked_state_once() is True
-    assert execution.is_state_reconciled() is True
+    assert execution.reconcile_tracked_state_once() is False
+    assert execution.is_state_reconciled() is False
 
 
 def test_reconcile_tracked_state_once_rebuilds_option_position_from_matching_options_trades_row(monkeypatch):
@@ -2475,13 +2477,13 @@ def test_reconcile_tracked_state_once_seeds_db_row_opened_for_contract_already_o
     assert recorded_db["updated"] == (("AAPL250117C00200000", 3.35, 1), {})
 
 
-def test_reconcile_tracked_state_once_defaults_db_row_opened_false_when_open_trades_fetch_fails(monkeypatch):
-    """Regression (fix-loop round 1, finding 2, defensive path): if db.fetch_open_options_trades()
-    raises during the pending-option-order reconstruction step, reconciliation must not crash and
-    must default db_row_opened=False (the safe default -- worst case is one duplicate INSERT, not a
-    crash)."""
+def test_reconcile_tracked_state_once_returns_false_when_open_options_trades_fetch_fails(monkeypatch):
+    """The single options_trades read feeds both the _option_positions rebuild and the
+    open_contract_symbols seed for reconstructed pending BUYs. A DB outage here is fatal for the
+    same reason a failed position read is -- option-stop protection depends on _option_positions
+    being fully rebuilt before state is marked reconciled."""
     monkeypatch.setattr(execution, "trading_client", FakeReconstructTradingClient([], option_orders=[FakeOptionOrder("order-opt-1", "AAPL250117C00200000", "2")]))
-
+    monkeypatch.setattr(execution, "_state_reconciled", False)
     monkeypatch.setattr(db, "record_position_opened", lambda symbol: None)
 
     def _raise():
@@ -2489,8 +2491,33 @@ def test_reconcile_tracked_state_once_defaults_db_row_opened_false_when_open_tra
 
     monkeypatch.setattr(db, "fetch_open_options_trades", _raise)
 
-    assert execution.reconcile_tracked_state_once() is True
-    assert execution._pending_option_fills["order-opt-1"]["db_row_opened"] is False
+    assert execution.reconcile_tracked_state_once() is False
+    assert execution.is_state_reconciled() is False
+    assert "order-opt-1" not in execution._pending_option_fills
+
+
+def test_reconcile_tracked_state_once_returns_false_when_option_positions_rebuild_raises(monkeypatch):
+    """If _rebuild_option_positions_from_positions() itself raises (e.g. a deterministic bug or a
+    malformed Alpaca Position), state must not be marked reconciled -- a half-rebuilt
+    _option_positions leaves pre-restart option positions unprotected by check_option_stops()."""
+
+    class FakeOptionPosition:
+        symbol = "AAPL250117C00200000"
+        qty = "2"
+        asset_class = AssetClass.US_OPTION
+
+    monkeypatch.setattr(execution, "trading_client", FakeReconstructTradingClient([], option_positions=[FakeOptionPosition()]))
+    monkeypatch.setattr(execution, "_state_reconciled", False)
+    monkeypatch.setattr(db, "record_position_opened", lambda symbol: None)
+    monkeypatch.setattr(db, "fetch_open_options_trades", lambda: [])
+
+    def _boom(*a, **k):
+        raise RuntimeError("rebuild bug")
+
+    monkeypatch.setattr(execution, "_rebuild_option_positions_from_positions", _boom)
+
+    assert execution.reconcile_tracked_state_once() is False
+    assert execution.is_state_reconciled() is False
 
 
 def test_reconcile_tracked_state_once_skips_pending_option_order_with_non_occ_symbol(monkeypatch):
@@ -2527,14 +2554,17 @@ def test_reconcile_tracked_state_once_does_not_overwrite_an_already_pending_opti
     assert execution._pending_option_fills["order-opt-1"]["reasoning"] == "already tracked, should not be overwritten"
 
 
-def test_reconcile_tracked_state_once_pending_option_orders_failure_does_not_block_reconciliation(monkeypatch):
+def test_reconcile_tracked_state_once_returns_false_when_open_option_orders_fetch_fails(monkeypatch):
+    """A failed open-option-orders read is fatal: a still-open option BUY order left out of
+    _pending_option_fills can allow a duplicate submission after restart, and a missed SELL stays
+    unobserved forever."""
     monkeypatch.setattr(execution, "trading_client", FakeReconstructTradingClient([], option_orders_error=APIError("unreachable")))
-
+    monkeypatch.setattr(execution, "_state_reconciled", False)
     monkeypatch.setattr(db, "record_position_opened", lambda symbol: None)
     monkeypatch.setattr(db, "fetch_open_options_trades", lambda: [])
 
-    assert execution.reconcile_tracked_state_once() is True
-    assert execution.is_state_reconciled() is True
+    assert execution.reconcile_tracked_state_once() is False
+    assert execution.is_state_reconciled() is False
 
 
 
