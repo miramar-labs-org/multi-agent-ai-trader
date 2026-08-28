@@ -917,121 +917,131 @@ def reconcile_tracked_state_once() -> bool:
 
     log(f"🔄  reconstructed {restored_pending} pending order(s) and {restored_brackets} bracket(s) from Alpaca")
 
-    # Backfill position_opens for every currently-open position -- ON CONFLICT DO NOTHING means
-    # this is a no-op for a symbol already tracked, and only seeds an opened_at for a position
-    # this process has never observed a BUY fill for (e.g. one that predates this feature, or was
-    # opened in a gap while the pod was down). Best-effort: a failure here must not block order
-    # reconciliation, which is why it's wrapped separately from the get_orders() call above.
     # One get_all_positions() call for the whole floor -- stocks, crypto and options all live on
     # the same account now, so a single fetch feeds the crypto-stop rebuild, the position_opens
     # backfill and the option-positions rebuild below.
+    #
+    # A failed read here is FATAL (return False, don't mark reconciled): a partial Alpaca read
+    # that still set _state_reconciled=True would leave existing option positions unrebuilt (so
+    # check_option_stops() protects nothing), skip the crypto-stop rebuild and position_opens
+    # backfill, re-enable BUYs via _buy_preflight_skip(), and stop poll_reconciliation() retrying
+    # (it loops only while unreconciled). The retry-with-backoff in reconstruct_tracked_state()
+    # plus the 60s background loop exist precisely to ride out a transient outage here.
     try:
         all_positions = trading_client.get_all_positions()
     except APIError as exc:
-        all_positions = None
         log(f"💥  failed to fetch open positions from Alpaca while reconciling tracked state: {exc}")
+        return False
 
-    if all_positions is not None:
-        try:
-            crypto_stops_restored = _rebuild_crypto_stops_from_positions(all_positions, load_config())
-        except Exception as exc:
-            crypto_stops_restored = 0
-            log(f"💥  failed to reconstruct crypto stops while reconciling tracked state: {exc}")
-        for position in all_positions:
-            # Option contracts are tracked in _option_positions (OCC symbols), not position_opens --
-            # keep them out of the equity/crypto backfill so db.record_position_opened() never sees
-            # an OCC symbol.
-            if position.asset_class == AssetClass.US_OPTION:
-                continue
-            symbol = canonical_crypto_symbol(position.symbol) if _is_crypto_position(position) else position.symbol
-            db.record_position_opened(symbol)
-        if crypto_stops_restored:
-            log(f"🔄  reconstructed {crypto_stops_restored} crypto synthetic stop/target(s) from open positions")
-
-        try:
-            option_positions = [p for p in all_positions if p.asset_class == AssetClass.US_OPTION]
-            open_trades = db.fetch_open_options_trades()
-            options_restored = _rebuild_option_positions_from_positions(option_positions, open_trades)
-        except Exception as exc:
-            options_restored = 0
-            log(f"💥  failed to reconstruct option positions while reconciling tracked state: {exc}")
-        if options_restored:
-            log(f"🔄  reconstructed {options_restored} option position(s) from Alpaca + options_trades")
-
+    # Single options_trades read for the whole reconcile: it feeds both the _option_positions
+    # rebuild (recovering BUY-side fields Alpaca's Position doesn't carry) and the
+    # open_contract_symbols set that seeds db_row_opened on reconstructed pending BUY orders. A DB
+    # outage here is fatal for the same reason as the position read above -- option-stop protection
+    # depends on _option_positions being fully rebuilt before state is marked reconciled.
     try:
-        # No side filter here (unlike the pre-fix version, which only fetched BUY) -- a Floor Broker
-        # restart between sell_option() submitting a SELL and that SELL's fill would otherwise leave
-        # the SELL permanently unobserved: nothing else ever re-registers it, so options_trades would
-        # stay open forever even after Alpaca fills or cancels it (external review finding 1,
-        # 2026-08-26). Filter to US_OPTION -- this account also carries stock/crypto orders, which the
-        # nested get_orders() call above already reconstructs.
+        open_option_trades = db.fetch_open_options_trades()
+    except Exception as exc:
+        log(f"💥  failed to fetch open options_trades while reconciling tracked state: {exc}")
+        return False
+
+    # Backfill position_opens for every currently-open position -- ON CONFLICT DO NOTHING means
+    # this is a no-op for a symbol already tracked, and only seeds an opened_at for a position
+    # this process has never observed a BUY fill for (e.g. one that predates this feature, or was
+    # opened in a gap while the pod was down). The crypto-stop rebuild is best-effort within this
+    # step: a bad config or one malformed position must not sink the whole reconcile.
+    try:
+        crypto_stops_restored = _rebuild_crypto_stops_from_positions(all_positions, load_config())
+    except Exception as exc:
+        crypto_stops_restored = 0
+        log(f"💥  failed to reconstruct crypto stops while reconciling tracked state: {exc}")
+    for position in all_positions:
+        # Option contracts are tracked in _option_positions (OCC symbols), not position_opens --
+        # keep them out of the equity/crypto backfill so db.record_position_opened() never sees
+        # an OCC symbol.
+        if position.asset_class == AssetClass.US_OPTION:
+            continue
+        symbol = canonical_crypto_symbol(position.symbol) if _is_crypto_position(position) else position.symbol
+        db.record_position_opened(symbol)
+    if crypto_stops_restored:
+        log(f"🔄  reconstructed {crypto_stops_restored} crypto synthetic stop/target(s) from open positions")
+
+    # Fatal on failure (return False): a half-rebuilt _option_positions marked reconciled leaves
+    # pre-restart option positions with no synthetic SL/TP/DTE protection from check_option_stops().
+    try:
+        option_positions = [p for p in all_positions if p.asset_class == AssetClass.US_OPTION]
+        options_restored = _rebuild_option_positions_from_positions(option_positions, open_option_trades)
+    except Exception as exc:
+        log(f"💥  failed to reconstruct option positions while reconciling tracked state: {exc}")
+        return False
+    if options_restored:
+        log(f"🔄  reconstructed {options_restored} option position(s) from Alpaca + options_trades")
+
+    # No side filter here (unlike the pre-fix version, which only fetched BUY) -- a Floor Broker
+    # restart between sell_option() submitting a SELL and that SELL's fill would otherwise leave
+    # the SELL permanently unobserved: nothing else ever re-registers it, so options_trades would
+    # stay open forever even after Alpaca fills or cancels it (external review finding 1,
+    # 2026-08-26). Filter to US_OPTION -- this account also carries stock/crypto orders, which the
+    # nested get_orders() call above already reconstructs. Fatal on failure (return False): a
+    # still-open option BUY order missing from _pending_option_fills can allow a duplicate
+    # submission after restart, and a missed SELL stays unobserved forever.
+    try:
         open_option_orders = [
             o
             for o in trading_client.get_orders(GetOrdersRequest(status="open"))
             if o.asset_class == AssetClass.US_OPTION
         ]
-
-        # Independent of the option-positions-rebuild block above -- that block's own `open_trades`
-        # is assigned inside a nested try and may be unbound if either its outer or inner try raised
-        # first, so reusing it here risks a NameError or silently-wrong state (fix-loop round 1,
-        # finding 2). This fetch has its own try/except so a DB hiccup during just this step
-        # degrades to the safe default (db_row_opened=False -- worst case one duplicate INSERT on
-        # the rare double-failure case) rather than losing the whole reconciliation step.
-        try:
-            open_contract_symbols = {trade["contract_symbol"] for trade in db.fetch_open_options_trades()}
-        except Exception as exc:
-            open_contract_symbols = set()
-            log(f"💥  failed to fetch open options_trades while reconstructing pending option orders: {exc}")
-
-        restored_pending_options = 0
-        for order in open_option_orders:
-            with _state_lock:
-                already_pending = order.id in _pending_option_fills
-            if already_pending:
-                continue
-            if order.side == OrderSide.SELL:
-                # A pending SELL has no BUY-side fields to reconstruct (right/strike/delta/etc.) and
-                # doesn't need them -- check_pending_option_fills()'s SELL branch only reads
-                # contract_symbol/symbol/reason. _option_positions itself is reconstructed separately
-                # above (_rebuild_option_positions_from_positions), from Alpaca's still-open position,
-                # so it's already tracked here independent of this order.
-                with _state_lock:
-                    underlying_symbol = _option_positions.get(order.symbol, {}).get("symbol")
-                _set_pending_option_fill(order.id, {
-                    "contract_symbol": order.symbol,
-                    "symbol": underlying_symbol,
-                    "action": "SELL",
-                    "reason": "reconstructed_after_restart",
-                })
-                restored_pending_options += 1
-                continue
-            parsed = _parse_occ_contract_symbol(order.symbol)
-            if parsed is None:
-                log(f"⚠️  cannot reconstruct pending option order {order.id} ({order.symbol}): symbol doesn't match OCC format")
-                continue
-            # Seed db_row_opened from whether this contract already has an open options_trades row
-            # (e.g. the order had already partially filled and been DB-recorded before the restart,
-            # or a race with the poll thread) -- otherwise the eventual fill would re-INSERT a
-            # duplicate open row and re-fire the first-fill Slack notification for a contract that's
-            # already tracked (fix-loop round 1, finding 2).
-            _set_pending_option_fill(order.id, {
-                "contract_symbol": order.symbol,
-                "symbol": parsed["symbol"],
-                "action": "BUY",
-                "right": parsed["right"],
-                "strike": parsed["strike"],
-                "expiration": parsed["expiration"],
-                "delta": None,
-                "qty": int(float(order.qty)),
-                "reasoning": "reconstructed_after_restart",
-                "cycle_id": None,
-                "db_row_opened": order.symbol in open_contract_symbols,
-            })
-            restored_pending_options += 1
-        if restored_pending_options:
-            log(f"🔄  reconstructed {restored_pending_options} pending option order(s) from Alpaca")
     except APIError as exc:
         log(f"💥  failed to fetch open option orders from Alpaca while reconciling tracked state: {exc}")
+        return False
+
+    # Seed db_row_opened from whether the contract already has an open options_trades row (from the
+    # single fetch above) -- otherwise the eventual fill re-INSERTs a duplicate open row and
+    # re-fires the first-fill Slack notification for a contract that's already tracked (fix-loop
+    # round 1, finding 2). open_option_trades is guaranteed bound here: its fetch is fatal above.
+    open_contract_symbols = {trade["contract_symbol"] for trade in open_option_trades}
+
+    restored_pending_options = 0
+    for order in open_option_orders:
+        with _state_lock:
+            already_pending = order.id in _pending_option_fills
+        if already_pending:
+            continue
+        if order.side == OrderSide.SELL:
+            # A pending SELL has no BUY-side fields to reconstruct (right/strike/delta/etc.) and
+            # doesn't need them -- check_pending_option_fills()'s SELL branch only reads
+            # contract_symbol/symbol/reason. _option_positions itself is reconstructed separately
+            # above (_rebuild_option_positions_from_positions), from Alpaca's still-open position,
+            # so it's already tracked here independent of this order.
+            with _state_lock:
+                underlying_symbol = _option_positions.get(order.symbol, {}).get("symbol")
+            _set_pending_option_fill(order.id, {
+                "contract_symbol": order.symbol,
+                "symbol": underlying_symbol,
+                "action": "SELL",
+                "reason": "reconstructed_after_restart",
+            })
+            restored_pending_options += 1
+            continue
+        parsed = _parse_occ_contract_symbol(order.symbol)
+        if parsed is None:
+            log(f"⚠️  cannot reconstruct pending option order {order.id} ({order.symbol}): symbol doesn't match OCC format")
+            continue
+        _set_pending_option_fill(order.id, {
+            "contract_symbol": order.symbol,
+            "symbol": parsed["symbol"],
+            "action": "BUY",
+            "right": parsed["right"],
+            "strike": parsed["strike"],
+            "expiration": parsed["expiration"],
+            "delta": None,
+            "qty": int(float(order.qty)),
+            "reasoning": "reconstructed_after_restart",
+            "cycle_id": None,
+            "db_row_opened": order.symbol in open_contract_symbols,
+        })
+        restored_pending_options += 1
+    if restored_pending_options:
+        log(f"🔄  reconstructed {restored_pending_options} pending option order(s) from Alpaca")
 
     _set_state_reconciled(True)
     return True

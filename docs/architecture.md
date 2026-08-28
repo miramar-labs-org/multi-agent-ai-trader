@@ -581,7 +581,18 @@ nothing has filled yet, so no notification could have been missed by the restart
 `reconstruct_tracked_state()` retries the underlying `execution.reconcile_tracked_state_once()`
 up to 5 times with exponential backoff (5s, 10s, 20s, 40s) rather than giving up on the first
 `APIError` — a transient Alpaca outage at exactly boot time shouldn't permanently strand the pod
-with empty tracking dicts. `execution.is_state_reconciled()` stays `False` until an attempt
+with empty tracking dicts. `reconcile_tracked_state_once()` returns `False` (never marks state
+reconciled) if **any** of its reads fail: the nested `get_orders()` for stock/crypto orders, the
+one `get_all_positions()` for the whole floor, the single `db.fetch_open_options_trades()` that
+feeds both the `_option_positions` rebuild and the pending-BUY `db_row_opened` seed, the
+`_rebuild_option_positions_from_positions()` call itself, or the `get_orders(status="open")` for
+pending option orders. A partial read that still flipped the flag would leave existing option
+positions unrebuilt (so `check_option_stops()` protects nothing), silently skip the crypto-stop
+and `position_opens` backfills, re-enable BUYs, and stop the background retry loop
+(`main.poll_reconciliation()` loops only while unreconciled) — so every one of these is fatal,
+and the retry machinery above rides out the transient case. Only `_rebuild_crypto_stops_from_positions()`
+and the per-symbol `record_position_opened()` backfill stay best-effort within an otherwise-successful
+reconcile. `execution.is_state_reconciled()` stays `False` until an attempt
 succeeds, and `execution.buy()` refuses new BUYs (`status="skipped"`,
 `reason="state_not_reconciled"` -- `ExecuteResponse`'s status `Literal` doesn't have a distinct
 "rejected" value, so this reuses "skipped" like every other declined-BUY outcome) while it's
@@ -961,10 +972,12 @@ Write sites:
 - `src/floor_broker/main.py::poll_pending_fills()` — additionally calls
   `record_position_opened()`/`record_position_closed()` on every BUY/SELL fill respectively,
   keeping `position_opens` in sync. `src/floor_broker/execution.py::reconcile_tracked_state_once()`
-  also backfills it from `trading_client.get_all_positions()` on every process start (best-effort,
-  `ON CONFLICT DO NOTHING` so it never overwrites an already-tracked symbol's `opened_at`) —
+  also backfills it from `trading_client.get_all_positions()` on every process start
+  (`ON CONFLICT DO NOTHING` so it never overwrites an already-tracked symbol's `opened_at`) —
   this is how a position that predates the feature, or was opened in a restart gap, still ends up
-  tracked.
+  tracked. The `get_all_positions()` read that feeds this backfill is not best-effort: a failure
+  aborts the whole reconcile (see the **Restart recovery** subsection under Agent 3 above); only
+  the per-symbol `record_position_opened()` writes are.
 
 There is no historical backfill — the tables start empty at deploy time; decisions made before
 v0.6.1 are unrecoverable, same limitation as the Slack-only trail it replaces. (v0.6.0 shipped
