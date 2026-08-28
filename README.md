@@ -179,7 +179,9 @@ flowchart TD
 
     subgraph Dealer["Dealer — every 10 min while market is open, per symbol"]
         direction TB
-        D1[fetch_indicators] --> D1b[fetch_market_data]
+        D1[fetch_indicators] --> D1a{indicators present?}
+        D1a -->|no| D1s["skip_missing_indicators — no order"]
+        D1a -->|yes| D1b[fetch_market_data]
         D1b --> D2[llm_call]
         D2 --> D3{"stock + options_trading.enabled<br/>+ action != HOLD?"}
         D3 -->|no| D6{call_floor_broker}
