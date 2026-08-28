@@ -329,7 +329,9 @@ A BUY/SELL whose confidence is below `strategy.min_confidence` still reaches `se
 `floor_broker_event` "skip" row and `execution_result` reason — matching the stock path — instead of
 a bare `no_option_pick`. It emits no extra Floor Broker Slack line; the Dealer signal already
 announced the sub-threshold call. A genuine selection failure (chain fetch/parse error, no row in
-the windows) has no `option_skip` and is still reported as `no_option_pick`.
+the windows) has no `option_skip` and is reported as `no_option_pick` — it also records a
+`floor_broker_event` "skip" row (`"no option contract was selected"`), so every skip outcome in
+`call_floor_broker_option` leaves an event trail, not just the gated ones.
 
 **Contract selector** (`_select_option_contract_async`, `src/dealer/graph.py`) — a LangChain
 tool-calling loop (≤ `_MAX_TOOL_CALL_ROUNDS` = 6 rounds) using the same `cfg.llm` model as the
@@ -384,7 +386,8 @@ trust the LLM's copy of the constraints:
   same rule authoritatively. A failed *selection* (no `option_pick`) skips this check and still
   emits the dealer signal, then reports its reason: `low_confidence` (with a `floor_broker_event`
   "skip" row, from `state["option_skip"]` set by `select_option_contract`) when confidence was
-  below `strategy.min_confidence`, otherwise `no_option_pick` for a genuine chain-selection failure.
+  below `strategy.min_confidence`, otherwise `no_option_pick` for a genuine chain-selection failure
+  (also a `floor_broker_event` "skip" row). Neither emits an extra Slack line.
 - All the same entry gates as `call_floor_broker` apply, and unconditionally (unlike the stock
   path where they only guard `action == "BUY"`): macro blackout, same-symbol stop cooldown,
   win-rate throttle, `budget > 0`. Every option entry — call *or* put — is a brand-new position;

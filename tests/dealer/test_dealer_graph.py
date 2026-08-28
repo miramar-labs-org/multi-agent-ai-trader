@@ -1108,18 +1108,28 @@ def test_call_floor_broker_option_skips_quietly_when_contract_already_exposed(mo
 
 
 def test_call_floor_broker_option_still_signals_when_selection_failed(monkeypatch):
-    """A failed selection (option_pick is None) skips the exposure check -- which needs a contract
-    symbol -- but must still emit the dealer signal so a failed pick is visible."""
-    signals = []
+    """A genuine failed selection (option_pick is None, no option_skip) skips the exposure check --
+    which needs a contract symbol -- but must still emit the dealer signal so a failed pick is
+    visible, and record one auditable floor_broker_event "skip" row (mirroring the low_confidence
+    sibling branch and every other skip outcome in this node). No extra Floor Broker Slack line --
+    the dealer signal above already announced the call."""
+    signals, events = [], []
     monkeypatch.setattr(graph.slack, "notify_dealer_signal", lambda *a, **k: signals.append(a))
     monkeypatch.setattr(graph.db, "record_dealer_decision", lambda *a, **k: None)
+    monkeypatch.setattr(graph.db, "record_floor_broker_event", lambda *a, **k: events.append(a))
     monkeypatch.setattr(graph, "_option_contract_already_exposed", _fail_if_exposure_checked)
+
+    def _no_slack(*a, **k):
+        raise AssertionError("a genuine no_option_pick skip must not post a Floor Broker line")
+
+    monkeypatch.setattr(graph.slack, "notify_floor_broker_result", _no_slack)
 
     state = {**_state("rsi: 71.2"), "signal": {"action": "BUY", "confidence": 0.9, "reasoning": "r"}, "option_pick": None}
     result = graph.call_floor_broker_option(state, _option_cfg())
 
     assert result["execution_result"]["reason"] == "no_option_pick"
     assert signals == [("CRV/USD", "BUY", "r")]
+    assert events == [("CRV/USD", "skip", "no option contract was selected")]
 
 
 def _fail_if_exposure_checked(cfg, sym):
