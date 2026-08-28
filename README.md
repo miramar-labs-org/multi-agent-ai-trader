@@ -158,7 +158,7 @@ context, and parse the response into a strict structured-output schema (via Lang
   LLM decides BUY/HOLD/SELL with recent same-symbol history in the prompt when enabled → apply
   local BUY gates (macro blackout, same-symbol stop cooldown, win-rate throttle, confidence,
   budget) → if not HOLD and not locally skipped, dispatch to Floor Broker over HTTP. When
-  `options_trading.enabled` and the symbol is a stock, the signal instead flows through
+  `options_trading.enabled` and the symbol is a stock, a non-HOLD signal instead flows through
   `select_option_contract` (an MCP tool-calling loop against Alpaca's options data that picks a
   concrete call/put contract) → `call_floor_broker_option` (re-validates DTE/delta/risk, sizes
   by `strategy.risk_per_trade_usd`, POSTs `/execute-option`).
@@ -181,7 +181,7 @@ flowchart TD
         direction TB
         D1[fetch_indicators] --> D1b[fetch_market_data]
         D1b --> D2[llm_call]
-        D2 --> D3{"stock + options_trading.enabled?"}
+        D2 --> D3{"stock + options_trading.enabled<br/>+ action != HOLD?"}
         D3 -->|no| D6{call_floor_broker}
         D6 -->|HOLD| D4["skipped — no order"]
         D6 -->|BUY / SELL| D5["POST /execute"]
