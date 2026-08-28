@@ -738,7 +738,14 @@ def call_floor_broker_option(state: DealerState, cfg) -> DealerState:
                     "detail": skip["detail"],
                 },
             }
-        return {**state, "execution_result": {"status": "skipped", "reason": "no_option_pick", "detail": "no option contract was selected"}}
+        # Genuine selection failure (LLM produced nothing usable and _fallback_pick found no
+        # contract, or _select_option_contract_async raised). Record one auditable floor_broker_event
+        # "skip" row like the low_confidence branch above and every other skip outcome in this node --
+        # otherwise this is the only skip that leaves no Floor Broker event trail. No extra Slack
+        # line -- the dealer signal above already announced the call.
+        detail = "no option contract was selected"
+        db.record_floor_broker_event(state["symbol"], "skip", detail)
+        return {**state, "execution_result": {"status": "skipped", "reason": "no_option_pick", "detail": detail}}
 
     blackout_label = _macro_blackout_active(cfg)
     if blackout_label:
