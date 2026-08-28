@@ -5,6 +5,11 @@
 __pycache__/
 *.pyc
 
+# Python build artifacts (pyproject.toml)
+build/
+dist/
+*.egg-info/
+
 notebook.ipynb
 .ipynb_checkpoints/
 

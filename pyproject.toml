@@ -1,0 +1,31 @@
+# Packaging metadata so the trading-floor agent code can be installed as a
+# pinned dependency by sibling repos (initially `agent-model-bakeoff`, which runs
+# the real Analyst / Dealer entrypoints in its eval harnesses rather than
+# re-implementing them).
+#
+# The production images do NOT use this file -- they still `pip install -r
+# requirements.txt` and run with `PYTHONPATH=/app` (see the `Dockerfile.*`).
+# This only adds an `pip install .` / `pip install git+https://...` path.
+#
+# The importable top-level package is `src` (matching the existing
+# `from src.<agent>... import ...` convention used everywhere in the tree). A
+# top-level package named `src` is unusual; renaming it would touch every module
+# and both deploy paths, so it is deliberately kept as-is for a consumer that is
+# internal-only.
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "multi-agent-ai-trader"
+version = "0.1.0"
+description = "3-agent trading floor (Analyst / Dealer / Floor Broker) on the Miramar platform"
+requires-python = ">=3.12"
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+include = ["src*"]
