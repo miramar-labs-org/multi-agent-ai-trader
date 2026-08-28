@@ -10,7 +10,11 @@ llm:
 langsmith:
   enabled: true
   project: "multi-agent-ai-trader"   # requires LANGCHAIN_API_KEY in the mlabs-api-keys secret
-  sampling_rate: 0.5   # caps Dealer's poll-driven trace volume under the free Developer plan's 5k traces/month limit
+  sampling_rate: 1.0   # TEMP (2026-08-28, agent-model-bakeoff): full capture to thicken the
+                       # analyst_universe + option_pick eval slices before a v20260904 re-export.
+                       # Dealer's poll-driven volume will blow the free Developer plan's 5k
+                       # traces/month cap mid-month -- acceptable, we already have enough Dealer
+                       # cases. Revert to 0.5 once the refreshed dataset is frozen.
 
 slack:
   enabled: true   # requires SLACK_WEBHOOK_URL2 in the mlabs-api-keys secret; posts to #miramar-trading-floor
