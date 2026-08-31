@@ -15,7 +15,13 @@ from src.common.logging import get_logger
 from src.common.indicators import fetch_indicators_bulk
 from src.dealer.features import compute_derived_features, format_features_text
 from src.dealer.mcp_options import get_options_tools
-from src.dealer.option_chain import compact_tool_result, estimate_tokens, parse_option_chain
+from src.dealer.option_chain import (
+    compact_tool_result,
+    ensure_option_feed,
+    estimate_tokens,
+    mcp_text,
+    parse_option_chain,
+)
 from src.dealer.schema import OptionContractPick, Signal
 
 log = get_logger("DEALER")
@@ -532,6 +538,10 @@ async def _select_option_contract_async(state: DealerState, cfg, signal: dict) -
     )
     agent_llm = llm.bind_tools(tools)
     right = "call" if signal["action"] == "BUY" else "put"
+    # opra (the alpaca-mcp default) is a paid real-time entitlement the paper account lacks -> 403
+    # on every option-data call. "indicative" is the free feed. Overridable for the day an account
+    # with an OPRA subscription is pointed at.
+    data_feed = cfg.options_trading.get("data_feed", "indicative")
 
     et = pytz.timezone("US/Eastern")
     today = datetime.now(et).date()
@@ -542,12 +552,12 @@ async def _select_option_contract_async(state: DealerState, cfg, signal: dict) -
     messages = [
         SystemMessage(
             content=(
-                "You are an options contract selector for a paper-trading account. Use the "
-                "provided Alpaca tools to look up the option chain, quotes, and Greeks for the "
-                "given underlying symbol, then pick exactly one contract that fits the stated "
-                "constraints. ALWAYS call get_option_chain with type set to the desired right, "
-                "expiration_date_gte and expiration_date_lte set to the given bounds, and limit "
-                "set to 50 or fewer. Never request the full chain."
+                "You are an options contract selector for a paper-trading account. The option "
+                f"chain for the target window has already been fetched (feed={data_feed}) and is "
+                "included below -- pick exactly one contract from it that fits the stated "
+                "constraints. If you need to look up anything further, use the provided Alpaca "
+                f"tools and ALWAYS pass feed={data_feed!r} (the default 'opra' feed 403s on this "
+                "account); set type to the desired right and keep limit at 50 or fewer."
             )
         ),
         HumanMessage(
@@ -561,13 +571,49 @@ async def _select_option_contract_async(state: DealerState, cfg, signal: dict) -
                 f"Minimum open interest: {cfg.options_trading.min_open_interest}\n"
                 f"Minimum volume: {cfg.options_trading.min_volume}\n"
                 f"Dealer reasoning for the underlying signal: {signal['reasoning']}\n\n"
-                "Call get_option_chain (filtered as instructed), inspect quotes/Greeks, then "
+                "Inspect the pre-fetched chain below (call more tools only if needed), then "
                 "respond with your final pick."
             )
         ),
     ]
 
     seen_rows: list[dict] = []
+
+    # Deterministic chain pre-fetch. The local model (qwen3.6:35b-a3b) is unreliable at both
+    # emitting the get_option_chain tool call and returning a structured pick -- see
+    # _fallback_pick's docstring. Fetching the chain ourselves, once, with known-good filters
+    # guarantees seen_rows is populated (so _fallback_pick can always run) regardless of what the
+    # model does. The agent loop below still runs so a more capable model can refine, but it is no
+    # longer load-bearing.
+    chain_tool = tools_by_name.get("get_option_chain")
+    if chain_tool is not None:
+        seed_args = ensure_option_feed(
+            "get_option_chain",
+            {
+                "underlying_symbol": state["symbol"],
+                "type": right,
+                "expiration_date_gte": exp_gte,
+                "expiration_date_lte": exp_lte,
+                "limit": 50,
+            },
+            data_feed,
+        )
+        try:
+            seed_raw = mcp_text(await chain_tool.ainvoke(seed_args))
+            seed_rows = parse_option_chain(seed_raw)
+            seen_rows.extend(seed_rows)
+            messages.append(
+                HumanMessage(
+                    content=(
+                        f"Pre-fetched {right} option chain for {state['symbol']} "
+                        f"({exp_gte} to {exp_lte}) -- {len(seed_rows)} contract(s):\n"
+                        + compact_tool_result("get_option_chain", seed_raw, target_delta_mid=delta_mid)
+                    )
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed pre-fetch must not abort the selector
+            log(f"⚠️ option selection for {state['symbol']}: chain pre-fetch failed ({exc})")
+
     for _ in range(_MAX_TOOL_CALL_ROUNDS):
         messages = _trim_history(messages, _OPTION_PROMPT_TOKEN_HARD_CAP)
         response = agent_llm.invoke(messages)
@@ -581,12 +627,12 @@ async def _select_option_contract_async(state: DealerState, cfg, signal: dict) -
                 messages.append(ToolMessage(content=f"error: unknown tool {call['name']!r}", tool_call_id=call["id"]))
                 continue
             try:
-                result = await tool.ainvoke(call["args"])
+                result = await tool.ainvoke(ensure_option_feed(call["name"], call["args"], data_feed))
             except Exception as exc:  # noqa: BLE001 - a bad tool call must not abort the whole selector
                 log(f"⚠️ option selection for {state['symbol']}: tool {call['name']} failed ({exc}), skipping")
                 messages.append(ToolMessage(content=f"error: tool {call['name']} failed: {exc}", tool_call_id=call["id"]))
                 continue
-            raw = str(result)
+            raw = mcp_text(result)
             seen_rows.extend(parse_option_chain(raw))
             messages.append(
                 ToolMessage(
