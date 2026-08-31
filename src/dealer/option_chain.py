@@ -6,6 +6,10 @@ straight into the LangChain message history (and re-sending it every tool-callin
 round) is what hard-hung the DGX on 2026-08-27. `compact_tool_result` shrinks each
 payload to the handful of fields the selector actually needs; `parse_option_chain`
 exposes the same rows structurally for the deterministic fallback pick.
+
+Both first peel the alpaca-mcp-server trust-boundary envelope (see
+`_unwrap_security_envelope`) -- without that the real `snapshots` map stays hidden
+under `data`, every contract row comes back empty, and the fallback pick starves.
 """
 
 import json
@@ -13,6 +17,30 @@ import re
 
 _OCC_RE = re.compile(r"^([A-Z]{1,6})(\d{6})([CP])(\d{8})$")
 _CHAIN_TOOLS = {"get_option_chain", "get_option_snapshot"}
+
+# alpaca-mcp-server >=0.x wraps every tool result in a trust-boundary envelope
+# (alpaca_mcp_server.security.TrustBoundaryMiddleware): the real payload moves
+# under `data`, alongside a `_alpaca_mcp_security` metadata block. langchain-mcp
+# -adapters passes that joined text through verbatim, so the Dealer's option loop
+# sees the wrapped JSON. Unwrap it before looking for `snapshots`.
+_SECURITY_KEY = "_alpaca_mcp_security"
+_DATA_KEY = "data"
+
+
+def _unwrap_security_envelope(data):
+    """Peel the alpaca-mcp-server trust-boundary envelope, if present. Non-enveloped
+    payloads pass through untouched. The `data` payload can itself be a `{"text": "<json>"}`
+    fallback block (non-structured tool output) -- parse that one level deeper too."""
+    for _ in range(2):
+        if not (isinstance(data, dict) and _SECURITY_KEY in data and _DATA_KEY in data):
+            break
+        data = data[_DATA_KEY]
+        if isinstance(data, dict) and set(data) == {"text"} and isinstance(data["text"], str):
+            try:
+                data = json.loads(data["text"])
+            except (TypeError, ValueError):
+                break
+    return data
 
 
 def parse_occ_symbol(sym: str) -> tuple[str, str, str, float] | None:
@@ -39,6 +67,7 @@ def parse_option_chain(raw: str) -> list[dict]:
         data = json.loads(raw)
     except (TypeError, ValueError):
         return []
+    data = _unwrap_security_envelope(data)
     if not isinstance(data, dict):
         return []
     snapshots = data.get("snapshots", data)
