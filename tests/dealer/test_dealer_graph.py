@@ -575,6 +575,83 @@ def test_select_option_contract_async_uses_fallback_when_structured_output_raise
     assert "fallback" in pick.reasoning.lower()
 
 
+def test_select_option_contract_async_prefetches_chain_with_indicative_feed(monkeypatch):
+    """The deterministic pre-fetch must run before the agent loop, filter the chain to the right /
+    expiration window, and force feed=indicative -- so a model that never calls a tool and returns
+    no structured pick still yields a fallback contract from the seeded rows."""
+    captured = {}
+    calls = []
+    ok_exp = (datetime.now(pytz.timezone("US/Eastern")).date() + timedelta(days=25)).isoformat()
+    occ = f"AAPL{ok_exp.replace('-', '')[2:]}C00145000"
+    envelope = {
+        "_alpaca_mcp_security": {"trust": "untrusted_tool_output"},
+        "data": {"snapshots": {occ: {"latestQuote": {"bp": 1.0, "ap": 1.2}, "greeks": {"delta": 0.46}}}},
+    }
+    # the real adapter (>=0.3) hands back a list of content blocks wrapping the security envelope
+    chain_blocks = [{"type": "text", "text": json.dumps(envelope)}]
+
+    class _Tool:
+        name = "get_option_chain"
+
+        async def ainvoke(self, args):
+            calls.append(args)
+            return chain_blocks
+
+    class _Bound:
+        def invoke(self, messages):
+            return type("R", (), {"tool_calls": []})()  # model never calls a tool
+
+    class _Structured:
+        def invoke(self, messages):
+            return None  # qwen3.6 empty-structured-output regression
+
+    pick = _run_async_select(monkeypatch, _Tool(), _Bound, _Structured, captured)
+
+    assert calls, "chain was never pre-fetched"
+    seed = calls[0]
+    assert seed["feed"] == "indicative"
+    assert seed["type"] == "call"
+    assert seed["expiration_date_gte"] and seed["expiration_date_lte"]
+    assert pick is not None and pick.contract_symbol == occ
+    assert "fallback" in pick.reasoning.lower()
+
+
+def test_select_option_contract_async_forces_feed_on_llm_tool_calls(monkeypatch):
+    """A get_option_latest_quote the model emits without a feed arg (or with feed=opra) must be
+    rewritten to the configured feed before dispatch."""
+    captured = {}
+    seen_args = []
+
+    class _Tool:
+        name = "get_option_latest_quote"
+
+        async def ainvoke(self, args):
+            seen_args.append(dict(args))
+            return json.dumps({"snapshots": {}})
+
+    class _Bound:
+        def __init__(self):
+            self.n = 0
+
+        def invoke(self, messages):
+            self.n += 1
+            if self.n == 1:
+                return type(
+                    "R", (),
+                    {"tool_calls": [{"name": "get_option_latest_quote", "args": {"symbols": "X", "feed": "opra"}, "id": "c"}]},
+                )()
+            return type("R", (), {"tool_calls": []})()
+
+    class _Structured:
+        def invoke(self, messages):
+            return None
+
+    # no get_option_chain tool here, so the only ainvoke calls come from the loop
+    _run_async_select(monkeypatch, _Tool(), _Bound, _Structured, captured)
+
+    assert seen_args and all(a["feed"] == "indicative" for a in seen_args)
+
+
 def _single_call_chain():
     """A one-contract chain whose sole row (a call, mid-delta, ~25 DTE, quoted) qualifies for the
     deterministic fallback -- so tests can assert the fallback engaged by checking the pick came back
