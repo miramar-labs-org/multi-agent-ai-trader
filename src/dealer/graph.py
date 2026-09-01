@@ -520,6 +520,37 @@ def _fallback_pick(rows: list[dict], right: str, cfg, delta_mid: float, today) -
     )
 
 
+def _latest_underlying_price(state: DealerState, cfg) -> float | None:
+    """Most recent close from the shortest configured timeframe -- a good-enough spot proxy for
+    centering the option-chain strike window. None when no bars were fetched (a market-data outage,
+    or a path that skipped fetch_market_data), in which case the pre-fetch omits the strike filter
+    and falls back to the full (expiration-windowed) chain."""
+    raw_bars = state.get("raw_bars") or {}
+    for tf in cfg.get("dealer", {}).get("timeframes", []) or raw_bars:
+        df = raw_bars.get(tf)
+        if df is not None and not df.empty:
+            try:
+                return float(df["close"].iloc[-1])
+            except (KeyError, IndexError, ValueError, TypeError):
+                return None
+    return None
+
+
+def _chain_strike_bounds(spot: float | None, cfg) -> dict:
+    """Strike window for the deterministic chain pre-fetch, centred on the underlying spot. Without
+    it, get_option_chain returns `limit` contracts from the low (deep-ITM for calls) end of the
+    strike ladder, none of them anywhere near the target-delta band -- the observed cause of
+    repeated `no option contract was selected` skips. Empty dict when spot is unknown or the knob
+    is disabled (strike_window_pct <= 0), leaving the pre-fetch expiration-windowed only."""
+    pct = cfg.options_trading.get("strike_window_pct", 0.20)
+    if spot is None or not pct or pct <= 0:
+        return {}
+    return {
+        "strike_price_gte": round(spot * (1 - pct), 2),
+        "strike_price_lte": round(spot * (1 + pct), 2),
+    }
+
+
 async def _select_option_contract_async(state: DealerState, cfg, signal: dict) -> OptionContractPick | None:
     tools = await get_options_tools()
     tools_by_name = {t.name: t for t in tools}
@@ -587,32 +618,48 @@ async def _select_option_contract_async(state: DealerState, cfg, signal: dict) -
     # longer load-bearing.
     chain_tool = tools_by_name.get("get_option_chain")
     if chain_tool is not None:
-        seed_args = ensure_option_feed(
-            "get_option_chain",
-            {
-                "underlying_symbol": state["symbol"],
-                "type": right,
-                "expiration_date_gte": exp_gte,
-                "expiration_date_lte": exp_lte,
-                "limit": 50,
-            },
-            data_feed,
-        )
-        try:
-            seed_raw = mcp_text(await chain_tool.ainvoke(seed_args))
+        prefetch_limit = cfg.options_trading.get("chain_prefetch_limit", 100)
+        base_args = {
+            "underlying_symbol": state["symbol"],
+            "type": right,
+            "expiration_date_gte": exp_gte,
+            "expiration_date_lte": exp_lte,
+            "limit": prefetch_limit,
+        }
+        strike_bounds = _chain_strike_bounds(_latest_underlying_price(state, cfg), cfg)
+
+        # First pass narrows to a strike window around spot; if it errors (e.g. a server that
+        # rejects strike_price_gte/lte) or comes back empty (stale spot proxy, sparse strikes, an
+        # odd underlying) fall through to the expiration-window-only pass, so the fallback pick is
+        # never starved by our own filter.
+        attempts = [{**base_args, **strike_bounds}, base_args] if strike_bounds else [base_args]
+        for i, attempt_args in enumerate(attempts):
+            seed_args = ensure_option_feed("get_option_chain", attempt_args, data_feed)
+            try:
+                seed_raw = mcp_text(await chain_tool.ainvoke(seed_args))
+            except Exception as exc:  # noqa: BLE001 - a failed pre-fetch must not abort the selector
+                log(f"⚠️ option selection for {state['symbol']}: chain pre-fetch failed ({exc})")
+                continue
             seed_rows = parse_option_chain(seed_raw)
-            seen_rows.extend(seed_rows)
-            messages.append(
-                HumanMessage(
-                    content=(
-                        f"Pre-fetched {right} option chain for {state['symbol']} "
-                        f"({exp_gte} to {exp_lte}) -- {len(seed_rows)} contract(s):\n"
-                        + compact_tool_result("get_option_chain", seed_raw, target_delta_mid=delta_mid)
+            if not seed_rows and i < len(attempts) - 1:
+                continue
+            if seed_rows:
+                seen_rows.extend(seed_rows)
+                window = (
+                    f", strikes {strike_bounds['strike_price_gte']}-{strike_bounds['strike_price_lte']}"
+                    if strike_bounds and "strike_price_gte" in seed_args
+                    else ""
+                )
+                messages.append(
+                    HumanMessage(
+                        content=(
+                            f"Pre-fetched {right} option chain for {state['symbol']} "
+                            f"({exp_gte} to {exp_lte}{window}) -- {len(seed_rows)} contract(s):\n"
+                            + compact_tool_result("get_option_chain", seed_raw, target_delta_mid=delta_mid)
+                        )
                     )
                 )
-            )
-        except Exception as exc:  # noqa: BLE001 - a failed pre-fetch must not abort the selector
-            log(f"⚠️ option selection for {state['symbol']}: chain pre-fetch failed ({exc})")
+                break
 
     for _ in range(_MAX_TOOL_CALL_ROUNDS):
         messages = _trim_history(messages, _OPTION_PROMPT_TOKEN_HARD_CAP)

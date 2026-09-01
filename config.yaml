@@ -122,6 +122,15 @@ options_trading:
   dte_force_close: 3        # force-close regardless of P&L once DTE drops to/below this
   target_delta_min: 0.30
   target_delta_max: 0.60
+  strike_window_pct: 0.20   # deterministic chain pre-fetch: restrict get_option_chain to strikes
+                            # within ±this fraction of the underlying spot. Without it the pre-fetch
+                            # returns `chain_prefetch_limit` contracts from the deep-ITM end of the
+                            # ladder (none near target_delta), which surfaced as repeated
+                            # "no option contract was selected" skips. Empty window / spot unknown
+                            # -> expiration-windowed only. An empty first pass retries without it.
+  chain_prefetch_limit: 100 # max contracts the deterministic pre-fetch pulls (was a hardcoded 50).
+                            # compact_tool_result still trims what the LLM sees; the fallback pick
+                            # scans them all, so a wider net = more rows with usable greeks/quotes.
   min_open_interest: 100    # best-effort liquidity floors: enforced only for contracts where Alpaca's
   min_volume: 10            # snapshot actually returns OI / volume (it usually omits both). A row
                            # missing the field is NOT rejected -- a hard gate would block all options
