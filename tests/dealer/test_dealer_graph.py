@@ -2,6 +2,7 @@ import asyncio
 import json
 from datetime import date, datetime, timedelta
 
+import pandas as pd
 import pytz
 from omegaconf import OmegaConf
 
@@ -348,7 +349,7 @@ def _async_options_state():
     }
 
 
-def _run_async_select(monkeypatch, tool, bound_cls, structured_cls, captured, cfg=None):
+def _run_async_select(monkeypatch, tool, bound_cls, structured_cls, captured, cfg=None, state=None):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
     async def _fake_tools():
@@ -366,7 +367,7 @@ def _run_async_select(monkeypatch, tool, bound_cls, structured_cls, captured, cf
 
     monkeypatch.setattr(graph, "get_options_tools", _fake_tools)
     monkeypatch.setattr(graph, "ChatOpenAI", FakeChatOpenAI)
-    state = _async_options_state()
+    state = state or _async_options_state()
     return asyncio.run(
         graph._select_option_contract_async(state, cfg or _async_options_cfg(), state["signal"])
     )
@@ -540,6 +541,117 @@ def test_fallback_pick_returns_none_when_nothing_qualifies():
     )
     rows = [_row("A", 0.05, "2025-06-20"), _row("B", 0.45, "2025-06-20", bid=0, ask=0)]
     assert graph._fallback_pick(rows, "call", cfg, 0.45, today) is None
+
+
+def _bars(*closes):
+    return pd.DataFrame({"open": closes, "high": closes, "low": closes, "close": closes, "volume": [1] * len(closes)})
+
+
+def test_latest_underlying_price_reads_last_close_of_shortest_timeframe():
+    cfg = OmegaConf.create({"dealer": {"timeframes": ["5m", "1h", "1d"]}})
+    state = {"raw_bars": {"5m": _bars(250.0, 251.5), "1h": _bars(240.0), "1d": _bars(200.0)}}
+    assert graph._latest_underlying_price(state, cfg) == 251.5
+
+
+def test_latest_underlying_price_is_none_without_bars():
+    cfg = OmegaConf.create({"dealer": {"timeframes": ["5m"]}})
+    assert graph._latest_underlying_price({"raw_bars": {}}, cfg) is None
+    assert graph._latest_underlying_price({}, cfg) is None
+
+
+def test_chain_strike_bounds_windows_around_spot():
+    cfg = OmegaConf.create({"options_trading": {"strike_window_pct": 0.20}})
+    assert graph._chain_strike_bounds(100.0, cfg) == {"strike_price_gte": 80.0, "strike_price_lte": 120.0}
+
+
+def test_chain_strike_bounds_empty_when_spot_unknown_or_disabled():
+    assert graph._chain_strike_bounds(None, OmegaConf.create({"options_trading": {"strike_window_pct": 0.2}})) == {}
+    assert graph._chain_strike_bounds(100.0, OmegaConf.create({"options_trading": {"strike_window_pct": 0}})) == {}
+
+
+def _prefetch_state(raw_bars):
+    return {**_async_options_state(), "raw_bars": raw_bars}
+
+
+def _prefetch_cfg(**ot_overrides):
+    cfg = _async_options_cfg(**ot_overrides)
+    cfg["dealer"] = {"timeframes": ["5m", "1h", "1d"]}
+    return cfg
+
+
+def test_prefetch_restricts_to_a_strike_window_around_spot(monkeypatch):
+    """With bars in state, the deterministic chain pre-fetch must pass strike_price_gte/lte bounding
+    a window around the latest close -- otherwise get_option_chain returns only deep-ITM strikes."""
+    captured = {}
+    calls = []
+    ok_exp = (datetime.now(pytz.timezone("US/Eastern")).date() + timedelta(days=25)).isoformat()
+    occ = f"AAPL{ok_exp.replace('-', '')[2:]}C00145000"
+    envelope = {
+        "_alpaca_mcp_security": {"trust": "untrusted"},
+        "data": {"snapshots": {occ: {"latestQuote": {"bp": 1.0, "ap": 1.2}, "greeks": {"delta": 0.46}}}},
+    }
+
+    class _Tool:
+        name = "get_option_chain"
+
+        async def ainvoke(self, args):
+            calls.append(dict(args))
+            return [{"type": "text", "text": json.dumps(envelope)}]
+
+    class _Bound:
+        def invoke(self, messages):
+            return type("R", (), {"tool_calls": []})()
+
+    class _Structured:
+        def invoke(self, messages):
+            return None
+
+    pick = _run_async_select(
+        monkeypatch, _Tool(), _Bound, _Structured, captured,
+        cfg=_prefetch_cfg(strike_window_pct=0.20, chain_prefetch_limit=100),
+        state=_prefetch_state({"5m": _bars(150.0)}),
+    )
+
+    assert calls[0]["strike_price_gte"] == 120.0
+    assert calls[0]["strike_price_lte"] == 180.0
+    assert calls[0]["limit"] == 100
+    assert pick is not None and pick.contract_symbol == occ
+
+
+def test_prefetch_retries_without_strike_window_when_first_pass_is_empty(monkeypatch):
+    """A stale/wrong spot proxy can window out the whole chain. The pre-fetch must retry once with
+    the expiration window only rather than leave the fallback pick with zero rows."""
+    captured = {}
+    calls = []
+    ok_exp = (datetime.now(pytz.timezone("US/Eastern")).date() + timedelta(days=25)).isoformat()
+    occ = f"AAPL{ok_exp.replace('-', '')[2:]}C00145000"
+    full = {"snapshots": {occ: {"latestQuote": {"bp": 1.0, "ap": 1.2}, "greeks": {"delta": 0.46}}}}
+
+    class _Tool:
+        name = "get_option_chain"
+
+        async def ainvoke(self, args):
+            calls.append(dict(args))
+            body = {"snapshots": {}} if "strike_price_gte" in args else full
+            return [{"type": "text", "text": json.dumps(body)}]
+
+    class _Bound:
+        def invoke(self, messages):
+            return type("R", (), {"tool_calls": []})()
+
+    class _Structured:
+        def invoke(self, messages):
+            return None
+
+    pick = _run_async_select(
+        monkeypatch, _Tool(), _Bound, _Structured, captured,
+        cfg=_prefetch_cfg(strike_window_pct=0.20),
+        state=_prefetch_state({"5m": _bars(150.0)}),
+    )
+
+    assert len(calls) == 2
+    assert "strike_price_gte" in calls[0] and "strike_price_gte" not in calls[1]
+    assert pick is not None and pick.contract_symbol == occ
 
 
 def test_select_option_contract_async_uses_fallback_when_structured_output_raises(monkeypatch):
