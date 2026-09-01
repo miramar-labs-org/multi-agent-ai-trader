@@ -41,6 +41,21 @@ def _by_abs_change_pct(candidate: dict) -> float:
     return abs(candidate["change_pct"]) if candidate.get("change_pct") is not None else -1
 
 
+def _rank_crypto_candidates(candidates: list[dict]) -> list[dict]:
+    """Order the crypto bucket so the CRYPTO_WATCHLIST majors are always kept when
+    _fill_buckets_with_backfill trims the bucket to its target count. The watchlist entries
+    (BTC/USD, ETH/USD, SOL/USD) only carry a change_pct on days they also show up in the movers
+    feed, so a plain abs(change_pct) sort drops them to the bottom and straight out of the pool.
+    The LLM then sees no major it recognises, picks BTC/ETH/SOL from memory, and
+    validate_selection discards the lot as hallucinations -- which is why crypto stopped trading.
+    Majors first (in watchlist order), then the rest by move size."""
+    watchlist_rank = {sym: i for i, sym in enumerate(sources.CRYPTO_WATCHLIST)}
+    return sorted(
+        candidates,
+        key=lambda c: (watchlist_rank.get(c["symbol"], len(watchlist_rank)), -_by_abs_change_pct(c)),
+    )
+
+
 def _filter_earnings_blackout(candidates: list[dict], cfg) -> list[dict]:
     if not cfg.earnings_blackout.enabled or not candidates:
         return candidates
@@ -125,7 +140,7 @@ def _discover_mixed_candidates(cfg, mix_cfg) -> list[dict]:
 
     crypto_pool = []
     if crypto_enabled:
-        crypto_pool = sorted(sources.fetch_crypto_candidates(cfg.analyst.screener_top_n), key=_by_abs_change_pct, reverse=True)
+        crypto_pool = _rank_crypto_candidates(sources.fetch_crypto_candidates(cfg.analyst.screener_top_n))
 
     selected = _fill_buckets_with_backfill(
         {"large_cap": large_cap_pool, "crypto": crypto_pool, "screener": screener_pool}, target_counts
