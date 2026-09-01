@@ -246,6 +246,34 @@ def test_discover_candidates_mix_composes_pool_by_configured_ratios(monkeypatch)
     assert len(result["raw_candidates"]) == 10
 
 
+def test_discover_candidates_mix_retains_crypto_watchlist_majors_without_change_pct(monkeypatch):
+    """Regression: BTC/ETH/SOL come out of fetch_crypto_candidates with no change_pct on a day
+    they aren't also movers. The old abs(change_pct) sort dropped them below every alt-coin mover
+    and out of the trimmed bucket -- the LLM then only ever saw alts, picked BTC/ETH/SOL from
+    memory, and validate_selection discarded them as hallucinations. They must stay in the pool."""
+    monkeypatch.setattr(graph.sources, "fetch_large_cap_candidates", lambda symbols: [{"symbol": s} for s in symbols])
+    monkeypatch.setattr(graph.sources, "fetch_screener_candidates", lambda n, min_price, **kwargs: [])
+    monkeypatch.setattr(
+        graph.sources,
+        "fetch_crypto_candidates",
+        lambda n: [
+            {"symbol": "BTC/USD"},
+            {"symbol": "ETH/USD"},
+            {"symbol": "SOL/USD"},
+            {"symbol": "PEPE/USD", "change_pct": 42.0},
+            {"symbol": "WIF/USD", "change_pct": 31.0},
+            {"symbol": "BONK/USD", "change_pct": 25.0},
+        ],
+    )
+
+    result = graph.discover_candidates(
+        _discover_state(), _mix_cfg(pool_size=10, large_cap_pct=0.4, crypto_pct=0.3, screener_pct=0.3)
+    )
+
+    crypto = {c["symbol"] for c in result["raw_candidates"] if c["market"] == "binance"}
+    assert {"BTC/USD", "ETH/USD", "SOL/USD"} <= crypto
+
+
 def test_discover_candidates_mix_excludes_large_cap_symbols_from_the_screener_bucket(monkeypatch):
     """A symbol on both the large-cap list and today's screener movers (e.g. NVDA having a
     genuinely huge day) belongs to the large-cap bucket -- it must not also be fetched/tagged as
