@@ -137,7 +137,7 @@ options_trading:
   max_notional_usd: 2000    # hard cap on a single option order's live-quoted notional (qty * mid-price * 100); re-quoted against the market at BUY time, not the LLM-claimed premium
 
 eod_flatten:
-  enabled: true   # feature gate: when false, poll_eod_flatten() (src/floor_broker/main.py) short-
+  enabled: false  # feature gate: when false, poll_eod_flatten() (src/floor_broker/main.py) short-
                    # circuits every iteration before touching the clock or Alpaca positions -- off
                    # by default, opt-in "day trading mode". Toggling this is a config-only change --
                    # no rebuild/redeploy needed, see src/common/config.py.
