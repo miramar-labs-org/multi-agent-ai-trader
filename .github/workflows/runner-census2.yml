@@ -1,0 +1,27 @@
+name: runner-census2
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  any:
+    runs-on: self-hosted
+    timeout-minutes: 10
+    steps:
+      - run: |
+          echo "CENSUS2 job=${{ github.job }} repo=${{ github.repository }}"
+          echo "runner_name=$RUNNER_NAME os=$RUNNER_OS arch=$RUNNER_ARCH"
+          printenv | grep -E '^(RUNNER|GITHUB|ACTIONS)' | sort | head -20
+          id; hostname; uname -a; nfs-smi 2>/dev/null; nvidia-smi -L 2>&1 | head; ls /dev/nvidia* 2>/dev/null | wc -l
+  dgx:
+    runs-on: [self-hosted, dgx]
+    timeout-minutes: 10
+    steps:
+      - run: |
+          echo "CENSUS2 dgx job=${{ github.job }}"; echo "runner_name=$RUNNER_NAME"; id; hostname; nvidia-smi -L 2>&1 | head; ls /dev/nvidia* 2>/dev/null | wc -l
+  agx:
+    runs-on: [self-hosted, agx]
+    timeout-minutes: 10
+    steps:
+      - run: |
+          echo "CENSUS2 agx job=${{ github.job }}"; echo "runner_name=$RUNNER_NAME"; id; hostname; uname -m; nvidia-smi -L 2>&1 | head
