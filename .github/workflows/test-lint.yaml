@@ -26,6 +26,8 @@ permissions:
 
 jobs:
   test-lint:
+    # Never run fork-PR code on the self-hosted runner (it has host access).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, dgx]
     steps:
       - uses: actions/checkout@v4
