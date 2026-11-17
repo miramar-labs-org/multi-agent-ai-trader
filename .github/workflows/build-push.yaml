@@ -28,7 +28,11 @@ env:
 
 jobs:
   build-push-ghcr:
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    # workflow_run: only after a successful push to this repo -- never a fork PR (its branch can be named main).
+    if: >-
+      github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event == 'push'
+      && github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: [self-hosted, dgx]
     strategy:
       matrix:
